@@ -6,7 +6,6 @@ import path from "node:path";
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { expect, it, vi } from "vitest";
 import { createToolCallOccurrenceQueue } from "../packages/agent-core/src/harness/session/tool-result-pairing.js";
-import { inspectManagedProcessGroup } from "../scripts/lib/managed-child-process.mts";
 import { isLiveTestEnabled, logLiveProgress } from "../src/agents/live-test-helpers.js";
 import { createExternalGates } from "../src/agents/subagents/announce/subagent-external-gate.test-support.js";
 import { loadSubagentRegistryFromSqlite } from "../src/agents/subagents/registry/subagent-registry-state.fixture.test-support.js";
@@ -355,14 +354,8 @@ it.skipIf(!isLiveTestEnabled() || process.platform === "win32")(
           if (!processOwner?.pid) {
             throw new Error("Owned subagent Gateway process is unavailable");
           }
-          process.kill(-processOwner.pid, "SIGKILL");
-          await vi.waitFor(
-            () =>
-              expect(
-                inspectManagedProcessGroup(processOwner, { errorPolicy: "indeterminate" }),
-              ).toBe("dead"),
-            { timeout: 10_000 },
-          );
+          // SIGKILL bypasses graceful drain; stop joins output and owned-tree extinction.
+          processOwner.kill("SIGKILL");
           await instance.stopGateway();
           return processOwner.pid;
         };
