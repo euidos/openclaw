@@ -197,9 +197,8 @@ it.skipIf(!isLiveTestEnabled() || process.platform === "win32")(
         logLiveProgress(
           `widget restart: checkpoint reached; replacing owned Gateway pid=${originalProcess.pid}`,
         );
-        // Interrupt without draining, then join the custody owner's extinction receipt.
-        originalProcess.kill("SIGKILL");
-        await instance.stopGateway();
+        // Interrupt without draining; the marker releases the surviving detached exec.
+        await instance.crashGateway();
         await writeFile(path.join(instance.state.workspaceDir, "checkpoint-resume"), "resume\n");
         await instance.startGateway();
         expect(instance.child?.pid).not.toBe(originalProcess.pid);

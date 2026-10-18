@@ -354,9 +354,8 @@ it.skipIf(!isLiveTestEnabled() || process.platform === "win32")(
           if (!processOwner?.pid) {
             throw new Error("Owned subagent Gateway process is unavailable");
           }
-          // SIGKILL bypasses graceful drain; stop joins output and owned-tree extinction.
-          processOwner.kill("SIGKILL");
-          await instance.stopGateway();
+          // Crash the command only; retain descendant custody through recovery.
+          await instance.crashGateway();
           return processOwner.pid;
         };
         const onlyChildFor = (parent: string) => {
