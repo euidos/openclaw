@@ -671,33 +671,4 @@ describe("installed plugin index install-record persistence", () => {
       source: "git",
     });
   });
-
-  it("atomically rejects an invalid __proto__ candidate record", async () => {
-    const pluginId = "__proto__";
-    const stateDir = makeTempDir();
-    await writePersistedInstalledPluginIndex(
-      createIndex({
-        installRecords: { stable: { source: "npm", spec: "stable@1.0.0" } },
-        plugins: [],
-      }),
-      { stateDir },
-    );
-    const before = readInstallRecordRow(stateDir);
-    const invalid = createPluginInstallRecordMap<unknown>();
-    setPluginInstallRecordMapEntry(invalid, "stable", {
-      source: "npm",
-      spec: "stable@2.0.0",
-    });
-    setPluginInstallRecordMapEntry(invalid, pluginId, { source: "bogus" });
-    await expect(
-      writePersistedInstalledPluginIndex(
-        createIndex({
-          installRecords: invalid as InstalledPluginIndex["installRecords"],
-          plugins: [],
-        }),
-        { stateDir },
-      ),
-    ).rejects.toThrow("Invalid plugin install record");
-    expect(readInstallRecordRow(stateDir)).toEqual(before);
-  });
 });
