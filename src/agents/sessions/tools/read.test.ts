@@ -1,7 +1,9 @@
 import { Buffer } from "node:buffer";
 import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { setImmediate as nextTurn, setTimeout as delay } from "node:timers/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../../test/helpers/promise.js";
 import { useAutoCleanupTempDirTracker } from "../../../../test/helpers/temp-dir.js";
@@ -10,7 +12,7 @@ import {
   resolveFileMutationQueueKey,
   withFileMutationQueueKeyResolution,
 } from "./file-mutation-queue.js";
-import { createReadTool, createReadToolDefinition } from "./read.js";
+import { createReadTool, createReadToolDefinition, type ReadToolOptions } from "./read.js";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "./truncate.js";
 import { createWriteTool } from "./write.js";
 
@@ -26,21 +28,13 @@ vi.mock("../../../infra/windows-encoding.js", async (importOriginal) => ({
 
 const ONE_PIXEL_PNG_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+const PNG_BYTES = Buffer.from(ONE_PIXEL_PNG_BASE64, "base64");
+const IMAGE_OPTIONS = { autoResizeImages: false };
 
-function createTinyBmp(): Buffer {
-  const buffer = Buffer.alloc(58);
-  buffer.write("BM", 0, "ascii");
-  buffer.writeUInt32LE(buffer.length, 2);
-  buffer.writeUInt32LE(54, 10);
-  buffer.writeUInt32LE(40, 14);
-  buffer.writeInt32LE(1, 18);
-  buffer.writeInt32LE(1, 22);
-  buffer.writeUInt16LE(1, 26);
-  buffer.writeUInt16LE(24, 28);
-  buffer.writeUInt32LE(4, 34);
-  buffer[56] = 0xff;
-  return buffer;
-}
+const ONE_PIXEL_BMP = Buffer.from(
+  "Qk06AAAAAAAAADYAAAAoAAAAAQAAAAEAAAABABgAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAD/AA==",
+  "base64",
+);
 
 function textContent(result: { content: Array<{ type: string; text?: string }> }): string {
   const first = result.content[0];
@@ -65,11 +59,19 @@ function memoryRead(content: string | Buffer, detectImageMimeType?: () => Promis
   });
 }
 
-async function fileFixture(name: string, content: string | Buffer) {
+async function fileFixture(name: string, content: string | Buffer, options?: ReadToolOptions) {
   const tempDir = tempDirs.make("openclaw-read-");
   const filePath = path.join(tempDir, name);
   await fs.writeFile(filePath, content);
-  return { tempDir, filePath, tool: createReadToolDefinition(tempDir) };
+  return { tempDir, filePath, tool: createReadToolDefinition(tempDir, options) };
+}
+
+async function expectReadText(
+  tool: ReturnType<typeof createReadToolDefinition>,
+  args: Parameters<typeof tool.execute>[1],
+  expected: string,
+) {
+  expect(textContent(await executeRead(tool, args))).toBe(expected);
 }
 
 async function queuedRead(tempDir: string, writePath: string, readPath: string, content: string) {
@@ -94,9 +96,7 @@ async function queuedRead(tempDir: string, writePath: string, readPath: string, 
   });
   const readResult = executeRead(reader, { path: readPath });
   void readResult.catch(() => {});
-  await new Promise<void>((resolve) => {
-    setImmediate(resolve);
-  });
+  await nextTurn();
   expect(readAccess).not.toHaveBeenCalled();
   releaseBlocker.resolve();
   await blocker;
@@ -130,8 +130,8 @@ describe("read tool", () => {
     const mediaId = `read-tool-${Date.now()}-${Math.random().toString(36).slice(2)}.png`;
     const mediaPath = path.join(stateDir, "media", "inbound", mediaId);
     await fs.mkdir(path.dirname(mediaPath), { recursive: true });
-    await fs.writeFile(mediaPath, Buffer.from(ONE_PIXEL_PNG_BASE64, "base64"));
-    const tool = createReadToolDefinition("/workspace", { autoResizeImages: false });
+    await fs.writeFile(mediaPath, PNG_BYTES);
+    const tool = createReadToolDefinition("/workspace", IMAGE_OPTIONS);
     await withEnvAsync({ OPENCLAW_STATE_DIR: stateDir }, async () => {
       const result = await executeRead(tool, { path: `media://inbound/${mediaId}` });
 
@@ -143,28 +143,16 @@ describe("read tool", () => {
   });
 
   it("omits images for a non-vision extension model", async () => {
-    const stateDir = tempDirs.make("openclaw-read-vision-");
-    const imagePath = path.join(stateDir, "pixel.png");
-    await fs.writeFile(imagePath, Buffer.from(ONE_PIXEL_PNG_BASE64, "base64"));
-    const result = await createReadToolDefinition(stateDir, { autoResizeImages: false }).execute(
-      "extension-read",
-      { path: imagePath },
-      undefined,
-      undefined,
-      {
-        model: { input: ["text"] },
-      } as never,
-    );
-    const imageParts = result.content.filter((part) => part.type === "image");
-    expect(imageParts).toHaveLength(0);
+    const { tool, filePath } = await fileFixture("pixel.png", PNG_BYTES, IMAGE_OPTIONS);
+    const result = await tool.execute("extension-read", { path: filePath }, undefined, undefined, {
+      model: { input: ["text"] },
+    } as never);
+    expect(result.content.filter((part) => part.type === "image")).toHaveLength(0);
     expect(textContent(result)).toContain("does not support images");
   });
 
   it("converts BMP files to PNG attachments", async () => {
-    const tempDir = tempDirs.make("openclaw-read-bmp-");
-    const filePath = path.join(tempDir, "pixel.bmp");
-    await fs.writeFile(filePath, createTinyBmp());
-    const tool = createReadToolDefinition(tempDir, { autoResizeImages: false });
+    const { tool, filePath } = await fileFixture("pixel.bmp", ONE_PIXEL_BMP, IMAGE_OPTIONS);
     const result = await executeRead(tool, { path: filePath });
     expect(textContent(result)).toContain("Read image file [image/png]");
     expect(textContent(result)).toContain("converted from image/bmp to image/png");
@@ -205,58 +193,47 @@ describe("read tool", () => {
     );
   });
 
-  it.runIf(process.platform !== "win32")(
-    "refuses a FIFO without waiting for a writer",
-    async () => {
-      const tempDir = tempDirs.make("openclaw-read-fifo-");
-      const fifoPath = path.join(tempDir, "live.pipe");
-      expect(spawnSync("mkfifo", [fifoPath]).status).toBe(0);
-      const tool = createReadToolDefinition(tempDir);
-      const read = executeRead(tool, { path: fifoPath });
-      let timer: NodeJS.Timeout | undefined;
-      const outcome = await Promise.race([
-        read.then(
-          () => ({ kind: "resolved" as const }),
-          (error: unknown) => ({ kind: "rejected" as const, error }),
-        ),
-        new Promise<{ kind: "timeout" }>((resolve) => {
-          timer = setTimeout(() => resolve({ kind: "timeout" }), 1_000);
-        }),
-      ]);
-      if (timer) {
-        clearTimeout(timer);
-      }
+  it.runIf(process.platform !== "win32")("rejects FIFOs without a writer", async () => {
+    const tempDir = tempDirs.make("openclaw-read-fifo-");
+    const fifoPath = path.join(tempDir, "live.pipe");
+    expect(spawnSync("mkfifo", [fifoPath]).status).toBe(0);
+    const tool = createReadToolDefinition(tempDir);
+    const read = executeRead(tool, { path: fifoPath });
+    let timer: NodeJS.Timeout | undefined;
+    const outcome = await Promise.race([
+      read.then(
+        () => ({ kind: "resolved" as const }),
+        (error: unknown) => ({ kind: "rejected" as const, error }),
+      ),
+      new Promise<{ kind: "timeout" }>((resolve) => {
+        timer = setTimeout(() => resolve({ kind: "timeout" }), 1_000);
+      }),
+    ]);
+    if (timer) {
+      clearTimeout(timer);
+    }
 
-      if (outcome.kind === "timeout") {
-        const writer = spawn(
-          "/bin/sh",
-          ["-c", 'while :; do printf x > "$1"; done', "openclaw-read-fifo", fifoPath],
-          { stdio: "ignore" },
-        );
-        const writerExit = new Promise<void>((resolve) => {
-          writer.once("exit", () => resolve());
-        });
-        await Promise.race([
-          read.catch(() => undefined),
-          new Promise<void>((resolve) => {
-            setTimeout(resolve, 2_000);
-          }),
-        ]);
-        writer.kill("SIGKILL");
-        await writerExit;
-      }
+    if (outcome.kind === "timeout") {
+      const writer = spawn(
+        "/bin/sh",
+        ["-c", 'while :; do printf x > "$1"; done', "openclaw-read-fifo", fifoPath],
+        { stdio: "ignore" },
+      );
+      const writerExit = once(writer, "exit");
+      await Promise.race([read.catch(() => undefined), delay(2_000)]);
+      writer.kill("SIGKILL");
+      await writerExit;
+    }
 
-      expect(outcome).toMatchObject({
-        kind: "rejected",
-        error: { message: expect.stringMatching(/regular file/i) },
-      });
-    },
-  );
+    expect(outcome).toMatchObject({
+      kind: "rejected",
+      error: { message: expect.stringMatching(/regular file/i) },
+    });
+  });
 
   it("describes empty files instead of returning blank content", async () => {
     const { tool } = await fileFixture("empty.txt", "");
-    const result = await executeRead(tool, { path: "empty.txt" });
-    expect(textContent(result)).toBe("File is empty (0 bytes).");
+    await expectReadText(tool, { path: "empty.txt" }, "File is empty (0 bytes).");
   });
 
   it("reads later lines from isolated files larger than 16 MiB", async () => {
@@ -264,17 +241,12 @@ describe("read tool", () => {
       "large.sqlite",
       `${"x".repeat(17 * 1024 * 1024)}\nlast line\n`,
     );
-    const result = await executeRead(tool, {
-      path: filePath,
-      offset: 2,
-    });
-    expect(textContent(result)).toBe("last line\n");
+    await expectReadText(tool, { path: filePath, offset: 2 }, "last line\n");
   });
 
   it("reports the byte count when a BOM-only file decodes to empty text", async () => {
     const tool = memoryRead(Buffer.from([0xef, 0xbb, 0xbf]));
-    const result = await executeRead(tool, { path: "bom.txt" });
-    expect(textContent(result)).toBe("File contains no readable text (3 bytes).");
+    await expectReadText(tool, { path: "bom.txt" }, "File contains no readable text (3 bytes).");
   });
 
   it("does not decode PDF bytes from a renamed .bin file", async () => {
@@ -331,14 +303,15 @@ describe("read tool", () => {
         reconstructed += output;
         break;
       }
-      const continuation = (
-        result.details as { continuation?: { kind: string; offset: number; cursor: number } }
-      ).continuation;
+      const continuation = result.details.continuation;
       expect(continuation).toMatchObject({ kind: "cursor", offset: 1 });
-      expect(continuation?.cursor).toBeGreaterThan(cursor ?? 0);
-      expect(output).toContain(`offset=1, cursor=${continuation?.cursor}`);
+      if (continuation.kind !== "cursor") {
+        throw new Error("Expected an intra-line cursor");
+      }
+      expect(continuation.cursor).toBeGreaterThan(cursor ?? 0);
+      expect(output).toContain(`offset=1, cursor=${continuation.cursor}`);
       reconstructed += output.replace(/\n\n\[Showing[^\]]*\]$/, "");
-      cursor = continuation?.cursor;
+      cursor = continuation.cursor;
     }
     expect(reconstructed).toBe(text);
   });
@@ -352,23 +325,20 @@ describe("read tool", () => {
 
   it("explains an intra-line cursor past EOF", async () => {
     const tool = memoryRead("done");
-    const result = await executeRead(tool, { path: "done.txt", cursor: 5 });
-    expect(textContent(result)).toBe("Cursor 5 is at or beyond the end of line 1 (4 characters).");
+    await expectReadText(
+      tool,
+      { path: "done.txt", cursor: 5 },
+      "Cursor 5 is at or beyond the end of line 1 (4 characters).",
+    );
   });
 
-  it.each([
-    {
-      name: "a blank-only file",
-      limit: 2000,
-      expected: "File contains 2 blank lines.",
-    },
-    {
-      name: "a blank-only range",
-      limit: 1,
-      expected:
-        "Selected range contains 1 blank line.\n\n[1 more line in file. Use offset=2 to continue.]",
-    },
-  ])("accepts cursor 0 on $name", async ({ limit, expected }) => {
+  it.each<[number, string]>([
+    [2000, "File contains 2 blank lines."],
+    [
+      1,
+      "Selected range contains 1 blank line.\n\n[1 more line in file. Use offset=2 to continue.]",
+    ],
+  ])("accepts cursor 0 on blank input (limit=%s)", async (limit, expected) => {
     const { tempDir } = await fileFixture("synthetic.txt", "\n\n");
     const result = await createReadTool(tempDir).execute("read-zero", {
       path: "synthetic.txt",
@@ -401,8 +371,6 @@ describe("read tool", () => {
   });
 
   it("clamps non-positive line limits before slicing file content", async () => {
-    // A bad limit should still reveal the first line plus a continuation hint
-    // instead of making a non-empty file look empty.
     const tool = memoryRead("alpha\nbeta\ngamma", async () => null);
     const result = await executeRead(tool, { path: "notes.txt", limit: -1 });
     expect(textContent(result)).toBe("alpha\n\n[2 more lines in file. Use offset=2 to continue.]");
@@ -423,13 +391,8 @@ describe("read tool", () => {
     const access = vi.fn(async () => {});
     const detectImageMimeType = vi.fn(async () => null);
     const readFile = vi.fn(async () => Buffer.from("alpha\nbeta\ngamma"));
-    const tool = createReadToolDefinition("/workspace", {
-      operations: {
-        access,
-        detectImageMimeType,
-        readFile,
-      },
-    });
+    const operations = { access, detectImageMimeType, readFile };
+    const tool = createReadToolDefinition("/workspace", { operations });
     await expect(
       executeRead(tool, { path: "notes.txt", offset: 0, optional: true }),
     ).rejects.toThrow("Offset must be an integer at least 1");
