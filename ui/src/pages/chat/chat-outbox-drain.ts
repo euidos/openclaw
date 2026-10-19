@@ -217,7 +217,8 @@ async function drainStoredChatOutbox(
           sendError,
           sendState,
         }));
-      if (!visible || isChatBusy(host)) {
+      // Local commands bypass server FIFO, so accepted inputs still fence them.
+      if (accepted.size > 0 || !visible || isChatBusy(host)) {
         lane.waitingForVisibleOwner = !visible;
         lane.freshAdmissions.delete(item.id);
         lane.pendingOptions.delete(item.id);

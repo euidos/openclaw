@@ -46,6 +46,56 @@ afterEach(() => {
 });
 
 describe("accepted input restart handoff", () => {
+  it("keeps local commands behind accepted input until transcript consumption", async () => {
+    let consumed = false;
+    const host = makeChatHost({
+      sessionKey,
+      currentSessionId: sessionId,
+      requestHandlers: {
+        "chat.history": () => ({
+          sessionId,
+          messages: [],
+          pendingInputs: consumed ? { items: [], total: 0 } : pending("interrupted"),
+          inputReceipts: [
+            consumed
+              ? { runId: item.sendRunId, state: "consumed", consumedByEventId: "saved-input" }
+              : { runId: item.sendRunId, state: "pending" },
+          ],
+          sessionInfo: { key: sessionKey, sessionId, status: "done", hasActiveRun: false },
+        }),
+        "sessions.compact": { ok: true, compacted: true },
+      },
+    });
+    for (const queued of [
+      item,
+      {
+        id: "queued-compact",
+        text: "/compact",
+        localCommandName: "compact",
+        createdAt: 200,
+        sendAttempts: 0,
+        sendState: "waiting-reconnect" as const,
+      },
+    ]) {
+      expect(
+        admitQueuedMessageForSession(host, captureChatOutboxAdmission(host, sessionKey), {
+          ...queued,
+          sessionId,
+        }),
+      ).toBe(true);
+    }
+    await resumeStoredChatOutboxes(host);
+    expect(host.request.mock.calls.filter(([method]) => method === "sessions.compact")).toEqual([]);
+    consumed = true;
+    await resumeStoredChatOutboxes(host);
+    await resumeStoredChatOutboxes(host);
+    expect(
+      host.request.mock.calls.filter(([method]) => method === "sessions.compact"),
+    ).toHaveLength(1);
+    expect(host.request.mock.calls.filter(([method]) => method === "chat.send")).toEqual([]);
+    expect(listStoredChatOutboxes(host)).toEqual([]);
+  });
+
   it("retains expired server custody without blocking a later queued input", async () => {
     let known = false;
     const successor = {

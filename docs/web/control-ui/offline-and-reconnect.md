@@ -408,7 +408,8 @@ When the Gateway confirms that it holds the same pending input, the Control UI c
 uncertain-delivery warning without sending the message again. The browser keeps its retry
 payload until consumption or cancellation is confirmed. If delivery is still unknown,
 the review warning remains. Confirmed server custody does not block later browser-queued
-messages, including when the accepted input is too old for automatic recovery.
+chat sends, including when the accepted input is too old for automatic recovery.
+Local commands such as `/compact` and `/reset` still wait behind that input.
 If the Gateway is holding that input for a later turn, it appears in the queue
 above the composer. Removing that row withdraws the exact queued message without
 stopping the active turn. Once cancellation is confirmed, the removed prompt and
