@@ -1,4 +1,5 @@
 import { once } from "node:events";
+import { readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { createServer, type ServerResponse } from "node:http";
 import path from "node:path";
@@ -27,6 +28,17 @@ import { runQaGatewayFixture } from "./helpers/qa-gateway-cleanup.js";
 const key = (name: string) => `agent:main:shutdown-settlement-${name}`;
 const marker = (name: string) => `SHUTDOWN_SETTLEMENT_${name}`;
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+
+function childProcessDiagnostic(pid: number) {
+  const read = (name: "stat" | "status") => {
+    try {
+      return readFileSync(`/proc/${pid}/${name}`, "utf8");
+    } catch (error) {
+      return String(error);
+    }
+  };
+  return JSON.stringify({ pid, stat: read("stat"), status: read("status") });
+}
 
 function toolCall(
   response: ServerResponse,
@@ -410,7 +422,13 @@ it(
           );
           expect(instance.logs()).not.toContain("shutdown deadline reached");
           for (const pid of [childPids.pid, childPids.gitPid]) {
-            expect(() => process.kill(pid, 0)).toThrow();
+            try {
+              expect(() => process.kill(pid, 0)).toThrow();
+            } catch (cause) {
+              throw new Error(`Child remains after shutdown: ${childProcessDiagnostic(pid)}`, {
+                cause,
+              });
+            }
           }
         } catch (cause) {
           throw new Error(
