@@ -14,9 +14,9 @@ import {
   recordAgentDatabaseAdmissions,
 } from "../state/agent-database-admission.js";
 import { resolveOpenClawAgentSqlitePath } from "../state/openclaw-agent-db.js";
-import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-clock.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { startGatewayConfigReloader, type GatewayReloadPlan } from "./config-reload.js";
+import { ownedConfigReloadOptions } from "./config-reload.test-support.js";
 import { installWatcherMock } from "./config-reload.watcher.test-support.js";
 import { retainSessionListForegroundWork } from "./session-projection-work.js";
 import { createSessionRowProjection } from "./session-row-projection.js";
@@ -69,20 +69,14 @@ it("retains resident rows across projection-neutral commits and unchanged admiss
       ownership.markRuntimeCommitted(next, plan);
       return "applied";
     };
+    const { subscribeToWrites: _, ...initialOptions } = await ownedConfigReloadOptions(
+      initial,
+      state.configPath,
+    );
     const reloader = startGatewayConfigReloader({
-      scheduler: createTestGatewayScheduler("fake-timers"),
-      initialConfig: cfg,
-      initialCompareConfig: initial.sourceConfig,
-      initialSnapshotRawHash: initial.hash ?? null,
-      initialAuthoredConfig: initial.parsed,
-      initialSnapshotValid: initial.valid,
-      initialSnapshotIssues: initial.issues,
-      testDebounceMs: 0,
+      ...initialOptions,
       readSnapshot,
       promoteSnapshot: async () => true,
-      watchPath: state.configPath,
-      initialPluginInstallRecords: {},
-      readPluginInstallRecords: async () => ({}),
       onHotReload: commit,
       onNoopConfigCommit: commit,
       onRuntimeConfigCommitted: (_plan, next) => {
@@ -174,15 +168,10 @@ it("retains resident rows across projection-neutral commits and unchanged admiss
       }
       const beforeRename = projection.materializedCount;
       const previousConfig = cfg;
+      const renamed = { ...cfg.agents?.entries?.main, identity: { name: "After" } };
       cfg = {
         ...cfg,
-        agents: {
-          ...cfg.agents,
-          entries: {
-            ...cfg.agents?.entries,
-            main: { ...cfg.agents?.entries?.main, identity: { name: "After" } },
-          },
-        },
+        agents: { ...cfg.agents, entries: { ...cfg.agents?.entries, main: renamed } },
       };
       copyConfigResolutionFacts(previousConfig, cfg);
       setRuntimeConfigSnapshot(cfg);

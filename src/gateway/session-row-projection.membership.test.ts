@@ -1,6 +1,9 @@
 import type { StatementSync } from "node:sqlite";
-import { expect, it, vi } from "vitest";
-import { observeHostDataSql } from "../../test/helpers/sqlite-statement-execution-counter.js";
+import { expect, it } from "vitest";
+import {
+  observeHostDataSql,
+  observeSqliteReadSql,
+} from "../../test/helpers/sqlite-statement-execution-counter.js";
 import { setRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
 import {
   loadSessionEntry,
@@ -25,25 +28,45 @@ import { readSessionGroupMembership } from "./session-group-membership.read.js";
 import { putSessionGroups } from "./session-groups.js";
 import { withReadySessionRows } from "./session-row-prepared-read.js";
 import { createSessionRowProjection, type SessionRowProjection } from "./session-row-projection.js";
+import { createTestProjection } from "./session-row-projection.read-fixture.test-support.js";
 
 function observeQueries(prototype: StatementSync) {
-  const executed: string[] = [];
-  const spies = (["all", "get", "iterate"] as const).map((method) => {
-    const original = prototype[method];
-    return vi.spyOn(prototype, method).mockImplementation(
-      new Proxy(original, {
-        apply(target, receiver: StatementSync, args) {
-          executed.push(receiver.sourceSQL);
-          return Reflect.apply(target, receiver, args);
-        },
-      }),
-    );
-  });
+  const { queries, restore } = observeSqliteReadSql(prototype);
   return {
     expectNoMembershipSql: () =>
-      expect(executed.filter((sql) => /\bsession_(members|participants)\b/i.test(sql))).toEqual([]),
-    [Symbol.dispose]: () => spies.forEach((spy) => spy.mockRestore()),
+      expect(queries.filter((sql) => /\bsession_(members|participants)\b/i.test(sql))).toEqual([]),
+    [Symbol.dispose]: restore,
   };
+}
+
+async function observedProjection<T>(read: (projection: SessionRowProjection) => T) {
+  let projection: SessionRowProjection | undefined;
+  let observing = false;
+  const observed: T[] = [];
+  const stop = sessionChanges.subscribe(() => {
+    if (observing && projection) {
+      observed.push(read(projection));
+    }
+  });
+  try {
+    projection = await createTestProjection({ cfg: {}, modelCatalog: [] });
+    await projection.ensureMaterialized();
+    const current = projection;
+    return Object.assign(current, {
+      observed,
+      start: () => {
+        observing = true;
+      },
+      [Symbol.dispose]: () => {
+        stop();
+        current.dispose();
+      },
+    });
+  } catch (error) {
+    stop();
+    projection?.dispose();
+    throw error;
+  }
 }
 
 const participant = (id: string) => ({ identity: { type: "agent" as const, id } });
@@ -140,74 +163,55 @@ it("publishes final replacement facts to observers registered before the project
     const database = openOpenClawAgentDatabase(scope);
     const replace = (sessionId: string, updatedAt: number) =>
       replaceSessionEntrySync(scope, { sessionId, updatedAt, category: sessionId });
-    let projection: SessionRowProjection | undefined;
-    let observing = false;
-    const observed: Array<{
-      old: boolean;
-      current: boolean;
-      transient: boolean;
-      groups: string[];
-    }> = [];
-    const observe = () => {
-      if (observing && projection) {
-        observed.push({
-          old: projection.hasMembership(database.path, scope.sessionKey, "old-viewer"),
-          current: projection.hasMembership(database.path, scope.sessionKey, "current-viewer"),
-          transient: projection.hasMembership(database.path, scope.sessionKey, "transient"),
-          groups: [...projection.sessionGroupTargets().keys()],
-        });
-      }
-    };
-    const stop = sessionChanges.subscribe(observe);
-    try {
-      projection = await createSessionRowProjection({ cfg: {}, modelCatalog: [] });
-      await projection.ensureMaterialized();
-      observing = true;
-      runOpenClawAgentWriteTransaction(() => {
-        replace("intermediate", 2);
-        replace("current", 3);
-        addSessionMember(scope, { identityId: "transient", addedBy: "owner" });
-        removeSessionMember(scope, "transient");
-        addSessionMember(scope, { identityId: "current-viewer", addedBy: "owner" });
-        recordSessionParticipant(scope, {
-          identity: { type: "agent", id: "reviewer" },
-          promptedAt: 2,
-        });
-        expect(() =>
-          runOpenClawAgentWriteTransaction(() => {
-            replace("rolled-back", 4);
-            addSessionMember(scope, { identityId: "rolled-back", addedBy: "owner" });
-            throw new Error("rollback savepoint");
-          }, scope),
-        ).toThrow("rollback savepoint");
-        expect(observed).toEqual([]);
-      }, scope);
-      expect(observed.length).toBeGreaterThan(0);
-      for (const value of observed) {
-        expect(value).toEqual({
-          old: false,
-          current: true,
-          transient: false,
-          groups: ["current"],
-        });
-      }
-      expect(projection.needsMembershipPreparation()).toBe(false);
-      const query = { agentId: scope.agentId, key: scope.sessionKey };
-      const entry = await withReadySessionRows(
-        projection,
-        () => [query],
-        (read) => read.describe(query)?.entry,
-      );
-      expect(entry).toMatchObject({
-        sessionId: "current",
-        category: "current",
-        participants: [participant("research"), participant("reviewer")],
-        participantCount: 2,
+    using projection = await observedProjection((read) => ({
+      old: read.hasMembership(database.path, scope.sessionKey, "old-viewer"),
+      current: read.hasMembership(database.path, scope.sessionKey, "current-viewer"),
+      transient: read.hasMembership(database.path, scope.sessionKey, "transient"),
+      groups: [...read.sessionGroupTargets().keys()],
+    }));
+    const { observed } = projection;
+    projection.start();
+    runOpenClawAgentWriteTransaction(() => {
+      replace("intermediate", 2);
+      replace("current", 3);
+      addSessionMember(scope, { identityId: "transient", addedBy: "owner" });
+      removeSessionMember(scope, "transient");
+      addSessionMember(scope, { identityId: "current-viewer", addedBy: "owner" });
+      recordSessionParticipant(scope, {
+        identity: { type: "agent", id: "reviewer" },
+        promptedAt: 2,
       });
-    } finally {
-      stop();
-      projection?.dispose();
+      expect(() =>
+        runOpenClawAgentWriteTransaction(() => {
+          replace("rolled-back", 4);
+          addSessionMember(scope, { identityId: "rolled-back", addedBy: "owner" });
+          throw new Error("rollback savepoint");
+        }, scope),
+      ).toThrow("rollback savepoint");
+      expect(observed).toEqual([]);
+    }, scope);
+    expect(observed.length).toBeGreaterThan(0);
+    for (const value of observed) {
+      expect(value).toEqual({
+        old: false,
+        current: true,
+        transient: false,
+        groups: ["current"],
+      });
     }
+    expect(projection.needsMembershipPreparation()).toBe(false);
+    const query = { agentId: scope.agentId, key: scope.sessionKey };
+    const entry = await withReadySessionRows(
+      projection,
+      () => [query],
+      (read) => read.describe(query)?.entry,
+    );
+    expect(entry).toMatchObject({
+      sessionId: "current",
+      category: "current",
+      participants: [participant("research"), participant("reviewer")],
+      participantCount: 2,
+    });
   });
 });
 
@@ -227,36 +231,23 @@ it("installs every category in a worker reply before the first row observer", as
         },
       );
     }
-    let projection: SessionRowProjection | undefined;
-    let observing = false;
-    const observed: Array<Array<[string, readonly { agentId: string; sessionKey: string }[]]>> = [];
-    const stop = sessionChanges.subscribe(() => {
-      if (observing && projection) {
-        observed.push([...projection.sessionGroupTargets()]);
-      }
-    });
-    try {
-      projection = await createSessionRowProjection({ cfg, modelCatalog: [] });
-      await projection.ensureMaterialized();
-      const database = openOpenClawAgentDatabase({ agentId: "main" });
-      observing = true;
-      expect(
-        await updateSessionGroupCategoriesInWorker({
-          scope: { agentId: "main", sessionKey: "", storePath: database.path },
-          from: "work",
-          to: "done",
-        }),
-      ).toBe(2);
-      expect(observed).toHaveLength(2);
-      for (const value of observed) {
-        expect(value).toEqual([
-          ["done", keys.map((sessionKey) => ({ agentId: "main", sessionKey }))],
-        ]);
-      }
-      expect(projection.needsMembershipPreparation()).toBe(false);
-    } finally {
-      stop();
-      projection?.dispose();
+    using projection = await observedProjection((read) => [...read.sessionGroupTargets()]);
+    const { observed } = projection;
+    const database = openOpenClawAgentDatabase({ agentId: "main" });
+    projection.start();
+    expect(
+      await updateSessionGroupCategoriesInWorker({
+        scope: { agentId: "main", sessionKey: "", storePath: database.path },
+        from: "work",
+        to: "done",
+      }),
+    ).toBe(2);
+    expect(observed).toHaveLength(2);
+    for (const value of observed) {
+      expect(value).toEqual([
+        ["done", keys.map((sessionKey) => ({ agentId: "main", sessionKey }))],
+      ]);
     }
+    expect(projection.needsMembershipPreparation()).toBe(false);
   });
 });

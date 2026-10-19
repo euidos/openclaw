@@ -12,11 +12,15 @@ import { createDeferredCore } from "../shared/deferred.js";
 import { closeOpenClawAgentDatabaseByPathAsync } from "../state/openclaw-agent-db-lifecycle.js";
 import { ensureProfileForEmail } from "../state/user-profiles.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
-import { retainSessionListForegroundWork } from "./session-projection-work.js";
 import * as databaseFactsRead from "./session-row-database-facts.js";
 import { withReadySessionRows } from "./session-row-prepared-read.js";
 import { ready, type Row } from "./session-row-projection-record.js";
-import { createSessionRowProjection, type SessionRowProjection } from "./session-row-projection.js";
+import type { SessionRowProjection } from "./session-row-projection.js";
+import {
+  createTestProjection,
+  holdForeground,
+  seedRow,
+} from "./session-row-projection.read-fixture.test-support.js";
 import * as rowInputs from "./session-utils-row.js";
 
 /** Pause after the real worker read scope has released its request hold. */
@@ -53,29 +57,29 @@ export async function withAcceptedSuffix(
       "agent:main:accepted-a",
       options.acpMeta === undefined ? "agent:main:accepted-b" : "agent:main:acp:accepted-b",
     ];
-    const identities = options.membership
-      ? {
-          owner: ensureProfileForEmail("accepted-owner@example.test"),
-          viewer: ensureProfileForEmail("accepted-viewer@example.test"),
-        }
-      : undefined;
+    const query = { agentId: "main", key: keys[1]! };
+    const scope = { agentId: query.agentId, sessionKey: query.key };
+    const [profileOwner, viewer] = options.membership
+      ? ["owner", "viewer"].map((name) => ensureProfileForEmail(`accepted-${name}@example.test`))
+      : [];
     const entries = keys.map<InternalSessionEntry>((_, index) => ({
       sessionId: `accepted-${index}`,
       updatedAt: 1,
       label: `initial-${index}`,
-      ...(options.acpMeta !== undefined && index === 1
-        ? { lifecycleRevision: "accepted-lifecycle" }
-        : {}),
-      ...(options.archived && index === 1 ? { archivedAt: 1 } : {}),
-      ...(identities && index === 1
-        ? {
-            visibility: "read-only",
-            createdActor: { type: "human", source: "profile", id: identities.owner.id },
-          }
-        : {}),
     }));
+    const suffixEntry = entries[1]!;
+    if (options.acpMeta !== undefined) {
+      suffixEntry.lifecycleRevision = "accepted-lifecycle";
+    }
+    if (options.archived) {
+      suffixEntry.archivedAt = 1;
+    }
+    if (profileOwner) {
+      suffixEntry.visibility = "read-only";
+      suffixEntry.createdActor = { type: "human", source: "profile", id: profileOwner.id };
+    }
     for (const [index, sessionKey] of keys.entries()) {
-      replaceSessionEntrySync({ agentId: "main", sessionKey }, entries[index]!);
+      seedRow(sessionKey, entries[index]!);
     }
     if (options.acpMeta) {
       seedCanonicalAcpSessionMeta({
@@ -86,35 +90,24 @@ export async function withAcceptedSuffix(
         now: () => 1,
       });
     }
-    if (identities) {
-      addSessionMember(
-        { agentId: "main", sessionKey: keys[1]! },
-        {
-          identityId: identities.viewer.id,
-          addedBy: identities.owner.id,
-          addedAt: 1,
-        },
-      );
+    if (profileOwner && viewer) {
+      addSessionMember(scope, { identityId: viewer.id, addedBy: profileOwner.id, addedAt: 1 });
     }
     const replacementPath = state.statePath("imports", "accepted-replacement.sqlite");
     if (options.replacement) {
       replaceSessionEntrySync(
-        { agentId: "main", sessionKey: keys[1]!, storePath: replacementPath },
+        { ...scope, storePath: replacementPath },
         { ...entries[1]!, updatedAt: 2, label: "replacement store" },
       );
       await closeOpenClawAgentDatabaseByPathAsync(replacementPath, "main");
     }
-    const releaseForeground = retainSessionListForegroundWork();
-    const projection = await createSessionRowProjection({
-      cfg,
-      modelCatalog: [],
-    });
+    using foreground = holdForeground();
+    using projection = await createTestProjection({ cfg, modelCatalog: [] });
     const paused = createDeferredCore();
     const release = createDeferredCore();
     let reading: Promise<void> | undefined;
     try {
       await projection.ensureMaterialized();
-      const query = { agentId: "main", key: keys[1]! };
       const previous = await withReadySessionRows(
         projection,
         () => keys.map((key) => ({ agentId: "main", key })),
@@ -170,11 +163,13 @@ export async function withAcceptedSuffix(
           await release.promise;
         },
       );
+      const acceptedEntries = entries.map((entry, index) => ({
+        ...entry,
+        updatedAt: 2,
+        label: `accepted-${index}`,
+      }));
       for (const [index, sessionKey] of keys.entries()) {
-        replaceSessionEntrySync(
-          { agentId: "main", sessionKey },
-          { ...entries[index]!, updatedAt: 2, label: `accepted-${index}` },
-        );
+        seedRow(sessionKey, acceptedEntries[index]!);
         sessionChanges.emit({
           agentId: "main",
           storePath: previous.storeTarget.storePath,
@@ -208,9 +203,9 @@ export async function withAcceptedSuffix(
         query,
         reads,
         replacementPath,
-        viewerId: identities?.viewer.id,
-        scope: { agentId: "main", sessionKey: query.key },
-        entry: { ...entries[1]!, updatedAt: 2, label: "accepted-1" },
+        viewerId: viewer?.id,
+        scope,
+        entry: acceptedEntries[1]!,
         resume: async () => {
           release.resolve();
           await reading;
@@ -226,7 +221,7 @@ export async function withAcceptedSuffix(
       await Promise.allSettled(reading ? [reading] : []);
       vi.restoreAllMocks();
       projection.dispose();
-      releaseForeground();
+      foreground();
     }
   });
 }

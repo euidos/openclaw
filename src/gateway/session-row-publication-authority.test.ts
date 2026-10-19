@@ -13,6 +13,7 @@ import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-cloc
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { prepareGatewayRecipientProfile } from "./expected-profile.js";
 import { createGatewayConnectionState } from "./server-connection-state.js";
+import { createGatewayWsTestSocket } from "./server/ws-connection.test-helpers.js";
 import type { GatewayWsClient } from "./server/ws-types.js";
 import { prepareSessionEventProjection } from "./session-event-projection.js";
 import { withReadySessionRows } from "./session-row-prepared-read.js";
@@ -25,6 +26,8 @@ afterEach(() => vi.restoreAllMocks());
 it.each(["child and swarm links", "sharing role", "incognito"] as const)(
   "keeps one cached publication recipient-local for %s",
   async (restriction) => {
+    const incognito = restriction === "incognito",
+      links = restriction === "child and swarm links";
     const now = 1_000_000;
     using _ = vi.spyOn(Date, "now").mockReturnValue(now);
     await withOpenClawTestState({ scenario: "minimal", prepareProfileCatalog: true }, async () => {
@@ -38,14 +41,11 @@ it.each(["child and swarm links", "sharing role", "incognito"] as const)(
       const [allowed, restricted] = ["allowed", "restricted"].map((name) =>
         ensureProfileForEmail(`${name}@publication-authority.test`),
       );
-      setUserProfileRole(allowed!.id, restriction === "incognito" ? "admin" : "view");
+      setUserProfileRole(allowed!.id, incognito ? "admin" : "view");
       setUserProfileRole(restricted!.id, restriction === "sharing role" ? "none" : "view");
       const query = {
         agentId: "main",
-        key:
-          restriction === "incognito"
-            ? "agent:main:dashboard:incognito-publication"
-            : "agent:main:publication",
+        key: incognito ? "agent:main:dashboard:incognito-publication" : "agent:main:publication",
       };
       const childKey = "agent:main:publication-child";
       await replaceSessionEntry(
@@ -53,11 +53,10 @@ it.each(["child and swarm links", "sharing role", "incognito"] as const)(
         {
           sessionId: "publication-session",
           updatedAt: now,
-          label: "Publication authority",
-          ...(restriction === "incognito" ? { incognito: true } : {}),
+          ...(incognito ? { incognito: true } : {}),
         },
       );
-      if (restriction === "child and swarm links") {
+      if (links) {
         replaceSessionEntrySync(
           { agentId: "main", sessionKey: childKey },
           {
@@ -96,37 +95,20 @@ it.each(["child and swarm links", "sharing role", "incognito"] as const)(
       const projection = await createSessionRowProjection({ cfg, modelCatalog: [] });
       // Repeat each identity on a second socket so both visible projections exercise cache hits.
       const peers = [allowed!, restricted!, allowed!, restricted!].map((profile, index) => {
-        const send = vi.fn();
+        const socket = createGatewayWsTestSocket();
         const client = {
           ...sharingPolicyClient({
             user: profile.id,
-            ...(restriction === "incognito" && profile === allowed
-              ? { scopes: ["operator.admin"] }
-              : {}),
+            displayName: profile.displayName ?? undefined,
+            ...(incognito && profile === allowed ? { scopes: ["operator.admin"] } : {}),
           }),
           connId: `publication-${index}`,
           usesSharedGatewayAuth: false,
-          authenticatedUserProfile: {
-            profileId: profile.id,
-            displayName: profile.displayName,
-            avatarRevision: "1",
-            hasAvatar: false,
-            updatedAt: now,
-          },
-          socket: {
-            readyState: 1,
-            bufferedAmount: 0,
-            send,
-            close: vi.fn(),
-            terminate: vi.fn(),
-            on: vi.fn(),
-            off: vi.fn(),
-            once: vi.fn(),
-          },
+          socket,
         } satisfies GatewayWsClient;
         prepareGatewayRecipientProfile(client);
         connection.clients.add(client);
-        return { send, client };
+        return socket.send;
       });
       const detach = connection.attachSessionRowProjection(projection);
       try {
@@ -176,9 +158,9 @@ it.each(["child and swarm links", "sharing role", "incognito"] as const)(
               },
             );
             serialization.mockRestore();
-            expect(envelopes).toBe(restriction === "child and swarm links" ? 2 : 1);
-            for (const [index, { send }] of peers.entries()) {
-              const visible = index % 2 === 0 || restriction === "child and swarm links";
+            expect(envelopes).toBe(links ? 2 : 1);
+            for (const [index, send] of peers.entries()) {
+              const visible = index % 2 === 0 || links;
               expect(send).toHaveBeenCalledTimes(visible ? 1 : 0);
               if (!visible) {
                 continue;
@@ -192,13 +174,11 @@ it.each(["child and swarm links", "sharing role", "incognito"] as const)(
                 key: query.key,
                 sessionId: "publication-session",
                 lastMessagePreview: "Private preview 🦞",
-                sharingRole: restriction === "incognito" ? "admin" : "viewer",
+                sharingRole: incognito ? "admin" : "viewer",
               });
-              expect(row.childSessions).toEqual(
-                restriction === "child and swarm links" && index % 2 === 0 ? [childKey] : undefined,
-              );
+              expect(row.childSessions).toEqual(links && index % 2 === 0 ? [childKey] : undefined);
               expect(row.swarm).toEqual(
-                restriction === "child and swarm links"
+                links
                   ? {
                       groups: [
                         {
@@ -217,9 +197,7 @@ it.each(["child and swarm links", "sharing role", "incognito"] as const)(
                   : undefined,
               );
             }
-            expect(presentations).toHaveBeenCalledTimes(
-              restriction === "child and swarm links" ? 2 : 1,
-            );
+            expect(presentations).toHaveBeenCalledTimes(links ? 2 : 1);
             presentations.mockRestore();
           },
         );
