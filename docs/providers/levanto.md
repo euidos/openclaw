@@ -47,7 +47,7 @@ An empty chat-model list is not such a declaration.
 
 ## Native operations
 
-Consumers use [`api.runtime.decisions.evaluateV2`](/plugins/sdk-overview/capabilities#prepared-version-2-providers).
+Consumers use [`api.runtime.decisions.evaluateV2`](/plugins/sdk-overview/capabilities#prepared-decision-execution-contract-version-2).
 The V1 adapter still refuses richer results it cannot represent; selecting Sage
 does not establish V1-only consumer or Auto compatibility.
 Only explicitly supplied content is sent. One question uses `POST /decide`;
