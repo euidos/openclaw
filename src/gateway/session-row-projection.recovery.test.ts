@@ -45,31 +45,37 @@ import { readSessionMessagesPageWithStatsAsync } from "./session-transcript-read
 
 afterEach(() => vi.restoreAllMocks());
 
+async function seedTranscript(name: string, user: string, assistant: string) {
+  const cfg = { agents: { entries: { main: {} } } };
+  setRuntimeConfigSnapshot(cfg);
+  const scope = { agentId: "main", sessionKey: `agent:main:${name}`, sessionId: name };
+  await upsertSessionEntryCore(scope, {
+    sessionId: name,
+    visibility: "shared",
+    updatedAt: Date.now(),
+  });
+  const messages = [
+    { role: "user", content: user },
+    { role: "assistant", content: assistant },
+  ];
+  await persistSessionTranscriptTurn(scope, {
+    messages: messages.map((message) => ({ message })),
+    touchSessionEntry: false,
+  });
+  await waitForSessionTranscriptIndexReconcile({ agentId: scope.agentId });
+  return { cfg, scope, messages };
+}
+
 it("refreshes omitted cold previews after a history read without revoking sharing", ({
   signal,
   onTestFinished,
 }) => {
   const run = withOpenClawTestState({ scenario: "minimal" }, async () => {
-    const cfg = { agents: { entries: { main: {} } } };
-    setRuntimeConfigSnapshot(cfg);
-    const scope = {
-      agentId: "main",
-      sessionKey: "agent:main:cold-preview",
-      sessionId: "cold-preview",
-    };
-    await upsertSessionEntryCore(scope, {
-      sessionId: scope.sessionId,
-      visibility: "shared",
-      updatedAt: Date.now(),
-    });
-    await persistSessionTranscriptTurn(scope, {
-      messages: [
-        { message: { role: "user", content: "Remember the restored conversation" } },
-        { message: { role: "assistant", content: "I will remember it." } },
-      ],
-      touchSessionEntry: false,
-    });
-    await waitForSessionTranscriptIndexReconcile({ agentId: scope.agentId });
+    const { cfg, scope, messages } = await seedTranscript(
+      "cold-preview",
+      "Remember the restored conversation",
+      "I will remember it.",
+    );
     const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 60 * 86_400_000);
     await expect(
       runSessionColdStorageMaintenance({
@@ -103,10 +109,7 @@ it("refreshes omitted cold previews after a history read without revoking sharin
         maxMessages: 100,
         offset: 0,
       });
-      expect(history.messages).toEqual([
-        expect.objectContaining({ role: "user", content: "Remember the restored conversation" }),
-        expect.objectContaining({ role: "assistant", content: "I will remember it." }),
-      ]);
+      expect(history.messages).toEqual(messages.map((message) => expect.objectContaining(message)));
       expect(readSessionColdTranscript(database.db, scope.sessionId)).toBeUndefined();
       expect(projection.capture(query)?.sharingEntry).toEqual(sharingEntry);
       await withinTest(refreshed, signal);
@@ -179,26 +182,11 @@ it("keeps projection reads outside borrowed startup admission and admits complet
 
 it("refreshes previews after reconciliation without metadata mutation or clean-read SQLite", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async () => {
-    const cfg = { agents: { entries: { main: {} } } };
-    setRuntimeConfigSnapshot(cfg);
-    const scope = {
-      agentId: "main",
-      sessionKey: "agent:main:recovered-title",
-      sessionId: "recovered-title",
-    };
-    await upsertSessionEntryCore(scope, {
-      sessionId: scope.sessionId,
-      visibility: "shared",
-      updatedAt: Date.now(),
-    });
-    await persistSessionTranscriptTurn(scope, {
-      messages: [
-        { message: { role: "user", content: "Explain the recovered session" } },
-        { message: { role: "assistant", content: "The existing reply is available again." } },
-      ],
-      touchSessionEntry: false,
-    });
-    await waitForSessionTranscriptIndexReconcile({ agentId: scope.agentId });
+    const { cfg, scope } = await seedTranscript(
+      "recovered-title",
+      "Explain the recovered session",
+      "The existing reply is available again.",
+    );
     clearStoredSessionRowTranscriptForTest(scope);
     const database = openOpenClawAgentDatabase({ agentId: scope.agentId });
     const events = database.db.prepare(
@@ -245,12 +233,7 @@ it("refreshes previews after reconciliation without metadata mutation or clean-r
       expect(loadSessionEntry(scope)).toEqual(originalEntry);
       const nativeCalls = observeMainThreadSql();
       const healed = await listSessions({ context, client, request: options });
-      expect(healed.sessions).toEqual([
-        expect.objectContaining({
-          key: expected.key,
-          lastMessagePreview: expected.lastMessagePreview,
-        }),
-      ]);
+      expect(healed.sessions).toEqual([expect.objectContaining(expected)]);
       expect(healed.sessions[0]?.derivedTitle).toBeUndefined();
       const respond = vi.fn();
       await sessionByKeyReadHandlers["sessions.describe"]!({

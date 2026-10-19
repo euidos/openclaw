@@ -1,6 +1,6 @@
-import { performance } from "node:perf_hooks";
 import { afterEach, expect, it, vi } from "vitest";
 import type { SessionsListParams } from "../../packages/gateway-protocol/src/index.js";
+import type { AgentHarness } from "../agents/harness/types.js";
 import { replaceSessionEntrySync } from "../config/sessions/session-accessor.js";
 import type { CronJob } from "../cron/types.js";
 import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
@@ -28,6 +28,29 @@ import { createSessionRowProjection } from "./session-row-projection.js";
 import { listProjectedSessions } from "./session-utils-list.js";
 
 afterEach(() => vi.restoreAllMocks());
+
+function installHarness(
+  id: string,
+  resolveSessionRuntimeOwnershipAsync?: AgentHarness["resolveSessionRuntimeOwnershipAsync"],
+) {
+  const previous = captureActivePluginRegistrySnapshot();
+  const registry = createEmptyPluginRegistry();
+  registry.agentHarnesses.push({
+    pluginId: id,
+    source: "test",
+    harness: {
+      id,
+      label: "Session ownership fixture",
+      supports: () => ({ supported: true }),
+      ...(resolveSessionRuntimeOwnershipAsync ? { resolveSessionRuntimeOwnershipAsync } : {}),
+      async runAttempt() {
+        throw new Error("Session presentation must not run a model");
+      },
+    },
+  });
+  setActivePluginRegistry(registry);
+  return { [Symbol.dispose]: () => restoreActivePluginRegistrySnapshot(previous) };
+}
 
 it.for([
   { name: "off-page", options: {}, first: "response", keys: ["agent:main:visible"] },
@@ -73,32 +96,17 @@ it.for([
       modelSelectionLocked: true,
     };
     replaceSessionEntrySync(offPage, offPageEntry);
-    const previousRegistry = captureActivePluginRegistrySnapshot();
-    const registry = createEmptyPluginRegistry();
     const entered = createDeferredCore();
     const release = createDeferredCore();
     let holdOwnership = false;
-    registry.agentHarnesses.push({
-      pluginId: "sidebar-owner",
-      source: "test",
-      harness: {
-        id: "sidebar-owner",
-        label: "Sidebar ownership fixture",
-        supports: () => ({ supported: true }),
-        async resolveSessionRuntimeOwnershipAsync({ assertCurrent }) {
-          if (holdOwnership) {
-            entered.resolve();
-            await release.promise;
-          }
-          assertCurrent();
-          return undefined;
-        },
-        async runAttempt() {
-          throw new Error("Listing sessions must not run a model");
-        },
-      },
+    using _ = installHarness("sidebar-owner", async ({ assertCurrent }) => {
+      if (holdOwnership) {
+        entered.resolve();
+        await release.promise;
+      }
+      assertCurrent();
+      return undefined;
     });
-    setActivePluginRegistry(registry);
     const abort = () => release.resolve();
     signal.addEventListener("abort", abort, { once: true });
     let projection: Awaited<ReturnType<typeof createSessionRowProjection>> | undefined;
@@ -120,17 +128,11 @@ it.for([
       const first = await projection.withSelectionPreparation(async () => {
         holdOwnership = true;
         replaceSessionEntrySync(offPage, { ...offPageEntry, label: "Renamed off-page" });
-        const started = performance.now();
         reading = listSessions({ context, client, request, acceptsSerializedJson: true });
         const winner = await Promise.race([
           reading.then(() => "response" as const),
           entered.promise.then(() => "off-page ownership" as const),
         ]);
-        console.info("sidebar-page-readiness", {
-          scenario: scenario.name,
-          first: winner,
-          elapsedMs: performance.now() - started,
-        });
         release.resolve();
         const result = await reading;
         expect(result.sessions.map((row) => row.key)).toEqual(scenario.keys);
@@ -141,7 +143,6 @@ it.for([
       release.resolve();
       await Promise.allSettled(reading ? [reading] : []);
       projection?.dispose();
-      restoreActivePluginRegistrySnapshot(previousRegistry);
       signal.removeEventListener("abort", abort);
     }
   });
@@ -171,22 +172,8 @@ it.each(["parent model change", "late cron registration"])(
           },
         );
       }
-      const previousRegistry = captureActivePluginRegistrySnapshot();
-      const registry = createEmptyPluginRegistry();
       // A pinned harness without dependency-tracked ownership yields opaque ownership facts.
-      registry.agentHarnesses.push({
-        pluginId: "row-opaque",
-        source: "test",
-        harness: {
-          id: "row-opaque",
-          label: "Opaque ownership fixture",
-          supports: () => ({ supported: true }),
-          runAttempt: async () => {
-            throw new Error("Session presentation must not run a model");
-          },
-        },
-      });
-      setActivePluginRegistry(registry);
+      using _ = installHarness("row-opaque");
       registerSessionAutomationSource(null);
       let preparationPasses = 0;
       let guardSelection = false;
@@ -277,7 +264,6 @@ it.each(["parent model change", "late cron registration"])(
         projection.dispose();
         release();
         registerSessionAutomationSource(null);
-        restoreActivePluginRegistrySnapshot(previousRegistry);
       }
     });
   },

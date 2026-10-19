@@ -39,8 +39,16 @@ function observeQueries(prototype: StatementSync) {
       }),
     );
   });
-  return { executed, restore: () => spies.forEach((spy) => spy.mockRestore()) };
+  return {
+    expectNoMembershipSql: () =>
+      expect(executed.filter((sql) => /\bsession_(members|participants)\b/i.test(sql))).toEqual([]),
+    [Symbol.dispose]: () => spies.forEach((spy) => spy.mockRestore()),
+  };
 }
+
+const participant = (id: string) => ({ identity: { type: "agent" as const, id } });
+const participantBytes = (entry: ReturnType<typeof loadSessionEntry>) =>
+  JSON.stringify({ participants: entry?.participants, participantCount: entry?.participantCount });
 
 it("publishes byte-identical group and participant facts without host membership SQL during cold admission, row refresh or 50 viewer reads", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async () => {
@@ -71,10 +79,7 @@ it("publishes byte-identical group and participant facts without host membership
         projection: "list",
       }).find(({ sessionKey }) => sessionKey === scope.sessionKey)?.entry;
       expect(nativeListEntry).toMatchObject({
-        participants: [
-          { identity: { type: "agent", id: "main" } },
-          { identity: { type: "agent", id: "research" } },
-        ],
+        participants: [participant("main"), participant("research")],
         participantCount: 2,
       });
       const nativeEntry = loadSessionEntry(scope);
@@ -82,24 +87,16 @@ it("publishes byte-identical group and participant facts without host membership
         participants: nativeListEntry?.participants,
         participantCount: 2,
       });
-      expect(
-        JSON.stringify({
-          participants: projection.describe(query)?.entry.participants,
-          participantCount: projection.describe(query)?.entry.participantCount,
-        }),
-      ).toBe(
-        JSON.stringify({
-          participants: nativeEntry?.participants,
-          participantCount: nativeEntry?.participantCount,
-        }),
+      expect(participantBytes(projection.describe(query)?.entry)).toBe(
+        participantBytes(nativeEntry),
       );
       const goldenGroups = JSON.stringify([
         ...new Map(readSessionGroupMembership({}, process.env).groups),
       ]);
       const goldenParticipants = JSON.stringify(projection.snapshot(query).row?.participants);
       expect(projection.describe(query)?.membership.has("viewer")).toBe(true);
-      const reads = observeQueries(prototype);
-      try {
+      {
+        using reads = observeQueries(prototype);
         for (let viewer = 0; viewer < 50; viewer++) {
           expect(JSON.stringify([...projection.sessionGroupTargets()])).toBe(goldenGroups);
           expect(JSON.stringify(projection.snapshot(query).row?.participants)).toBe(
@@ -107,28 +104,20 @@ it("publishes byte-identical group and participant facts without host membership
           );
           expect(projection.hasMembership(database.path, scope.sessionKey, "viewer")).toBe(true);
         }
-        expect(
-          reads.executed.filter((sql) => /\bsession_(members|participants)\b/i.test(sql)),
-        ).toEqual([]);
-      } finally {
-        reads.restore();
+        reads.expectNoMembershipSql();
       }
       // Revocation is visible before full-row materialization or another awaited worker read.
       removeSessionMember(scope, "viewer");
       expect(projection.hasMembership(database.path, scope.sessionKey, "viewer")).toBe(false);
-      const refreshReads = observeQueries(prototype);
-      try {
+      {
+        using refreshReads = observeQueries(prototype);
         await projection.ensureMaterialized();
         await projection.prepareMembership();
         expect(projection.describe(query)?.membership.has("viewer")).toBe(false);
         expect(JSON.stringify(projection.snapshot(query).row?.participants)).toBe(
           goldenParticipants,
         );
-        expect(
-          refreshReads.executed.filter((sql) => /\bsession_(members|participants)\b/i.test(sql)),
-        ).toEqual([]);
-      } finally {
-        refreshReads.restore();
+        refreshReads.expectNoMembershipSql();
       }
     } finally {
       admissionReads.restore();
@@ -149,6 +138,8 @@ it("publishes final replacement facts to observers registered before the project
       promptedAt: 1,
     });
     const database = openOpenClawAgentDatabase(scope);
+    const replace = (sessionId: string, updatedAt: number) =>
+      replaceSessionEntrySync(scope, { sessionId, updatedAt, category: sessionId });
     let projection: SessionRowProjection | undefined;
     let observing = false;
     const observed: Array<{
@@ -173,16 +164,8 @@ it("publishes final replacement facts to observers registered before the project
       await projection.ensureMaterialized();
       observing = true;
       runOpenClawAgentWriteTransaction(() => {
-        replaceSessionEntrySync(scope, {
-          sessionId: "intermediate",
-          updatedAt: 2,
-          category: "intermediate",
-        });
-        replaceSessionEntrySync(scope, {
-          sessionId: "current",
-          updatedAt: 3,
-          category: "current",
-        });
+        replace("intermediate", 2);
+        replace("current", 3);
         addSessionMember(scope, { identityId: "transient", addedBy: "owner" });
         removeSessionMember(scope, "transient");
         addSessionMember(scope, { identityId: "current-viewer", addedBy: "owner" });
@@ -192,11 +175,7 @@ it("publishes final replacement facts to observers registered before the project
         });
         expect(() =>
           runOpenClawAgentWriteTransaction(() => {
-            replaceSessionEntrySync(scope, {
-              sessionId: "rolled-back",
-              updatedAt: 4,
-              category: "rolled-back",
-            });
+            replace("rolled-back", 4);
             addSessionMember(scope, { identityId: "rolled-back", addedBy: "owner" });
             throw new Error("rollback savepoint");
           }, scope),
@@ -222,10 +201,7 @@ it("publishes final replacement facts to observers registered before the project
       expect(entry).toMatchObject({
         sessionId: "current",
         category: "current",
-        participants: [
-          { identity: { type: "agent", id: "research" } },
-          { identity: { type: "agent", id: "reviewer" } },
-        ],
+        participants: [participant("research"), participant("reviewer")],
         participantCount: 2,
       });
     } finally {

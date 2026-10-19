@@ -7,11 +7,13 @@ import { replaceSessionEntrySync } from "../config/sessions/session-accessor.js"
 import { bindSessionTranscriptStoreScope } from "../config/sessions/session-accessor.transcript-target.js";
 import { withSessionActor } from "../config/sessions/session-actor-scope.js";
 import { buildRestartRecoveryExpectedState } from "../config/sessions/session-transcript-turn-state.js";
-import * as history from "../config/sessions/session-transcript-worker-runtime.js";
 import { patchSessionEntry as patchSdkSessionEntry } from "../plugin-sdk/session-store-runtime.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
-import { retainSessionListForegroundWork } from "./session-projection-work.js";
-import { createSessionRowProjection } from "./session-row-projection.js";
+import {
+  createTestProjection,
+  holdForeground,
+  watchRowFacts as observeRowFacts,
+} from "./session-row-projection.read-fixture.test-support.js";
 import * as transcriptBackfill from "./session-row-transcript-backfill.js";
 
 // Hold GatewayScheduler timeouts so WAL maintenance stays outside the request SQL budget.
@@ -20,29 +22,6 @@ afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
 });
-
-function observeRowFacts(
-  wrap: (
-    owner: history.SessionHistoryWorkerDatabase,
-  ) => history.SessionHistoryWorkerDatabase["readRowFacts"],
-  once = false,
-) {
-  const readDatabases = history.withSessionHistoryWorkerDatabases;
-  const observe: typeof readDatabases = (databases, consume, lane) =>
-    readDatabases(
-      databases,
-      (owners) =>
-        consume(
-          owners.map((owner) => ({
-            ...owner,
-            readRowFacts: wrap(owner),
-          })),
-        ),
-      lane,
-    );
-  const spy = vi.spyOn(history, "withSessionHistoryWorkerDatabases");
-  return once ? spy.mockImplementationOnce(observe) : spy.mockImplementation(observe);
-}
 
 it("reuses actor row facts after metadata writes and refreshes Board presence after a write", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async () => {
@@ -75,46 +54,41 @@ it("reuses actor row facts after metadata writes and refreshes Board presence af
           reads.push([...input.sessionKeys]);
           return owner.readRowFacts(input);
         });
-        const release = retainSessionListForegroundWork();
-        const projection = await createSessionRowProjection({ cfg, modelCatalog: [] });
+        using _ = holdForeground();
+        using projection = await createTestProjection({ cfg, modelCatalog: [] });
         const query = { agentId: scope.agentId, key: scope.sessionKey };
-        try {
-          await projection.ensureMaterialized();
-          expect(projection.snapshot(query).row).toMatchObject({
-            sessionId: entry.sessionId,
-            label: "Committed metadata",
-            hasBoard: false,
-          });
-          expect(projection.describe(query)?.retainedDatabaseFacts?.entry).not.toHaveProperty(
-            "skillsSnapshot",
-          );
-          expect(reads).toEqual([]);
+        await projection.ensureMaterialized();
+        expect(projection.snapshot(query).row).toMatchObject({
+          sessionId: entry.sessionId,
+          label: "Committed metadata",
+          hasBoard: false,
+        });
+        expect(projection.describe(query)?.retainedDatabaseFacts?.entry).not.toHaveProperty(
+          "skillsSnapshot",
+        );
+        expect(reads).toEqual([]);
 
-          const board = new SqliteBoardStore({
-            resolveSession: ({ sessionKey }) => ({ agentId: scope.agentId, sessionKey }),
-          });
-          await board.putWidget({
-            sessionKey: scope.sessionKey,
-            name: "status",
-            content: { kind: "html", html: "<p>Current</p>" },
-          });
-          await projection.ensureMaterialized();
-          expect(projection.snapshot(query).row).toMatchObject({
-            hasBoard: true,
-            label: "Committed metadata",
-          });
-          expect(reads).toEqual([[scope.sessionKey]]);
-          await updateLabel("Metadata after Board", 3);
-          await projection.ensureMaterialized();
-          expect(projection.snapshot(query).row).toMatchObject({
-            hasBoard: true,
-            label: "Metadata after Board",
-          });
-          expect(reads).toEqual([[scope.sessionKey]]);
-        } finally {
-          projection.dispose();
-          release();
-        }
+        const board = new SqliteBoardStore({
+          resolveSession: ({ sessionKey }) => ({ agentId: scope.agentId, sessionKey }),
+        });
+        await board.putWidget({
+          sessionKey: scope.sessionKey,
+          name: "status",
+          content: { kind: "html", html: "<p>Current</p>" },
+        });
+        await projection.ensureMaterialized();
+        expect(projection.snapshot(query).row).toMatchObject({
+          hasBoard: true,
+          label: "Committed metadata",
+        });
+        expect(reads).toEqual([[scope.sessionKey]]);
+        await updateLabel("Metadata after Board", 3);
+        await projection.ensureMaterialized();
+        expect(projection.snapshot(query).row).toMatchObject({
+          hasBoard: true,
+          label: "Metadata after Board",
+        });
+        expect(reads).toEqual([[scope.sessionKey]]);
         return true;
       },
     );
@@ -145,83 +119,75 @@ it("publishes user and assistant actor previews without background reads or losi
           return owner.readRowFacts(input);
         });
         const backfill = vi.spyOn(transcriptBackfill, "backfillSessionRowTranscriptFields");
-        const release = retainSessionListForegroundWork();
-        const projection = await createSessionRowProjection({ cfg, modelCatalog: [] });
+        using release = holdForeground();
+        using projection = await createTestProjection({ cfg, modelCatalog: [] });
         const query = { agentId: scope.agentId, key: scope.sessionKey };
-        try {
-          await projection.ensureMaterialized();
-          const input = await actor.acceptInput(
-            {
-              commandId: "accepted-input",
-              phaseId: "turn",
-              expectedState: buildRestartRecoveryExpectedState(entry),
-              lifecycle: {},
-              turn: {
-                ...scope,
-                options: {
-                  expectedSessionId: entry.sessionId,
-                  sessionFile: "synthetic.jsonl",
-                  touchSessionEntry: false,
-                  messages: [
-                    {
-                      eventId: "accepted-input",
-                      message: { role: "user", content: "Accepted question" },
-                      now: 2,
-                    },
-                  ],
-                },
+        await projection.ensureMaterialized();
+        const input = await actor.acceptInput(
+          {
+            commandId: "accepted-input",
+            phaseId: "turn",
+            expectedState: buildRestartRecoveryExpectedState(entry),
+            lifecycle: {},
+            turn: {
+              ...scope,
+              options: {
+                expectedSessionId: entry.sessionId,
+                sessionFile: "synthetic.jsonl",
+                touchSessionEntry: false,
+                messages: [
+                  {
+                    eventId: "accepted-input",
+                    message: { role: "user", content: "Accepted question" },
+                    now: 2,
+                  },
+                ],
               },
             },
-            authority,
-          );
-          expect(input.kind).toBe("committed");
-          await projection.ensureMaterialized();
-          expect(
-            projection.snapshot(query, { includeLastMessage: true }).row?.lastMessagePreview,
-          ).toBe("Accepted question");
-          expect(actor.snapshot(authority)?.transcript).toMatchObject({
-            anchorsState: "unavailable",
-            projection: { state: { activeMessageCount: 1 } },
-          });
+          },
+          authority,
+        );
+        expect(input.kind).toBe("committed");
+        await projection.ensureMaterialized();
+        expect(
+          projection.snapshot(query, { includeLastMessage: true }).row?.lastMessagePreview,
+        ).toBe("Accepted question");
+        expect(actor.snapshot(authority)?.transcript).toMatchObject({
+          anchorsState: "unavailable",
+          projection: { state: { activeMessageCount: 1 } },
+        });
 
-          const reply = await appendSessionManagerActor({
-            actor,
-            toolResult: false,
-            assertCurrent() {},
-            append: {
-              kind: "message",
-              input: {
-                scope: bindSessionTranscriptStoreScope(
-                  { ...scope, sessionId: entry.sessionId },
-                  cfg,
-                ),
-                cwd: "/synthetic",
-                messageJson: JSON.stringify({
-                  role: "assistant",
-                  content: "Committed answer",
-                  timestamp: 3,
-                }),
-              },
+        const reply = await appendSessionManagerActor({
+          actor,
+          toolResult: false,
+          assertCurrent() {},
+          append: {
+            kind: "message",
+            input: {
+              scope: bindSessionTranscriptStoreScope({ ...scope, sessionId: entry.sessionId }, cfg),
+              cwd: "/synthetic",
+              messageJson: JSON.stringify({
+                role: "assistant",
+                content: "Committed answer",
+                timestamp: 3,
+              }),
             },
-          });
-          expect(reply.failure).toBeUndefined();
-          await projection.ensureMaterialized();
-          expect(
-            projection.snapshot(query, { includeLastMessage: true }).row?.lastMessagePreview,
-          ).toBe("Committed answer");
-          expect(actor.snapshot(authority)?.transcript).toMatchObject({
-            anchorsState: "unavailable",
-            projection: { state: { activeMessageCount: 2 } },
-          });
-          expect(reads).toEqual([]);
+          },
+        });
+        expect(reply.failure).toBeUndefined();
+        await projection.ensureMaterialized();
+        expect(
+          projection.snapshot(query, { includeLastMessage: true }).row?.lastMessagePreview,
+        ).toBe("Committed answer");
+        expect(actor.snapshot(authority)?.transcript).toMatchObject({
+          anchorsState: "unavailable",
+          projection: { state: { activeMessageCount: 2 } },
+        });
+        expect(reads).toEqual([]);
 
-          release();
-          await nextTurn();
-          expect(backfill).not.toHaveBeenCalled();
-        } finally {
-          projection.dispose();
-          release();
-        }
+        release();
+        await nextTurn();
+        expect(backfill).not.toHaveBeenCalled();
         return true;
       },
     );

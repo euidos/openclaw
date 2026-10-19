@@ -15,11 +15,19 @@ import { resolveIncognitoOpenClawAgentSqlitePath } from "../state/openclaw-agent
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { identifiedClient } from "./server-methods/sessions-read-cache.test-support.js";
 import { prepareProjectedSessionPresentation } from "./session-row-presentation.js";
-import { createSessionRowProjection } from "./session-row-projection.js";
+import type { SessionRowProjection } from "./session-row-projection.js";
+import { createTestProjection } from "./session-row-projection.read-fixture.test-support.js";
 import { canReceiveSessionEvent } from "./session-sharing.js";
 import { resolveGatewaySessionStoreTargetWithStoreAsync } from "./session-utils-store-lookup.js";
 
 afterEach(() => memorySessionActorOwners.reset());
+
+function findKeys(
+  projection: SessionRowProjection,
+  query: Parameters<SessionRowProjection["findBySessionId"]>[0],
+) {
+  return projection.findBySessionId(query).map((row) => row.key);
+}
 
 it("finds retained incognito sessions from an explicit root distinct from the ambient root", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
@@ -36,27 +44,23 @@ it("finds retained incognito sessions from an explicit root distinct from the am
       updatedAt: 1,
       incognito: true,
     });
-    const projection = await createSessionRowProjection({ cfg, modelCatalog: [] });
-    try {
-      const query = { agentId: "main", sessionId: "private-original", federated: true };
-      expect(projection.findBySessionId(query)).toMatchObject([
-        { key, storeTarget: { storePath }, entry: { sessionId: "private-original" } },
-      ]);
-      expect(
-        projection.findBySessionId({ ...target, sessionId: "private-original" }),
-      ).toMatchObject([{ key, entry: { sessionId: "private-original" } }]);
-      await replaceSessionEntry(target, {
-        sessionId: "private-current",
-        updatedAt: 2,
-        incognito: true,
-      });
-      expect(projection.findBySessionId(query)).toEqual([]);
-      expect(projection.findBySessionId({ ...query, sessionId: "private-current" })).toMatchObject([
-        { key, storeTarget: { storePath }, entry: { sessionId: "private-current" } },
-      ]);
-    } finally {
-      projection.dispose();
-    }
+    using projection = await createTestProjection({ cfg, modelCatalog: [] });
+    const query = { agentId: "main", sessionId: "private-original", federated: true };
+    expect(projection.findBySessionId(query)).toMatchObject([
+      { key, storeTarget: { storePath }, entry: { sessionId: "private-original" } },
+    ]);
+    expect(projection.findBySessionId({ ...target, sessionId: "private-original" })).toMatchObject([
+      { key, entry: { sessionId: "private-original" } },
+    ]);
+    await replaceSessionEntry(target, {
+      sessionId: "private-current",
+      updatedAt: 2,
+      incognito: true,
+    });
+    expect(projection.findBySessionId(query)).toEqual([]);
+    expect(projection.findBySessionId({ ...query, sessionId: "private-current" })).toMatchObject([
+      { key, storeTarget: { storePath }, entry: { sessionId: "private-current" } },
+    ]);
   });
 });
 
@@ -109,24 +113,20 @@ it("reads a private parent once despite multiple durable store candidates", asyn
     expect(scoped.targetsBySessionKey.get(key)?.readSourceEntry(parent)?.modelOverride).toBe(
       "qwen3:14b",
     );
-    const projection = await createSessionRowProjection({ cfg, modelCatalog: [] });
-    try {
-      const query = { agentId: "work", key };
-      await projection.withPreparedExactRows(
-        () => [query],
-        (read) => {
-          expect(read.present(read.describe(query)!)).toMatchObject({
-            key,
-            parentSessionKey: parent,
-            model: "qwen3:14b",
-            modelOverrideSource: "inherited",
-          });
-        },
-      );
-      expect(projection.selectEntries().map((row) => row.key)).not.toContain(key);
-    } finally {
-      projection.dispose();
-    }
+    using projection = await createTestProjection({ cfg, modelCatalog: [] });
+    const query = { agentId: "work", key };
+    await projection.withPreparedExactRows(
+      () => [query],
+      (read) => {
+        expect(read.present(read.describe(query)!)).toMatchObject({
+          key,
+          parentSessionKey: parent,
+          model: "qwen3:14b",
+          modelOverrideSource: "inherited",
+        });
+      },
+    );
+    expect(projection.selectEntries().map((row) => row.key)).not.toContain(key);
   });
 });
 
@@ -153,7 +153,7 @@ it.each(["capture", "prepared"] as const)(
         path: storePath,
         authority: { assertCurrent() {}, authorize() {} },
       };
-      const projection = await createSessionRowProjection({ cfg, modelCatalog: [] });
+      const projection = await createTestProjection({ cfg, modelCatalog: [] });
       try {
         await actor.release();
         if (mode === "prepared") {
@@ -213,7 +213,7 @@ it("keeps archived incognito rows private and retires captures when their sessio
       },
     );
     const viewer = identifiedClient("incognito-observer");
-    const projection = await createSessionRowProjection({ cfg, getModelCatalog: async () => [] });
+    const projection = await createTestProjection({ cfg, getModelCatalog: async () => [] });
     try {
       const original = projection.capture(query)!;
       expect(original?.entry?.sessionId).toBe(entry.sessionId);
@@ -265,16 +265,9 @@ it("keeps archived incognito rows private and retires captures when their sessio
           ).toBe(false);
         },
       );
-      expect(
-        projection
-          .findBySessionId({ agentId: "main", storePath, sessionId: entry.sessionId })
-          .map(({ key: foundKey }) => foundKey),
-      ).toEqual([key]);
-      expect(
-        projection
-          .findBySessionId({ agentId: "main", sessionId: entry.sessionId, federated: true })
-          .map((row) => row.key),
-      ).toEqual([key]);
+      const identity = { agentId: "main", sessionId: entry.sessionId };
+      expect(findKeys(projection, { ...identity, storePath })).toEqual([key]);
+      expect(findKeys(projection, { ...identity, federated: true })).toEqual([key]);
       expect(projection.selectEntries()).toEqual([]);
       const internal = resolveInternalSessionEffectsIdentity({
         agentId: "main",
@@ -288,9 +281,7 @@ it("keeps archived incognito rows private and retires captures when their sessio
         touchSessionEntry: false,
       });
       // Exact internal readers may address their private row; discovery must not.
-      expect(projection.findBySessionId(internalScope).map((row) => row.key)).toEqual([
-        internal.sessionKey,
-      ]);
+      expect(findKeys(projection, internalScope)).toEqual([internal.sessionKey]);
       expect(
         projection.findBySessionId({
           agentId: "main",
