@@ -1,4 +1,5 @@
 /** Real tool → Gateway handler → resident session rows; no provider or turn execution. */
+import assert from "node:assert/strict";
 import { expectDefined } from "@openclaw/normalization-core";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { expect, test, vi } from "vitest";
@@ -80,16 +81,12 @@ test.each(inventorySizes)(
     const callGateway: AgentToolGatewayRequestCaller = async <T>(
       request: Parameters<AgentToolGatewayRequestCaller>[0],
     ) => {
-      if (!isRecord(request.params)) {
-        throw new Error("Expected structured Gateway request params");
-      }
+      assert(isRecord(request.params), "Expected structured Gateway request params");
       requests.push({ method: request.method, params: request.params });
       const response = await directSessionReq<T>(request.method, request.params, {
         context: { getRuntimeConfig: () => cfg, ...bindSessionRowProjection({}, () => projection) },
       });
-      if (!response.ok) {
-        throw new Error(response.error?.message ?? "Gateway inventory request failed");
-      }
+      assert(response.ok, response.error?.message ?? "Gateway inventory request failed");
       return expectDefined(response.payload, "Gateway inventory payload");
     };
     const tool = createSessionsListTool({
@@ -137,13 +134,12 @@ test.each(inventorySizes)(
           },
         });
         expect(details).toMatchObject({ count: MATCH_COUNT, hasMore: false });
-        if (!isRecord(details) || !Array.isArray(details.sessions)) {
-          throw new Error("Expected sessions_list details with sessions");
-        }
+        assert(
+          isRecord(details) && Array.isArray(details.sessions),
+          "Expected sessions_list details with sessions",
+        );
         const returnedKeys = details.sessions.map((row: unknown) => {
-          if (!isRecord(row)) {
-            throw new Error("Expected inventory row");
-          }
+          assert(isRecord(row), "Expected inventory row");
           expect(row).toMatchObject({
             owner: { actor: { id: selected.id } },
             group: SELECTED_GROUP,

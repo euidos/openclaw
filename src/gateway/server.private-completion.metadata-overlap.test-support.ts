@@ -31,10 +31,8 @@ export function holdMetadataThroughSubagentStop(target: {
   let producerOutcome: Promise<{ ok: true } | { ok: false; error: unknown }> | undefined;
   let disposal: Promise<void> | undefined;
   const release = (reason: NonNullable<typeof releaseReason>) => {
-    if (releaseReason === undefined) {
-      releaseReason = reason;
-      releaseResult.resolve();
-    }
+    releaseReason ??= reason;
+    releaseResult.resolve();
   };
   const onAbort = () => release("test-abort");
   target.signal.addEventListener("abort", onAbort, { once: true });
@@ -95,8 +93,10 @@ export function holdMetadataThroughSubagentStop(target: {
       if (producerScope.getStore() !== true) {
         return execution;
       }
-      const runExisting: typeof execution.runExisting = (source, operation, options) =>
-        execution.runExisting(
+      // Captures return fresh borrowers, so only this producer's handle is wrapped.
+      const runExisting = execution.runExisting;
+      execution.runExisting = (source, operation, options) =>
+        runExisting(
           source,
           (scope) =>
             operation({
@@ -115,25 +115,18 @@ export function holdMetadataThroughSubagentStop(target: {
             }),
           options,
         );
-      return new Proxy(execution, {
-        get(original, key, receiver) {
-          return key === "runExisting" ? runExisting : Reflect.get(original, key, receiver);
-        },
-      });
+      return execution;
     });
 
   const persistMarker = killSession.persistSubagentAbortedLastRun;
   const markerSpy = vi
     .spyOn(killSession, "persistSubagentAbortedLastRun")
     .mockImplementation((params) => {
-      if (
-        params.childSessionKey !== target.sessionKey ||
-        !params.abortedLastRun ||
-        !bookkeepingReturned
-      ) {
-        return persistMarker(params);
-      }
-      return markerScope.run(true, () => persistMarker(params));
+      return params.childSessionKey === target.sessionKey &&
+        params.abortedLastRun &&
+        bookkeepingReturned
+        ? markerScope.run(true, () => persistMarker(params))
+        : persistMarker(params);
     });
 
   const completeBookkeeping = bookkeeping.completeCleanupBookkeeping;
@@ -188,9 +181,7 @@ export function holdMetadataThroughSubagentStop(target: {
       expect(releaseReason).toBe("marker-enqueued");
       expect(await producerOutcome).toEqual({ ok: true });
     },
-    releaseForCleanup() {
-      release("cleanup");
-    },
+    releaseForCleanup: () => release("cleanup"),
     dispose(): Promise<void> {
       disposal ??= (async () => {
         release("cleanup");

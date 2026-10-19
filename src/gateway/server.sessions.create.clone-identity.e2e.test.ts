@@ -88,12 +88,10 @@ test.each(
     });
     const broadcast = vi.fn();
     let sequence = 0;
-    const errors = () =>
-      JSON.stringify(
-        broadcast.mock.calls
-          .filter(([event, data]) => event === "chat" && data.state === "error")
-          .map(([, data]) => data.errorMessage),
-      );
+    const chatErrors = () =>
+      broadcast.mock.calls
+        .filter(([event, data]) => event === "chat" && data.state === "error")
+        .map(([, data]) => data.errorMessage);
     const create = async (worktree = false) => {
       const created = await directSessionReq<{ key: string; runId: string }>(
         "sessions.create",
@@ -122,12 +120,12 @@ test.each(
       });
       expect(getRpcSource(runId)).toBeUndefined();
       const entry = (await loadGatewaySessionEntryReadOnlyAsync(key, { agentId: "main" })).entry;
-      expect(entry, errors()).toBeDefined();
+      expect(entry, JSON.stringify(chatErrors())).toBeDefined();
       return { runId, entry };
     };
     if (operation === "refresh") {
       const warm = await create();
-      expect(warm.entry?.projectId, errors()).toBeDefined();
+      expect(warm.entry?.projectId, JSON.stringify(chatErrors())).toBeDefined();
       await requireGit(path.join(git.root, "remote.git"), ["branch", "fresh-base", git.later]);
       git.requests.length = 0;
       dispatchInboundMessageMock.mockClear();
@@ -168,9 +166,9 @@ test.each(
     if (identity === "allowed") {
       expect(git.requests.length).toBeGreaterThan(0);
       expect(git.requests.every((authorization) => authorization === AUTHORIZATION)).toBe(true);
-      expect(created.entry?.projectId, errors()).toBeDefined();
+      expect(created.entry?.projectId, JSON.stringify(chatErrors())).toBeDefined();
       expect(dispatchInboundMessageMock).toHaveBeenCalledOnce();
-      expect(errors()).toBe("[]");
+      expect(chatErrors()).toEqual([]);
       expect(created.entry?.pendingWorktree).toBeUndefined();
       expect(await fs.readFile(path.join(created.entry!.spawnedCwd!, "input.txt"), "utf8")).toBe(
         "later private content\n",

@@ -6,6 +6,7 @@ import { SqliteBoardStore } from "../boards/sqlite-board-store.js";
 import { replaceSessionEntrySync } from "../config/sessions/session-accessor.entry.js";
 import { loadSessionEntry } from "../config/sessions/session-accessor.js";
 import { resolveSqliteTargetFromSessionStorePath } from "../config/sessions/session-sqlite-target.js";
+import type { SessionEntry } from "../config/sessions/types.js";
 import { closeOpenClawAgentDatabaseByPathAsync } from "../state/openclaw-agent-db.js";
 import { withEnvAsync } from "../test-utils/env.js";
 import { boardStore } from "./board-store.js";
@@ -16,12 +17,7 @@ import {
 } from "./test/server-sessions.test-helpers.js";
 
 const { createSessionStoreDir, openClient } = setupGatewaySessionsTestHarness();
-type BoardSession = {
-  key: string;
-  boardFace?: string;
-  boardPresentation?: string;
-  hasBoard?: boolean;
-};
+type BoardSession = Pick<SessionEntry, "boardFace" | "boardPresentation"> & { key: string };
 type BoardList = { sessions: BoardSession[]; totalCount: number };
 type Client = Awaited<ReturnType<typeof openClient>>["ws"];
 
@@ -38,6 +34,12 @@ async function withClient(scopes: string[], run: (ws: Client) => Promise<void>) 
   } finally {
     ws.close();
   }
+}
+
+function addBoard(store: Pick<SqliteBoardStore, "applyOps">, sessionKey: string) {
+  return store.applyOps({ sessionKey }, [
+    { kind: "tab_create", tabId: "main", title: "Dashboard" },
+  ]);
 }
 
 test("dashboard defaults persist for another client and clear without changing the board face", async () => {
@@ -111,9 +113,7 @@ test("sessions.list filters dashboard sessions by board existence instead of sav
       faceOnly: { sessionId: "sess-face-only", updatedAt: now - 1, boardFace: "dashboard" },
     },
   });
-  await boardStore.applyOps({ sessionKey: "agent:main:board" }, [
-    { kind: "tab_create", tabId: "main", title: "Dashboard" },
-  ]);
+  await addBoard(boardStore, "agent:main:board");
 
   await withClient(["operator.read", "operator.write"], async (ws) => {
     for (const hasBoard of [true, false]) {
@@ -170,9 +170,7 @@ test("sessions.list ignores a same-owner sentinel board in an unselected store",
         sessionKey: "unknown",
       }),
     });
-    await boards.applyOps({ sessionKey: "unknown" }, [
-      { kind: "tab_create", tabId: "main", title: "Selected-store dashboard" },
-    ]);
+    await addBoard(boards, "unknown");
     testState.agentsConfig = { entries: { main: {} } };
     testState.sessionConfig = {
       store: path.join(stateDir, "agents", "{agentId}", "sessions", "sessions.json"),

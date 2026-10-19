@@ -1,4 +1,5 @@
 /** Gateway health endpoint integration tests. */
+import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { asOptionalRecord, expectDefined } from "@openclaw/normalization-core";
@@ -70,9 +71,7 @@ test("connect + health + presence + status succeed", healthTimeout, async () => 
     arrayBuffersBytes: sample.arrayBuffersMb,
   })) {
     const bytes = memory[field];
-    if (typeof bytes !== "number") {
-      throw new Error(`Expected numeric process memory field: ${field}`);
-    }
+    assert(typeof bytes === "number", `Expected numeric process memory field: ${field}`);
     expect(Number.isFinite(bytes)).toBe(true);
     expect(bytes).toBeGreaterThanOrEqual(0);
     expect(megabytes).toBe(bytes / 1048576);
@@ -109,11 +108,8 @@ test("presence events carry seq + stateVersion", presenceTimeout, async () => {
   };
   let seq = expectDefined(evt.seq, "presence sequence");
   let version = expectDefined(evt.stateVersion?.presence, "presence state version");
-  const beacon = async (
-    overrides: { ip?: string; lastInputSeconds?: number },
-    ip: string,
-    lastInputSeconds: number,
-  ) => {
+  const beacon = async (overrides: { ip?: string; lastInputSeconds?: number }) => {
+    const { ip, lastInputSeconds } = { ip: "10.0.0.9", lastInputSeconds: 7, ...overrides };
     const eventP = onceMessage<PresenceEvent>(
       ws,
       (frame) =>
@@ -153,16 +149,16 @@ test("presence events carry seq + stateVersion", presenceTimeout, async () => {
   };
 
   try {
-    await beacon({}, "10.0.0.9", 7);
+    await beacon({});
     expect(drainSystemEvents(sessionKey)).toEqual([
       "Node: Relay-Host (10.0.0.9) · app 2.1.0 · mode ui",
     ]);
 
     // Consuming the first event clears queue dedupe; it cannot hide a noisy refresh.
-    await beacon({ lastInputSeconds: 11 }, "10.0.0.9", 11);
+    await beacon({ lastInputSeconds: 11 });
     expect(drainSystemEvents(sessionKey)).toEqual([]);
 
-    await beacon({ ip: "10.0.0.10", lastInputSeconds: 11 }, "10.0.0.10", 11);
+    await beacon({ ip: "10.0.0.10", lastInputSeconds: 11 });
     expect(drainSystemEvents(sessionKey)).toEqual(["Node: Relay-Host (10.0.0.10)"]);
   } finally {
     drainSystemEvents(sessionKey);

@@ -117,10 +117,9 @@ test.each(["mobile", "node"] as const)("trusted-proxy %s pairing", async (profil
       mode: "node" as const,
     };
     // Machine routes preserve proxy attribution but assert no operator identity.
-    const nodeHeaders: Record<string, string> = { ...PROXY_HEADERS };
-    if (profile === "node") {
-      delete nodeHeaders["x-forwarded-user"];
-    }
+    const anonymousHeaders: Record<string, string> = { ...PROXY_HEADERS };
+    delete anonymousHeaders["x-forwarded-user"];
+    const nodeHeaders = profile === "node" ? anonymousHeaders : PROXY_HEADERS;
     const connectDevice = async (
       overrides: Parameters<typeof connectReq>[1],
       headers = nodeHeaders,
@@ -178,13 +177,9 @@ test.each(["mobile", "node"] as const)("trusted-proxy %s pairing", async (profil
     for (const authenticatedProxy of [true, false]) {
       // A paired phone may still authenticate through the proxy. Remove only
       // its identity assertion to test the consumed bootstrap as the sole credential.
-      const headers: Record<string, string> = { ...PROXY_HEADERS };
-      if (!authenticatedProxy) {
-        delete headers["x-forwarded-user"];
-      }
       const { response: reconnected } = await connectDevice(
         { bootstrapToken: payload.bootstrapToken },
-        headers,
+        authenticatedProxy ? PROXY_HEADERS : anonymousHeaders,
       );
       expect(reconnected.ok).toBe(authenticatedProxy);
       if (!authenticatedProxy) {

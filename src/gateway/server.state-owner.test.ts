@@ -186,9 +186,7 @@ it.each(["clean startup", "startup", "shutdown"] as const)(
       runtime.startupError = undefined;
     } else {
       const first = await startGatewayServer(18701);
-      runtime.close = async () => {
-        throw failure;
-      };
+      runtime.close = vi.fn<() => Promise<void>>().mockRejectedValue(failure);
       await expect(first.close()).rejects.toBe(failure);
       runtime.close = async () => {};
     }
