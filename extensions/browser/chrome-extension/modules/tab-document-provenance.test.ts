@@ -98,6 +98,15 @@ function createHarness() {
     );
     return documents.navigateTab(7, epoch, params, isAttached, isCurrent, sendCommand);
   };
+  const confirmBlank = () =>
+    navigate(async () => {
+      commitBlank();
+      return blankResult;
+    });
+  const expectRetired = () => {
+    expect(documents.get(7)).toBeUndefined();
+    expect(send).not.toHaveBeenCalled();
+  };
   return {
     documents,
     access,
@@ -113,6 +122,8 @@ function createHarness() {
     emit,
     commitBlank,
     navigate,
+    confirmBlank,
+    expectRetired,
   };
 }
 
@@ -197,8 +208,7 @@ describe("commanded tab document provenance", () => {
       } else {
         await expect(navigating).rejects.toThrow("access was revoked");
       }
-      expect(h.documents.get(7)).toBeUndefined();
-      expect(h.send).not.toHaveBeenCalled();
+      h.expectRetired();
     },
   );
 
@@ -224,8 +234,7 @@ describe("commanded tab document provenance", () => {
         return result;
       }),
     ).rejects.toThrow(name === "rejected" ? "native failure" : /confirm|revoked/);
-    expect(h.documents.get(7)).toBeUndefined();
-    expect(h.send).not.toHaveBeenCalled();
+    h.expectRetired();
     expect(h.access.invalidateTab).toHaveBeenCalledWith(7);
   });
 
@@ -242,8 +251,7 @@ describe("commanded tab document provenance", () => {
           url: change === "competing document" ? originalUrl : "about:blank",
         }),
       );
-      expect(h.documents.get(7)).toBeUndefined();
-      expect(h.send).not.toHaveBeenCalled();
+      h.expectRetired();
     },
   );
 
@@ -256,59 +264,47 @@ describe("commanded tab document provenance", () => {
     { phase: "before response", reason: "retireAttachment" },
     { phase: "before response", reason: "invalidateAll" },
     { phase: "before response", reason: "invalidateGroup" },
-  ])("discards authority and queued events on $reason $phase", async ({ phase, reason }) => {
-    const h = createHarness();
-    let navigation: TabDocumentNavigation;
-    const revoke = () => {
-      switch (reason) {
-        case "connection":
-          h.isCurrent.mockReturnValue(false);
-          break;
-        case "attachment":
-          h.isAttached.mockReturnValue(undefined);
-          break;
-        case "command access":
-          h.proven.delete(h.epoch);
-          break;
-        case "attachment access":
-          h.proven.delete(h.attachmentEpoch);
-          break;
-        case "retireAttachment":
-          h.documents.retireAttachment(7);
-          break;
-        case "invalidateAll":
-          h.documents.invalidateAll();
-          break;
-        default:
-          h.documents.invalidateGroup({ id: 7 });
-      }
-    };
-    const navigating = h.navigate(async () => {
-      h.commitBlank();
-      const document = h.documents.get(7);
-      assert(document);
-      navigation = document.navigation;
+  ] as const)(
+    "discards authority and queued events on $reason $phase",
+    async ({ phase, reason }) => {
+      const h = createHarness();
+      let navigation: TabDocumentNavigation;
+      const revocations = {
+        connection: () => h.isCurrent.mockReturnValue(false),
+        attachment: () => h.isAttached.mockReturnValue(undefined),
+        "command access": () => h.proven.delete(h.epoch),
+        "attachment access": () => h.proven.delete(h.attachmentEpoch),
+        retireAttachment: () => h.documents.retireAttachment(7),
+        invalidateAll: () => h.documents.invalidateAll(),
+        invalidateGroup: () => h.documents.invalidateGroup({ id: 7 }),
+      };
+      const revoke = revocations[reason];
+      const navigating = h.navigate(async () => {
+        h.commitBlank();
+        const document = h.documents.get(7);
+        assert(document);
+        navigation = document.navigation;
+        if (phase === "before response") {
+          revoke();
+        }
+        return blankResult;
+      });
       if (phase === "before response") {
+        await expect(navigating).rejects.toThrow("access was revoked");
+      } else {
+        await navigating;
+        h.send.mockClear();
         revoke();
+        expect(() => navigation.observe(contextEvent, h.send)).toThrow("access was revoked");
       }
-      return blankResult;
-    });
-    if (phase === "before response") {
-      await expect(navigating).rejects.toThrow("access was revoked");
-    } else {
-      await navigating;
-      h.send.mockClear();
-      revoke();
+      h.isCurrent.mockReturnValue(true);
+      h.isAttached.mockReturnValue(h.attachmentEpoch);
+      h.proven.add(h.epoch).add(h.attachmentEpoch);
+      expect(() => navigation.accept(blankResult)).toThrow("access was revoked");
       expect(() => navigation.observe(contextEvent, h.send)).toThrow("access was revoked");
-    }
-    h.isCurrent.mockReturnValue(true);
-    h.isAttached.mockReturnValue(h.attachmentEpoch);
-    h.proven.add(h.epoch).add(h.attachmentEpoch);
-    expect(() => navigation.accept(blankResult)).toThrow("access was revoked");
-    expect(() => navigation.observe(contextEvent, h.send)).toThrow("access was revoked");
-    expect(h.documents.get(7)).toBeUndefined();
-    expect(h.send).not.toHaveBeenCalled();
-  });
+      h.expectRetired();
+    },
+  );
 
   it.each([
     { name: "group move", tab: { groupId: -1 } },
@@ -320,10 +316,7 @@ describe("commanded tab document provenance", () => {
     { name: "user blank", tab: {} },
   ])("retires controlled blank on $name", async ({ name, tab }) => {
     const h = createHarness();
-    await h.navigate(async () => {
-      h.commitBlank();
-      return blankResult;
-    });
+    await h.confirmBlank();
     const document = h.documents.get(7);
     assert(document);
     const navigation = document.navigation;
@@ -333,10 +326,9 @@ describe("commanded tab document provenance", () => {
     } else {
       h.documents.observeTab(Object.assign(h.tab, tab));
     }
-    expect(h.documents.get(7)).toBeUndefined();
     expect(h.access.invalidateTab).toHaveBeenCalledWith(7);
     expect(() => navigation.observe(contextEvent, h.send)).toThrow("access was revoked");
-    expect(h.send).not.toHaveBeenCalled();
+    h.expectRetired();
   });
 
   it.each(["root commit", "attachment revision"])(
@@ -376,19 +368,13 @@ describe("commanded tab document provenance", () => {
       return blankResult;
     });
     await expect(navigating).rejects.toThrow("access was revoked");
-    expect(h.documents.get(7)).toBeUndefined();
-    expect(h.send).not.toHaveBeenCalled();
+    h.expectRetired();
   });
 
   it("stops flushing immediately when the receiver revokes attachment authority", async () => {
     const h = createHarness();
     h.send.mockImplementationOnce(() => h.documents.retireAttachment(7));
-    await expect(
-      h.navigate(async () => {
-        h.commitBlank();
-        return blankResult;
-      }),
-    ).rejects.toThrow("access was revoked");
+    await expect(h.confirmBlank()).rejects.toThrow("access was revoked");
     expect(h.send.mock.calls).toEqual([[contextEvent]]);
     expect(h.documents.get(7)).toBeUndefined();
   });

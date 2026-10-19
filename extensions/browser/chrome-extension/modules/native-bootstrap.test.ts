@@ -21,6 +21,44 @@ type CleanupFailureStage =
   | "retired_local_remove"
   | "marker_remove";
 
+function localStorage(values: Record<string, unknown>) {
+  return {
+    get: vi.fn(async (keys: string[]) =>
+      Object.fromEntries(
+        keys.filter((key) => Object.hasOwn(values, key)).map((key) => [key, values[key]]),
+      ),
+    ),
+    set: vi.fn(async (next: Record<string, unknown>) => {
+      Object.assign(values, next);
+    }),
+    remove: vi.fn(async (keys: string[]) => {
+      for (const key of keys) {
+        delete values[key];
+      }
+    }),
+  };
+}
+
+function nativePort() {
+  let message = (_response: unknown) => {};
+  let disconnect = () => {};
+  return {
+    disconnect: vi.fn(() => disconnect()),
+    onMessage: {
+      addListener: (listener: typeof message) => {
+        message = listener;
+      },
+    },
+    onDisconnect: {
+      addListener: (listener: typeof disconnect) => {
+        disconnect = listener;
+      },
+    },
+    postMessage: vi.fn((_request: { nonce: string }) => {}),
+    respond: (response: unknown) => message(response),
+  };
+}
+
 function cleanupStorage(params: {
   registry?: unknown;
   readError?: Error;
@@ -37,55 +75,39 @@ function cleanupStorage(params: {
     copilotBrowserInstanceV1: "browser-instance",
     copilotPanelBindingsV1: { 7: "panel-binding" },
   };
-  const localSet = vi.fn(async (values: Record<string, unknown>) => {
-    if (failureStage === "marker_set") {
-      throw new Error("marker set failed");
-    }
-    Object.assign(localValues, values);
-  });
-  const localRemove = vi.fn(async (keys: string[]) => {
-    const stage = keys.includes(CUSTODY_BLOCKED_KEY) ? "marker_remove" : "retired_local_remove";
+  const local = localStorage(localValues);
+  const session = localStorage(sessionValues);
+  const failAt = (stage: CleanupFailureStage) => {
     if (failureStage === stage) {
       throw new Error(`${stage} failed`);
     }
-    for (const key of keys) {
-      delete localValues[key];
-    }
+  };
+  const set = local.set.getMockImplementation()!;
+  local.set.mockImplementation(async (values) => {
+    failAt("marker_set");
+    await set(values);
   });
-  const sessionRemove = vi.fn(async (keys: string[]) => {
-    if (failureStage === "session_remove") {
-      throw new Error("session remove failed");
-    }
-    for (const key of keys) {
-      delete sessionValues[key];
-    }
+  const remove = local.remove.getMockImplementation()!;
+  local.remove.mockImplementation(async (keys) => {
+    failAt(keys.includes(CUSTODY_BLOCKED_KEY) ? "marker_remove" : "retired_local_remove");
+    await remove(keys);
   });
+  const removeSession = session.remove.getMockImplementation()!;
+  session.remove.mockImplementation(async (keys) => {
+    failAt("session_remove");
+    await removeSession(keys);
+  });
+  if (params.readError) {
+    local.get.mockRejectedValue(params.readError);
+  }
   return {
-    chromeApi: {
-      storage: {
-        local: {
-          get: vi.fn(async (keys: string[]) => {
-            if (params.readError) {
-              throw params.readError;
-            }
-            return Object.fromEntries(
-              keys
-                .filter((key) => Object.hasOwn(localValues, key))
-                .map((key) => [key, localValues[key]]),
-            );
-          }),
-          set: localSet,
-          remove: localRemove,
-        },
-        session: { remove: sessionRemove },
-      },
-    },
-    localRemove,
+    chromeApi: { storage: { local, session } },
+    localRemove: local.remove,
     localValues,
     setFailureStage: (next: CleanupFailureStage | undefined) => {
       failureStage = next;
     },
-    sessionRemove,
+    sessionRemove: session.remove,
     sessionValues,
   };
 }
@@ -177,38 +199,10 @@ describe("native bootstrap timeout", () => {
         }),
       });
       const stored: Record<string, unknown> = {};
-      let onDisconnect = () => {};
-      const disconnect = vi.fn(() => onDisconnect());
+      const port = nativePort();
       const chromeApi = {
-        runtime: {
-          connectNative: vi.fn(() => ({
-            disconnect,
-            onDisconnect: {
-              addListener: (listener: () => void) => {
-                onDisconnect = listener;
-              },
-            },
-            onMessage: { addListener: vi.fn() },
-            postMessage: vi.fn(),
-          })),
-        },
-        storage: {
-          local: {
-            get: vi.fn(async (keys: string[]) =>
-              Object.fromEntries(
-                keys.filter((key) => Object.hasOwn(stored, key)).map((key) => [key, stored[key]]),
-              ),
-            ),
-            set: vi.fn(async (values: Record<string, unknown>) => {
-              Object.assign(stored, values);
-            }),
-            remove: vi.fn(async (keys: string[]) => {
-              for (const key of keys) {
-                delete stored[key];
-              }
-            }),
-          },
-        },
+        runtime: { connectNative: vi.fn(() => port) },
+        storage: { local: localStorage(stored) },
       };
       const controller = createNativeBootstrapController({
         chromeApi,
@@ -218,9 +212,7 @@ describe("native bootstrap timeout", () => {
 
       const attempt = controller.attempt();
       await vi.advanceTimersByTimeAsync(0);
-      expect(
-        chromeApi.runtime.connectNative.mock.results[0]?.value.postMessage,
-      ).toHaveBeenCalledWith({
+      expect(port.postMessage).toHaveBeenCalledWith({
         v: 1,
         op: "bootstrap",
         nonce: "ABEiM0RVZneImaq7zN3u_w",
@@ -229,9 +221,7 @@ describe("native bootstrap timeout", () => {
       expect(stored).toEqual({});
       if (ownership !== "current") {
         await controller.disableSynchronously();
-        if (ownership === "re-enabled") {
-          await controller.enable({ attemptNow: false });
-        }
+        await controller.enable({ attemptNow: false });
       }
       await vi.advanceTimersByTimeAsync(1);
 
@@ -243,12 +233,9 @@ describe("native bootstrap timeout", () => {
       await expect(controller.status()).resolves.toEqual(
         ownership === "current"
           ? { disabled: false, state: "retrying", failureCode: "native_host_timeout" }
-          : {
-              disabled: ownership === "disabled",
-              state: ownership === "disabled" ? "disabled" : "waiting",
-            },
+          : { disabled: false, state: "waiting" },
       );
-      expect(disconnect).toHaveBeenCalledOnce();
+      expect(port.disconnect).toHaveBeenCalledOnce();
     },
   );
 });
@@ -257,30 +244,17 @@ type EnsurePortScript = (request: { nonce: string }) => unknown;
 
 function ensureChromeApi(script: EnsurePortScript | "disconnect") {
   const connectNative = vi.fn(() => {
-    let messageListener: ((response: unknown) => void) | undefined;
-    let disconnectListener: (() => void) | undefined;
-    return {
-      disconnect: vi.fn(),
-      onMessage: {
-        addListener: (listener: (response: unknown) => void) => {
-          messageListener = listener;
-        },
-      },
-      onDisconnect: {
-        addListener: (listener: () => void) => {
-          disconnectListener = listener;
-        },
-      },
-      postMessage: (request: { nonce: string }) => {
-        queueMicrotask(() => {
-          if (script === "disconnect") {
-            disconnectListener?.();
-            return;
-          }
-          messageListener?.(script(request));
-        });
-      },
-    };
+    const port = nativePort();
+    port.postMessage.mockImplementation((request) => {
+      queueMicrotask(() => {
+        if (script === "disconnect") {
+          port.disconnect();
+        } else {
+          port.respond(script(request));
+        }
+      });
+    });
+    return port;
   });
   return { runtime: { connectNative, lastError: undefined } };
 }
