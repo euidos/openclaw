@@ -31,7 +31,8 @@ vi.mock("../infra/worker-cpu.js", async (importOriginal) => {
       const transcript = /insert into "?transcript_events/i.test(sql);
       const placement = /from "?worker_session_placements/i.test(sql);
       if (transcript || placement) {
-        for (const method of ["run", "all", "get"]) {
+        // Kysely reads use all() on newer Node and iterate() on Bun/older Node.
+        for (const method of ["run", "all", "get", "iterate"]) {
           const run = statement[method].bind(statement);
           statement[method] = (...args) => {
             const state = new Int32Array(workerData.diskFullState);
@@ -177,6 +178,9 @@ test.each(["transcript", "admission"] as const)(
       payload: { key, runStarted: false },
     });
     expect(created.payload).not.toHaveProperty("messageSeq");
+    if (phase === "admission") {
+      expect(created.payload?.runError).toMatchObject({ retryable: true });
+    }
     const scope = {
       agentId: "main",
       sessionKey: key,
@@ -191,7 +195,7 @@ test.each(["transcript", "admission"] as const)(
     expect(loadSessionEntry(scope)).toMatchObject({ sessionId: scope.sessionId });
     expect(loadSessionEntry(scope)?.restartRecoveryDeliveryRunId).toBeUndefined();
     expect(createGatewayActiveWorkSnapshot().counts.totalActive).toBe(0);
-    expect(context.broadcast).toHaveBeenCalledWith(
+    expect(context.broadcast, JSON.stringify({ created, admissionFailures })).toHaveBeenCalledWith(
       "chat",
       expect.objectContaining({
         sessionKey: key,

@@ -98,7 +98,11 @@ export function respondChatSendAdmissionError(
     { message: storageMessage ?? formatForLog(error) },
   );
   respond(false, undefined, failure);
-  if (!failure.retryable && !(error instanceof SessionMutationAuthorizationChangedError)) {
+  // A storage refusal ends this attempt even when a later request can safely retry.
+  if (
+    (storageMessage !== undefined || !failure.retryable) &&
+    !(error instanceof SessionMutationAuthorizationChangedError)
+  ) {
     onUnexpectedError?.(failure.message);
   }
 }
