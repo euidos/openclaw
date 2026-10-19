@@ -274,7 +274,7 @@ describe("MCP app pane actions", () => {
     const frames: RequestFrame[] = [];
     const dispatched = createDeferred<RequestFrame>();
     let requestSignal: AbortSignal | undefined;
-    f.client.request = createTestGatewayClient((method, params, options) => {
+    const requestClient = createTestGatewayClient((method, params, options) => {
       if (method !== "sessions.create") {
         return sessionsResult([]);
       }
@@ -292,7 +292,8 @@ describe("MCP app pane actions", () => {
         params,
         options,
       );
-    }).request;
+    });
+    f.client.request = requestClient.request.bind(requestClient);
     Object.assign(f.context, {
       router: { getState: () => ({ location: "/chat/one" }) },
       sessions: createTestSessionCapability(f.context.gateway),
