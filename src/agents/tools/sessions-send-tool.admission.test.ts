@@ -426,7 +426,11 @@ describe("sessions_send dispatch admission", () => {
     const context = createContext([], () => config);
     const caller = createSessionsSendTestCaller(requesterSessionKey);
     const queueMessage = vi.fn(async () => {});
-    const handle = createEmbeddedRunHandle({ guarded: true, queueMessage });
+    const handle = createEmbeddedRunHandle({
+      guarded: true,
+      queueMessage,
+      supportsTranscriptCommitWait: false,
+    });
     const close = await setSessionsSendTestActiveRun(
       "target-session",
       handle,

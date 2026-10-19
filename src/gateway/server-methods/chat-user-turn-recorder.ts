@@ -31,10 +31,7 @@ import {
   INTERNAL_MESSAGE_CHANNEL,
   isBrowserOperatorUiClient,
 } from "../../utils/message-channel.js";
-import {
-  createChatInputRecovery,
-  readChatInputRecoveryAdmission,
-} from "../chat-input-recovery-source.js";
+import { readChatInputRecoveryAdmission } from "../chat-input-recovery-source.js";
 import type { MentionInbox } from "../mention-inbox.types.js";
 import { hasGatewayAdminScope } from "../operator-scopes.js";
 import { captureWorkerTurnInputSource } from "../worker-environments/worker-turn-transcript-target.js";
@@ -45,7 +42,7 @@ import {
   resolveChatSendReplyContext,
   type ChatSendReplyContextFields,
 } from "./chat-send-reply-context.js";
-import type { NormalizedChatSendRequest } from "./chat-send-request.js";
+import { createChatInputRecovery, type NormalizedChatSendRequest } from "./chat-send-request.js";
 import type { PreparedChatSendSession } from "./chat-send-session.js";
 import type { createChatSendGoalCommitGuard } from "./chat-send-work-admission.js";
 import { gatewayClientSenderFields } from "./gateway-client-identity.js";

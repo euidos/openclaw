@@ -15,6 +15,8 @@ import type {
   ChatSendParamsSchema,
   QueueMode,
 } from "../../../packages/gateway-protocol/src/schema/logs-chat.js";
+import type { createOperatorInputRecoverySource } from "../../agents/operator-run-recovery-source.js";
+import { shouldComputeCommandAuthorized } from "../../auto-reply/command-detection.js";
 import { isAbortRequestText } from "../../auto-reply/reply/abort-primitives.js";
 import { isBtwRequestText } from "../../auto-reply/reply/btw-command.js";
 import {
@@ -357,4 +359,46 @@ export function normalizeChatSendRequest(params: {
     }
     return { ok: true as const, value: request };
   });
+}
+
+/** Keep only execution options; approved text and media live in the input itself. */
+export function createChatInputRecovery(params: {
+  request: NormalizedChatSendRequest;
+  source: ReturnType<typeof createOperatorInputRecoverySource>;
+}) {
+  const { request, source } = params;
+  // Attached-client capabilities cannot be re-created after the connection ends.
+  if (
+    !source ||
+    request.toolBindings ||
+    request.goalOperation ||
+    request.turnKind !== "main" ||
+    (request.systemInputProvenance && request.systemInputProvenance.kind !== "external_user")
+  ) {
+    return undefined;
+  }
+  const p = request.p;
+  return {
+    version: 1 as const,
+    source,
+    clientInfo: request.clientInfo,
+    suppressCommandInterpretation:
+      request.suppressCommandInterpretation ||
+      !shouldComputeCommandAuthorized(request.inboundMessage),
+    request: {
+      thinking: p.thinking,
+      fastMode: p.fastMode,
+      fastAutoOnSeconds: p.fastAutoOnSeconds,
+      timeoutMs: p.timeoutMs,
+      deliver: p.deliver,
+      queueMode: p.queueMode,
+      replyToId: p.replyToId,
+      originatingChannel: p.originatingChannel,
+      originatingTo: p.originatingTo,
+      originatingAccountId: p.originatingAccountId,
+      originatingThreadId: p.originatingThreadId,
+      systemInputProvenance: request.systemInputProvenance,
+      systemProvenanceReceipt: request.systemProvenanceReceipt,
+    },
+  };
 }

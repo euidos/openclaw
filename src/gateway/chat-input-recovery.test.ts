@@ -11,14 +11,14 @@ import type { PersistedUserTurnMessage } from "../sessions/user-turn-transcript.
 import { setUserProfileRole } from "../state/user-profile-writes.worker.js";
 import { ensureProfileForEmail } from "../state/user-profiles.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
-import {
-  createChatInputRecovery,
-  readChatInputRecoveryAdmission,
-} from "./chat-input-recovery-source.js";
+import { readChatInputRecoveryAdmission } from "./chat-input-recovery-source.js";
 import { resumeChatInput } from "./chat-input-recovery.js";
 import { captureGatewayOperatorRunAuthority } from "./operator-run-authority.js";
 import { createOperatorRecoveryFixture } from "./operator-run-recovery.test-support.js";
-import { normalizeChatSendRequest } from "./server-methods/chat-send-request.js";
+import {
+  createChatInputRecovery,
+  normalizeChatSendRequest,
+} from "./server-methods/chat-send-request.js";
 import { createContext } from "./server-plugin-in-process-dispatch.test-support.js";
 import { resolveRequestedSessionAgentId } from "./session-request-agent.js";
 
