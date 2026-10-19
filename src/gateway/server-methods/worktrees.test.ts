@@ -78,6 +78,10 @@ async function call(
 const adminClient = { connect: { scopes: ["operator.admin"] } };
 const writeClient = { connect: { scopes: ["operator.write"] } };
 const emptyConfigContext = { getRuntimeConfig: () => ({}) };
+function clientCall(handlers: ReturnType<typeof createWorktreesHandlers>, client = adminClient) {
+  return (method: string, params: Record<string, unknown>) =>
+    call(handlers, method, params, { client, context: emptyConfigContext });
+}
 
 describe("worktrees gateway methods", () => {
   it("routes checkout operations through the managed worktree service", async () => {
@@ -93,20 +97,12 @@ describe("worktrees gateway methods", () => {
       restore: vi.fn(async () => ({ ...deferred, snapshotRef: "refs/snapshot" })),
     };
     const handlers = createWorktreesHandlers(service as never);
+    const invoke = clientCall(handlers);
 
     const listed = await call(handlers, "worktrees.list", {});
     expect(listed).toEqual([true, { worktrees: [record] }, undefined]);
     expect(
-      await call(
-        handlers,
-        "worktrees.create",
-        {
-          repoRoot: "/repo",
-          name: "task-one",
-          baseRef: "main",
-        },
-        { client: adminClient, context: emptyConfigContext },
-      ),
+      await invoke("worktrees.create", { repoRoot: "/repo", name: "task-one", baseRef: "main" }),
     ).toEqual([true, record, undefined]);
     expect(await call(handlers, "worktrees.remove", { id: record.id, force: true })).toEqual([
       true,
@@ -131,12 +127,7 @@ describe("worktrees gateway methods", () => {
         ["worktrees.restore", { id: record.id }],
       ] as const) {
         const qualified = expectDefined(
-          await call(
-            handlers,
-            method,
-            { ...params, expectedOwnerId: "gateway-owner" },
-            { client: adminClient, context: emptyConfigContext },
-          ),
+          await invoke(method, { ...params, expectedOwnerId: "gateway-owner" }),
           "qualified worktree response",
         );
         expect(qualified[0]).toBe(true);
@@ -169,36 +160,24 @@ describe("worktrees gateway methods", () => {
       })),
     };
     const handlers = createWorktreesHandlers(service as never);
+    const invoke = clientCall(handlers);
 
-    const adminResponse = await call(
-      handlers,
-      "worktrees.branches",
-      { repoRoot: "/anywhere" },
-      { client: adminClient, context: emptyConfigContext },
-    );
+    const adminResponse = await invoke("worktrees.branches", { repoRoot: "/anywhere" });
     expect(adminResponse?.[0]).toBe(true);
     expect(service.listRepositoryBranches).toHaveBeenCalledWith("/anywhere");
 
-    const statusResponse = await call(
-      handlers,
-      "worktrees.branches",
-      { repoRoot: "/anywhere", includeRepositoryStatus: true },
-      { client: adminClient, context: emptyConfigContext },
-    );
+    const statusResponse = await invoke("worktrees.branches", {
+      repoRoot: "/anywhere",
+      includeRepositoryStatus: true,
+    });
     expect(statusResponse?.[0]).toBe(true);
     expect(service.listRepositoryBranches).toHaveBeenCalledWith("/anywhere", {
       includeRepositoryStatus: true,
     });
 
-    // Write scope cannot probe arbitrary host paths for branch names; the
-    // denial uses the shared structured missing-scope contract so clients can
-    // tell an authorization failure apart from a repository inspection failure.
-    const denied = await call(
-      handlers,
-      "worktrees.branches",
-      { repoRoot: "/anywhere" },
-      { client: writeClient, context: emptyConfigContext },
-    );
+    const denied = await clientCall(handlers, writeClient)("worktrees.branches", {
+      repoRoot: "/anywhere",
+    });
     expect(denied?.[0]).toBe(false);
     expect(denied?.[2]).toMatchObject({
       code: "FORBIDDEN",
@@ -224,22 +203,16 @@ describe("worktrees gateway methods", () => {
       listRepositoryBranches: vi.fn(async () => ({ branches: [] })),
     };
     const handlers = createWorktreesHandlers(service as never);
+    const invoke = clientCall(handlers, writeClient);
     try {
-      const allowed = await call(
-        handlers,
-        "worktrees.branches",
-        { repoRoot: alias },
-        { client: writeClient, context: emptyConfigContext },
-      );
+      const allowed = await invoke("worktrees.branches", { repoRoot: alias });
       expect(allowed?.[0]).toBe(true);
       expect(service.listRepositoryBranches).toHaveBeenCalledWith(repoRoot);
 
-      const created = await call(
-        handlers,
-        "worktrees.create",
-        { repoRoot: alias, name: "registered-task" },
-        { client: writeClient, context: emptyConfigContext },
-      );
+      const created = await invoke("worktrees.create", {
+        repoRoot: alias,
+        name: "registered-task",
+      });
       expect(created?.[0]).toBe(true);
       expect(service.create).toHaveBeenCalledWith({
         repoRoot,
@@ -249,12 +222,7 @@ describe("worktrees gateway methods", () => {
         runSetupScript: false,
       });
 
-      const denied = await call(
-        handlers,
-        "worktrees.branches",
-        { repoRoot: outside },
-        { client: writeClient, context: emptyConfigContext },
-      );
+      const denied = await invoke("worktrees.branches", { repoRoot: outside });
       expect(denied?.[0]).toBe(false);
       expect(denied?.[2]).toMatchObject({
         code: "FORBIDDEN",

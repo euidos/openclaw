@@ -44,8 +44,7 @@ it.each([
         profileName: "wizard-authority",
         scopes: ["operator.admin"],
       });
-      const context = createContext();
-      Object.assign(context, createWizardSessionTracker());
+      const context = Object.assign(createContext(), createWizardSessionTracker());
       const connection = new AbortController();
       const continueProbe = createDeferredCore();
       let captureError: unknown;
@@ -71,7 +70,6 @@ it.each([
           }
         } catch (error) {
           captureError = error;
-          console.info("setup-inference authority capture:", error);
           throw error;
         }
         return {
@@ -118,24 +116,21 @@ it.each([
           connection.signal,
         );
         const respond = vi.fn();
+        const scope = {
+          client,
+          context,
+          isWebchatConnect: () => false,
+          hasCurrentClientAuthority: authority.isCurrent,
+        };
         const options: GatewayRequestHandlerOptions = {
           req: { type: "req", id: method, method, params },
           params,
           respond,
-          context,
-          client,
-          isWebchatConnect: () => false,
-          hasCurrentClientAuthority: authority.isCurrent,
+          ...scope,
         };
         try {
-          await withPluginRuntimeGatewayRequestScope(
-            {
-              client,
-              context,
-              isWebchatConnect: () => false,
-              hasCurrentClientAuthority: authority.isCurrent,
-            },
-            () => expectDefined(wizardHandlers[method], method)(options),
+          await withPluginRuntimeGatewayRequestScope(scope, () =>
+            expectDefined(wizardHandlers[method], method)(options),
           );
           expect(respond).toHaveBeenCalledOnce();
           expect(respond.mock.calls[0]?.[0]).toBe(true);
@@ -188,13 +183,11 @@ it.each(["admission", "publication"])(
   async (phase) => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
       const connection = new AbortController();
-      const client = createOperatorClient({
-        profileId: "login-owner",
-        scopes: ["operator.admin"],
-      });
-      client.connectionSignal = connection.signal;
-      const context = createContext();
-      Object.assign(context, createWizardSessionTracker());
+      const client = Object.assign(
+        createOperatorClient({ profileId: "login-owner", scopes: ["operator.admin"] }),
+        { connectionSignal: connection.signal },
+      );
+      const context = Object.assign(createContext(), createWizardSessionTracker());
       const respond = vi.fn();
       const createSession = vi.fn(
         () =>
@@ -210,12 +203,11 @@ it.each(["admission", "publication"])(
         assertCurrent: vi.fn(),
         createSession,
       };
+      const closed = new Error(`Connection closed before ${phase}`);
       if (phase === "admission") {
-        connection.abort(new Error("Connection closed before admission"));
+        connection.abort(closed);
         try {
-          await expect(startWizardLogin(params)).rejects.toThrow(
-            "Connection closed before admission",
-          );
+          await expect(startWizardLogin(params)).rejects.toThrow(closed.message);
         } finally {
           for (const session of context.wizardSessions.values()) {
             session.cancel();
@@ -229,7 +221,7 @@ it.each(["admission", "publication"])(
           "admitted login session",
         );
         try {
-          connection.abort(new Error("Connection closed before publication"));
+          connection.abort(closed);
           await publishWizardLoginSession({ ...params, session });
           expect(session.signal.aborted).toBe(true);
           expect(respond).toHaveBeenCalledWith(
