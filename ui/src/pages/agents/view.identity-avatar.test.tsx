@@ -23,10 +23,7 @@ const revokeObjectURL = vi.fn<typeof URL.revokeObjectURL>();
 
 beforeEach(({ onTestFailed }) => {
   onTestFailed(() => {
-    const urls = fetchAvatar.mock.calls.map(([input]) =>
-      input instanceof Request ? input.url : String(input),
-    );
-    console.error(`[settings avatar request URLs] ${JSON.stringify(urls)}`);
+    console.error(`[settings avatar request URLs] ${JSON.stringify(avatarRequestUrls())}`);
   });
   const nativeFetch = globalThis.fetch;
   fetchAvatar.mockReset();
@@ -98,20 +95,24 @@ function avatarRequestUrls() {
   );
 }
 
-function avatarImage(view: AgentAvatarView) {
-  return view.container.querySelector<HTMLImageElement>(".agent-identity-editor__avatar img");
+function avatarElement<T extends HTMLElement = HTMLElement>(
+  view: AgentAvatarView,
+  selector: string,
+) {
+  return view.container.querySelector<T>(`.agent-identity-editor__avatar ${selector}`);
 }
+const avatarImage = (view: AgentAvatarView) => avatarElement<HTMLImageElement>(view, "img");
+const avatarSrc = (view: AgentAvatarView) => avatarImage(view)?.getAttribute("src");
+const avatarClasses = (view: AgentAvatarView) =>
+  avatarElement(view, ".identity-avatar--agent")?.classList;
+const waitForAvatar = (view: AgentAvatarView, sequence: number) =>
+  waitForFast(() => expect(avatarSrc(view)).toBe(`blob:settings-avatar-${sequence}`));
 
 async function expectAvatarFallback(view: AgentAvatarView) {
-  await waitForFast(() => {
-    expect(
-      view.container.querySelector(".agent-identity-editor__avatar .identity-avatar__agent-face"),
-    ).not.toBeNull();
-  });
-  expect(
-    view.container.querySelector(".agent-identity-editor__avatar .identity-avatar--agent")
-      ?.classList,
-  ).toContain("is-fallback");
+  await waitForFast(() =>
+    expect(avatarElement(view, ".identity-avatar__agent-face")).not.toBeNull(),
+  );
+  expect(avatarClasses(view)).toContain("is-fallback");
 }
 
 function updateView(view: AgentAvatarView, next: Partial<AgentsProps>) {
@@ -127,6 +128,15 @@ function changeAvatarRevision(view: AgentAvatarView, revision: number) {
   });
 }
 
+function renameView(view: AgentAvatarView) {
+  updateView(view, {
+    overview: {
+      ...view.props.overview,
+      identityDraft: { name: "Renamed Beta", emoji: null, avatar: null },
+    },
+  });
+}
+
 it("fetches one persisted settings avatar alongside unrelated requests", async () => {
   const response = createDeferred<Response>();
   fetchAvatar.mockReturnValue(response.promise);
@@ -136,11 +146,9 @@ it("fetches one persisted settings avatar alongside unrelated requests", async (
   const asset = fetch(new URL("/fixture/settings-asset", globalThis.location.origin));
 
   try {
-    const avatar = view.container.querySelector(
-      ".agent-identity-editor__avatar .identity-avatar--agent",
-    );
-    expect(avatar?.classList).toContain("is-pending");
-    expect(avatar?.classList).not.toContain("is-fallback");
+    const classes = avatarClasses(view);
+    expect(classes).toContain("is-pending");
+    expect(classes).not.toContain("is-fallback");
     expect(fetchAvatar).toHaveBeenCalledWith(
       `${globalThis.location.origin}/avatar/beta?v=1`,
       expect.objectContaining({
@@ -151,13 +159,11 @@ it("fetches one persisted settings avatar alongside unrelated requests", async (
     );
 
     response.resolve(avatarResponse());
-    await waitForFast(() => {
-      expect(avatarImage(view)?.getAttribute("src")).toBe("blob:settings-avatar-1");
-    });
-    expect(avatar?.classList).toContain("is-pending");
+    await waitForAvatar(view, 1);
+    expect(classes).toContain("is-pending");
     avatarImage(view)?.dispatchEvent(new Event("load"));
     flush();
-    expect(avatar?.classList).not.toContain("is-pending");
+    expect(classes).not.toContain("is-pending");
     expect(avatarRequestUrls(), "requests after the persisted avatar loads").toEqual([
       globalThis.location.origin + "/avatar/beta?v=1",
     ]);
@@ -177,7 +183,7 @@ it("renders the upload preview without fetching the persisted settings avatar", 
     },
   });
 
-  expect(avatarImage(view)?.getAttribute("src")).toBe(preview);
+  expect(avatarSrc(view)).toBe(preview);
   expect(fetchAvatar).not.toHaveBeenCalled();
 });
 
@@ -190,9 +196,7 @@ it("keeps a missing settings avatar on its fallback and recovers on a new revisi
     .mockResolvedValueOnce(new Response(null, { status: 404 }))
     .mockResolvedValueOnce(avatarResponse());
   const view = createView();
-  await waitForFast(() => {
-    expect(avatarImage(view)?.getAttribute("src")).toBe("blob:settings-avatar-1");
-  });
+  await waitForAvatar(view, 1);
 
   changeAvatarRevision(view, 2);
   await waitForFast(() =>
@@ -201,12 +205,7 @@ it("keeps a missing settings avatar on its fallback and recovers on a new revisi
     ),
   );
   await waitForFast(() => expect(avatarImage(view)).toBeNull());
-  updateView(view, {
-    overview: {
-      ...view.props.overview,
-      identityDraft: { name: "Renamed Beta", emoji: null, avatar: null },
-    },
-  });
+  renameView(view);
   expect(avatarImage(view)).toBeNull();
   await expectAvatarFallback(view);
   expect(avatarRequestUrls(), "requests after showing the fallback and editing the name").toEqual(
@@ -214,9 +213,7 @@ it("keeps a missing settings avatar on its fallback and recovers on a new revisi
   );
 
   changeAvatarRevision(view, 3);
-  await waitForFast(() => {
-    expect(avatarImage(view)?.getAttribute("src")).toBe("blob:settings-avatar-2");
-  });
+  await waitForAvatar(view, 2);
   expect(avatarRequestUrls()).toEqual([
     ...expectedRequests,
     globalThis.location.origin + "/avatar/beta?v=3",
@@ -226,32 +223,22 @@ it("keeps a missing settings avatar on its fallback and recovers on a new revisi
 it("keeps a decode failure on its fallback across rerenders until the revision changes", async () => {
   fetchAvatar.mockImplementation(async () => avatarResponse());
   const view = createView();
-  const failedImage = await waitForFast(() => {
-    const image = avatarImage(view);
-    expect(image?.getAttribute("src")).toBe("blob:settings-avatar-1");
-    return image;
-  });
+  await waitForAvatar(view, 1);
+  const failedImage = avatarImage(view);
   failedImage?.dispatchEvent(new Event("error"));
   await waitForFast(() => expect(avatarImage(view)).toBeNull());
   await expectAvatarFallback(view);
 
-  updateView(view, {
-    overview: {
-      ...view.props.overview,
-      identityDraft: { name: "Renamed Beta", emoji: null, avatar: null },
-    },
-  });
+  renameView(view);
   expect(avatarImage(view)).toBeNull();
   await expectAvatarFallback(view);
   expect(fetchAvatar).toHaveBeenCalledOnce();
 
   changeAvatarRevision(view, 2);
-  await waitForFast(() => {
-    expect(avatarImage(view)?.getAttribute("src")).toBe("blob:settings-avatar-2");
-  });
+  await waitForAvatar(view, 2);
   failedImage?.dispatchEvent(new Event("error"));
   await Promise.resolve();
-  expect(avatarImage(view)?.getAttribute("src")).toBe("blob:settings-avatar-2");
+  expect(avatarSrc(view)).toBe("blob:settings-avatar-2");
   expect(fetchAvatar).toHaveBeenCalledTimes(2);
 });
 

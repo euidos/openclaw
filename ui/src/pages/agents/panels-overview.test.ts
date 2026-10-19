@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildAgentContext } from "../../lib/agents/display.ts";
-// Control UI tests cover the agents overview context display.
 import { mountSolid } from "../../test-helpers/solid-render.tsx";
 import { flush, waitForSolid } from "../../test-helpers/solid-settle.ts";
 import { createAgentViewTestProps as createProps } from "./agents-view.test-helpers.ts";
@@ -10,6 +9,32 @@ afterEach(() => document.body.replaceChildren());
 
 const inheritedAgentModel = "openai/gpt-5.4";
 const resolvedAgentWorkspace = "/tmp/agents/beta";
+const contextConfig = (model: Record<string, unknown>) => ({
+  agents: {
+    defaults: {
+      workspace: "/tmp/agents",
+      model: { primary: inheritedAgentModel, fallbacks: ["openai/global-fallback"] },
+    },
+    entries: { beta: { model } },
+  },
+});
+const configWith = (configForm: Record<string, unknown>) => ({
+  ...createProps().config,
+  configForm,
+});
+const contextValue = (container: HTMLElement, label: string) =>
+  Array.from(container.querySelectorAll("dt"))
+    .find((term) => term.textContent?.trim() === label)
+    ?.nextElementSibling?.textContent?.trim();
+
+function renderAgents(overrides: Partial<ReturnType<typeof createProps>> = {}, attached = false) {
+  const container = document.createElement("div");
+  if (attached) {
+    document.body.append(container);
+  }
+  mountSolid(Agents, createProps(overrides), container);
+  return container;
+}
 
 it.each([
   {
@@ -34,15 +59,7 @@ it.each([
       workspace: resolvedAgentWorkspace,
       model: { primary: "openai/stale-roster-model", fallbacks: ["openai/stale-fallback"] },
     },
-    {
-      agents: {
-        defaults: {
-          workspace: "/tmp/agents",
-          model: { primary: inheritedAgentModel, fallbacks: ["openai/global-fallback"] },
-        },
-        entries: { beta: { model } },
-      },
-    },
+    contextConfig(model),
     null,
     "alpha",
   );
@@ -54,50 +71,26 @@ it.each([
 it.each(["overview", "channels", "cron"] as const)(
   "shows authoritative agent workspace and effective model on the %s panel",
   (activePanel) => {
-    const container = document.createElement("div");
-    const props = createProps();
-    mountSolid(
-      Agents,
-      {
-        ...props,
-        activePanel,
-        agentsList: {
-          defaultId: "alpha",
-          mainKey: "main",
-          scope: "per-sender",
-          agents: [
-            { id: "alpha", name: "Alpha" },
-            {
-              id: "beta",
-              name: "Beta",
-              workspace: resolvedAgentWorkspace,
-              model: { primary: inheritedAgentModel },
-            },
-          ],
-        },
-        config: {
-          ...props.config,
-          configForm: {
-            agents: {
-              defaults: {
-                workspace: "/tmp/agents",
-                model: { primary: inheritedAgentModel, fallbacks: ["openai/global-fallback"] },
-              },
-              entries: { beta: { model: { fallbacks: ["google/gemini-3-pro"] } } },
-            },
+    const container = renderAgents({
+      activePanel,
+      agentsList: {
+        defaultId: "alpha",
+        mainKey: "main",
+        scope: "per-sender",
+        agents: [
+          { id: "alpha", name: "Alpha" },
+          {
+            id: "beta",
+            name: "Beta",
+            workspace: resolvedAgentWorkspace,
+            model: { primary: inheritedAgentModel },
           },
-        },
+        ],
       },
-      container,
-    );
-
-    const contextValue = (label: string) =>
-      Array.from(container.querySelectorAll("dt"))
-        .find((term) => term.textContent?.trim() === label)
-        ?.nextElementSibling?.textContent?.trim();
-
-    expect(contextValue("Workspace")).toBe(resolvedAgentWorkspace);
-    expect(contextValue("Primary Model")).toBe(`${inheritedAgentModel} (+1 fallback)`);
+      config: configWith(contextConfig({ fallbacks: ["google/gemini-3-pro"] })),
+    });
+    expect(contextValue(container, "Workspace")).toBe(resolvedAgentWorkspace);
+    expect(contextValue(container, "Primary Model")).toBe(`${inheritedAgentModel} (+1 fallback)`);
   },
 );
 
@@ -107,17 +100,11 @@ it.each([
 ])(
   "keeps identity field permissions correct for $label",
   ({ canUpdateIdentity, identitySaving }) => {
-    const container = document.createElement("div");
     const props = createProps();
-    mountSolid(
-      Agents,
-      {
-        ...props,
-        access: { ...props.access, canUpdateIdentity },
-        overview: { ...props.overview, identitySaving },
-      },
-      container,
-    );
+    const container = renderAgents({
+      access: { ...props.access, canUpdateIdentity },
+      overview: { ...props.overview, identitySaving },
+    });
 
     expect(
       container.querySelector<HTMLInputElement>(".agent-identity-editor__fields input")?.disabled,
@@ -126,31 +113,15 @@ it.each([
 );
 
 it("shows inherited skills in the Agent Context overview", () => {
-  const container = document.createElement("div");
-  mountSolid(
-    Agents,
-    createProps({
-      config: {
-        configForm: {
-          agents: {
-            defaults: { skills: ["github", "weather"] },
-            entries: { beta: {} },
-          },
-        },
-        configSnapshot: null,
-        configLoading: false,
-        configSaving: false,
-        configFormDirty: false,
-        lastError: null,
+  const container = renderAgents({
+    config: configWith({
+      agents: {
+        defaults: { skills: ["github", "weather"] },
+        entries: { beta: {} },
       },
     }),
-    container,
-  );
-
-  const skillsFilterRow = Array.from(container.querySelectorAll("dt")).find(
-    (term) => term.textContent?.trim() === "Skills Filter",
-  )?.nextElementSibling;
-  expect(skillsFilterRow?.textContent?.trim()).toBe("2 selected");
+  });
+  expect(contextValue(container, "Skills Filter")).toBe("2 selected");
 });
 
 describe("fallback field", () => {
@@ -163,24 +134,15 @@ describe("fallback field", () => {
   ] satisfies ReturnType<typeof createProps>["overview"]["modelCatalog"];
 
   function renderFallbacks(overrides: Partial<ReturnType<typeof createProps>> = {}) {
-    const container = document.body.appendChild(document.createElement("div"));
     const onModelFallbacksChange = vi.fn();
-    mountSolid(
-      Agents,
-      createProps({
-        config: {
-          configForm: {
-            agents: {
-              defaults: { model: { primary, fallbacks: [existingFallback] } },
-              entries: { alpha: {}, beta: {} },
-            },
+    const container = renderAgents(
+      {
+        config: configWith({
+          agents: {
+            defaults: { model: { primary, fallbacks: [existingFallback] } },
+            entries: { alpha: {}, beta: {} },
           },
-          configSnapshot: null,
-          configLoading: false,
-          configSaving: false,
-          configFormDirty: false,
-          lastError: null,
-        },
+        }),
         ...overrides,
         overview: {
           ...createProps().overview,
@@ -188,8 +150,8 @@ describe("fallback field", () => {
           ...overrides.overview,
           onModelFallbacksChange,
         },
-      }),
-      container,
+      },
+      true,
     );
     const field = container.querySelector<HTMLElement>("openclaw-multi-select.agent-fallbacks");
     if (!field) {
@@ -254,22 +216,15 @@ describe("fallback field", () => {
         scope: "per-sender",
         agents: [{ id: "alpha" }, { id: "beta", model: { primary: caseDistinct } }],
       },
-      config: {
-        configForm: {
-          agents: {
-            defaults: {
-              model: { primary: primaryAlias },
-              models: { [target]: { alias: "fast" } },
-            },
-            entries: { alpha: {}, beta: {} },
+      config: configWith({
+        agents: {
+          defaults: {
+            model: { primary: primaryAlias },
+            models: { [target]: { alias: "fast" } },
           },
+          entries: { alpha: {}, beta: {} },
         },
-        configSnapshot: null,
-        configLoading: false,
-        configSaving: false,
-        configFormDirty: false,
-        lastError: null,
-      },
+      }),
       overview: {
         ...createProps().overview,
         modelCatalog: [
