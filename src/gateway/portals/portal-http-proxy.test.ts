@@ -2,36 +2,30 @@ import { once } from "node:events";
 import {
   createServer,
   request,
+  type ClientRequest,
   type IncomingMessage,
   type Server,
   type ServerResponse,
 } from "node:http";
-import net, { type AddressInfo } from "node:net";
+import net from "node:net";
 import { duplexPair, type Duplex } from "node:stream";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { type RawData, WebSocket, WebSocketServer } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 import { mockIpv4OnlyLocalhostLookup } from "../../../test/helpers/loopback-dns.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import { acquireTestPortBlock } from "../../test-utils/port-claims.js";
 import type { PortalTarget } from "./portal-http-proxy.js";
-import { createGatewayPortalService, type GatewayPortalService } from "./portal-service.js";
+import type { GatewayPortalService } from "./portal-service.js";
+import { requestText, usePortalHarness } from "./portal.test-support.js";
 
-type HttpResult = {
-  status: number;
-  headers: IncomingMessage["headers"];
-  body: string;
-};
+type HttpResult = Awaited<ReturnType<typeof requestText>>;
 
-let targetPort = 0;
-let targetHandler: (req: IncomingMessage, res: ServerResponse) => void;
+const { target, makeService, listenTarget } = usePortalHarness();
 let targetWebSocketPath: string | undefined;
 let targetWebSocketCookie: string | undefined;
 let targetWebSocketHeaders: IncomingMessage["headers"] | undefined;
 let targetWebSocketSetCookie: string | undefined;
-const targetServer = createServer((req, res) => targetHandler(req, res));
-const targetWss = new WebSocketServer({ server: targetServer });
-const services = new Set<GatewayPortalService>();
-const temporaryTargetServers = new Set<Server>();
+const targetWss = new WebSocketServer({ server: target.server });
 
 beforeAll(async () => {
   targetWss.on("connection", (socket, req) => {
@@ -45,47 +39,23 @@ beforeAll(async () => {
       headers.push(`Set-Cookie: ${targetWebSocketSetCookie}`);
     }
   });
-  await new Promise<void>((resolve, reject) => {
-    targetServer.once("error", reject);
-    targetServer.listen(0, "127.0.0.1", () => resolve());
-  });
-  targetPort = (targetServer.address() as AddressInfo).port;
 });
 
 afterEach(async () => {
-  await Promise.all([...services].map((service) => service.closeAll()));
-  services.clear();
-  await Promise.all(
-    [...temporaryTargetServers].map(
-      (server) =>
-        new Promise<void>((resolve) => {
-          server.close(() => resolve());
-          server.closeAllConnections();
-        }),
-    ),
-  );
-  temporaryTargetServers.clear();
   targetWebSocketPath = undefined;
   targetWebSocketCookie = undefined;
   targetWebSocketHeaders = undefined;
   targetWebSocketSetCookie = undefined;
 });
 
-afterAll(async () => {
-  targetWss.close();
-  await new Promise<void>((resolve) => {
-    targetServer.close(() => resolve());
-  });
-});
+afterAll(() => targetWss.close());
 
 function portalService(httpServers: Server[] = []) {
-  const service = createGatewayPortalService({ httpBindHosts: ["127.0.0.1"], httpServers });
-  services.add(service);
-  return service;
+  return makeService({ httpServers }).service;
 }
 
 function openPortal(options: Partial<Parameters<GatewayPortalService["open"]>[0]> = {}) {
-  return portalService().open({ targetPort, ...options });
+  return portalService().open({ targetPort: target.port, ...options });
 }
 
 function authenticatedCall(portal: { listenPort: number; tokenQuery: string }, path = "/") {
@@ -94,7 +64,7 @@ function authenticatedCall(portal: { listenPort: number; tokenQuery: string }, p
 
 async function expectEcho(socket: WebSocket, message: string) {
   const echoed = new Promise<string>((resolve) => {
-    socket.once("message", (data) => resolve(webSocketMessageText(data)));
+    socket.once("message", (data) => resolve(data.toString()));
   });
   socket.send(message);
   expect(await echoed).toBe(message);
@@ -114,21 +84,6 @@ function cookieTarget(value: string, received: Array<string | undefined> = []) {
     }
     res.end(`target-${value}`);
   };
-}
-
-async function listenTarget(
-  handler: (req: IncomingMessage, res: ServerResponse) => void,
-): Promise<number> {
-  return await listenTargetServer(createServer(handler));
-}
-
-async function listenTargetServer(server: Server): Promise<number> {
-  temporaryTargetServers.add(server);
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => resolve());
-  });
-  return (server.address() as AddressInfo).port;
 }
 
 function createWorkerStreamPair() {
@@ -160,40 +115,18 @@ function workerTarget(connect: () => Promise<Duplex>, remotePort: number): Porta
   };
 }
 
-async function httpCall(params: {
+function httpCall(params: {
   port: number;
   path?: string;
   method?: string;
   headers?: Record<string, string>;
   body?: string;
 }): Promise<HttpResult> {
-  return await new Promise<HttpResult>((resolve, reject) => {
-    const req = request(
-      {
-        host: "127.0.0.1",
-        port: params.port,
-        path: params.path ?? "/",
-        method: params.method,
-        headers: params.headers,
-      },
-      (res) => {
-        const chunks: Buffer[] = [];
-        res.on("data", (chunk: Buffer) => chunks.push(chunk));
-        res.once("end", () =>
-          resolve({
-            status: res.statusCode ?? 0,
-            headers: res.headers,
-            body: Buffer.concat(chunks).toString("utf8"),
-          }),
-        );
-      },
-    );
-    req.once("error", reject);
-    if (params.body) {
-      req.write(params.body);
-    }
-    req.end();
-  });
+  return requestText(
+    `http://127.0.0.1:${params.port}${params.path ?? "/"}`,
+    { method: params.method, headers: params.headers },
+    params.body,
+  );
 }
 
 async function readUpgradeRejection(params: {
@@ -249,46 +182,58 @@ function portalAuthCookie(portal: { listenPort: number; tokenQuery: string }): s
   return `openclaw_portal_${portal.listenPort}=${token}`;
 }
 
-function webSocketMessageText(data: RawData): string {
-  const bytes = Array.isArray(data)
-    ? Buffer.concat(data)
-    : data instanceof ArrayBuffer
-      ? Buffer.from(data)
-      : data;
-  return bytes.toString("utf8");
+const privateHeaders = {
+  Cookie: "openclaw_plugin_tab=secret",
+  "Tailscale-User-Login": "private@example.test",
+  Forwarded: "host=forged.example;proto=https",
+  "Cf-Access-Jwt-Assertion": "synthetic-edge-assertion",
+  Authorization: "Bearer synthetic-app-token",
+  "X-Remove-Me": "remove",
+};
+
+function expectSafeHeaders(headers: IncomingMessage["headers"] | undefined, publicUrl: string) {
+  expect(headers).toMatchObject({
+    "x-forwarded-host": new URL(publicUrl).host,
+    "x-forwarded-proto": "http",
+    authorization: privateHeaders.Authorization,
+  });
+  for (const key of "cookie tailscale-user-login forwarded x-remove-me cf-access-jwt-assertion".split(
+    " ",
+  )) {
+    expect(headers?.[key]).toBeUndefined();
+  }
 }
 
 async function openWebSocket(
   url: string,
   headers?: Record<string, string>,
+  finishRequest?: (req: ClientRequest) => void,
 ): Promise<{ socket: WebSocket; setCookies: string[] | undefined }> {
   let setCookies: string[] | undefined;
-  const socket = new WebSocket(url, headers ? { headers } : undefined);
+  const socket = new WebSocket(url, { headers, finishRequest });
   socket.once("upgrade", (response) => {
     setCookies = response.headers["set-cookie"];
   });
-  await new Promise<void>((resolve, reject) => {
-    socket.once("open", resolve);
-    socket.once("error", reject);
-  });
+  await once(socket, "open");
   return { socket, setCookies };
 }
 
 async function closeWebSocket(socket: WebSocket): Promise<void> {
-  await new Promise<void>((resolve) => {
-    socket.once("close", resolve);
-    socket.close();
-  });
+  const closed = once(socket, "close");
+  socket.close();
+  await closed;
 }
 
 async function browserCall(
   jar: Map<string, string>,
-  params: Omit<Parameters<typeof httpCall>[0], "headers">,
+  portal: { listenPort: number },
+  path = "/",
 ): Promise<HttpResult> {
   const cookie = cookieJarHeader(jar);
   const result = await httpCall({
-    ...params,
-    ...(cookie ? { headers: { Cookie: cookie } } : {}),
+    port: portal.listenPort,
+    path,
+    headers: cookie ? { Cookie: cookie } : undefined,
   });
   storeCookies(jar, result.headers["set-cookie"]);
   return result;
@@ -297,12 +242,12 @@ async function browserCall(
 describe("portal HTTP proxy", () => {
   it("proxies a URL token directly, sets a private cookie, and strips the token", async () => {
     const targetPaths: string[] = [];
-    targetHandler = (req, res) => {
+    target.handler = (req, res) => {
       targetPaths.push(req.url ?? "/");
       res.statusCode = 200;
       res.end("proxied");
     };
-    const portal = await openPortal({ targetPort, title: "App" });
+    const portal = await openPortal({ targetPort: target.port, title: "App" });
 
     const unauthorized = await httpCall({ port: portal.listenPort });
     expect(unauthorized.status).toBe(401);
@@ -311,45 +256,33 @@ describe("portal HTTP proxy", () => {
     expect(unauthorized.headers["referrer-policy"]).toBe("no-referrer");
 
     const unauthorizedUpgrade = await readUpgradeRejection({ port: portal.listenPort });
-    expect(unauthorizedUpgrade.status).toBe(401);
-    expect(unauthorizedUpgrade.body).toBe("Unauthorized");
+    expect(unauthorizedUpgrade).toMatchObject({ status: 401, body: "Unauthorized" });
     expect(unauthorizedUpgrade.elapsedMs).toBeLessThan(2000);
 
     const authorized = await httpCall({
       port: portal.listenPort,
       path: `/preview?x=1&${portal.tokenQuery}`,
     });
-    expect(authorized.status).toBe(200);
-    expect(authorized.body).toBe("proxied");
+    expect(authorized).toMatchObject({ status: 200, body: "proxied" });
     expect(authorized.headers["set-cookie"]?.[0]).toContain(
       `openclaw_portal_${portal.listenPort}=`,
     );
     expect(authorized.headers["set-cookie"]?.[0]).toContain("HttpOnly; SameSite=Lax; Path=/");
     expect(targetPaths).toEqual(["/preview?x=1"]);
 
-    const cookieOnly = await httpCall({
-      port: portal.listenPort,
-      path: "/cookie?y=2",
-      headers: { Cookie: portalAuthCookie(portal) },
-    });
+    const cookieOnly = await authenticatedCall(portal, "/cookie?y=2");
     expect(cookieOnly).toMatchObject({ status: 200, body: "proxied" });
     expect(targetPaths).toEqual(["/preview?x=1", "/cookie?y=2"]);
   });
 
   it("flushes HTTP 404 on an unknown portal ingress upgrade instead of hanging", async () => {
-    const service = createGatewayPortalService({
-      httpBindHosts: ["127.0.0.1"],
-      httpServers: [],
-      ingress: { domain: "previews.example.net", port: 0 },
-    });
-    services.add(service);
-    const portal = await service.open({ targetPort, title: "App" });
+    const { service } = makeService({ ingress: { domain: "previews.example.net", port: 0 } });
+    const portal = await service.open({ targetPort: target.port, title: "App" });
     const rejected = await readUpgradeRejection({
       port: portal.listenPort,
       host: "missing.previews.example.net",
     });
-    expect(rejected.status).toBe(404);
-    expect(rejected.body).toBe("Unknown portal");
+    expect(rejected).toMatchObject({ status: 404, body: "Unknown portal" });
     expect(rejected.elapsedMs).toBeLessThan(2000);
   });
 
@@ -359,10 +292,10 @@ describe("portal HTTP proxy", () => {
       const httpServers: Server[] = [];
       const service = portalService(httpServers);
       const portal = await service.open({
-        targetPort,
+        targetPort: target.port,
         target: workerTarget(async () => {
           throw new Error("Worker unavailable");
-        }, targetPort),
+        }, target.port),
       });
       const upgraded = createDeferredCore<Duplex>();
       httpServers[0]!.once("upgrade", (_req, socket) => upgraded.resolve(socket));
@@ -397,7 +330,7 @@ describe("portal HTTP proxy", () => {
   it("streams HTTP requests and responses with rewritten safe headers", async () => {
     let receivedHeaders: IncomingMessage["headers"] | undefined;
     let receivedBody = "";
-    targetHandler = (req, res) => {
+    target.handler = (req, res) => {
       receivedHeaders = req.headers;
       req.setEncoding("utf8");
       req.on("data", (chunk: string) => (receivedBody += chunk));
@@ -419,17 +352,13 @@ describe("portal HTTP proxy", () => {
       method: "POST",
       body: "streamed request",
       headers: {
+        ...privateHeaders,
         Host: "portal.example:9999",
         Cookie: `openclaw_plugin_tab=secret; ${portalAuthCookie(portal)}`,
         Connection: "keep-alive, x-remove-me",
-        "X-Remove-Me": "remove",
-        "Tailscale-User-Login": "private@example.test",
-        Forwarded: "host=forged.example;proto=https",
         "X-Forwarded-Port": "444",
         "X-Real-IP": "192.0.2.1",
-        "Cf-Access-Jwt-Assertion": "synthetic-edge-assertion",
         "Cf-Access-Client-Secret": "synthetic-edge-secret",
-        Authorization: "Bearer synthetic-app-token",
         Referer: `http://127.0.0.1:${portal.listenPort}/?${portal.tokenQuery}`,
       },
     });
@@ -438,49 +367,31 @@ describe("portal HTTP proxy", () => {
     expect(receivedBody).toBe("streamed request");
     expect(result.headers["x-app"]).toBe("kept");
     expect(result.headers["referrer-policy"]).toBe("no-referrer");
-    expect(receivedHeaders?.referer).toBeUndefined();
     expect(result.headers["x-target-hop"]).toBeUndefined();
     // Node may add its own connection-local Keep-Alive header; the upstream value must not pass.
     expect(result.headers["keep-alive"]).not.toBe("upstream-secret=17");
+    expectSafeHeaders(receivedHeaders, portal.publicUrl);
     expect(receivedHeaders).toMatchObject({
-      host: `localhost:${targetPort}`,
-      "x-forwarded-proto": "http",
-      "x-forwarded-host": new URL(portal.publicUrl).host,
+      host: `localhost:${target.port}`,
+      "x-forwarded-for": expect.stringMatching(/127\.0\.0\.1|::ffff:127\.0\.0\.1/u),
     });
-    expect(receivedHeaders?.cookie).toBeUndefined();
-    expect(receivedHeaders?.authorization).toBe("Bearer synthetic-app-token");
-    for (const name of [
-      "cf-access-jwt-assertion",
-      "cf-access-client-secret",
-      "tailscale-user-login",
-      "forwarded",
-      "x-forwarded-port",
-      "x-real-ip",
-      "x-remove-me",
-    ]) {
-      expect(receivedHeaders?.[name]).toBeUndefined();
+    for (const key of ["referer", "cf-access-client-secret", "x-forwarded-port", "x-real-ip"]) {
+      expect(receivedHeaders?.[key]).toBeUndefined();
     }
-    expect(receivedHeaders?.["x-forwarded-for"]).toMatch(/127\.0\.0\.1|::ffff:127\.0\.0\.1/u);
   });
 
   it("keeps A-B-A sessions authorized while forwarding only each target's prefixed cookies", async () => {
     const receivedCookiesA: Array<string | undefined> = [];
-    targetHandler = cookieTarget("a", receivedCookiesA);
+    target.handler = cookieTarget("a", receivedCookiesA);
     const receivedCookiesB: Array<string | undefined> = [];
     const targetPortB = await listenTarget(cookieTarget("b", receivedCookiesB));
     const service = portalService();
-    const portalA = await service.open({ targetPort });
+    const portalA = await service.open({ targetPort: target.port });
     const portalB = await service.open({ targetPort: targetPortB });
     const jar = new Map<string, string>();
 
-    const initialA = await browserCall(jar, {
-      port: portalA.listenPort,
-      path: `/set?${portalA.tokenQuery}`,
-    });
-    const initialB = await browserCall(jar, {
-      port: portalB.listenPort,
-      path: `/set?${portalB.tokenQuery}`,
-    });
+    const initialA = await browserCall(jar, portalA, `/set?${portalA.tokenQuery}`);
+    const initialB = await browserCall(jar, portalB, `/set?${portalB.tokenQuery}`);
     expect(initialA).toMatchObject({ status: 200, body: "target-a" });
     expect(initialB).toMatchObject({ status: 200, body: "target-b" });
     const targetCookieA = initialA.headers["set-cookie"]?.find((cookie) =>
@@ -509,7 +420,7 @@ describe("portal HTTP proxy", () => {
       [portalB, "target-b"],
       [portalA, "target-a"],
     ] as const) {
-      expect(await browserCall(jar, { port: portal.listenPort })).toMatchObject({
+      expect(await browserCall(jar, portal)).toMatchObject({
         status: 200,
         body,
       });
@@ -519,81 +430,66 @@ describe("portal HTTP proxy", () => {
   });
 
   it("does not forward cookies from a closed portal when its target port is reused", async () => {
-    targetHandler = (_req, res) => {
+    target.handler = (_req, res) => {
       res.setHeader("Set-Cookie", "session=portal-a-secret; Path=/; HttpOnly");
       res.end("target-a");
     };
     const service = portalService();
-    const portalA = await service.open({ targetPort });
+    const portalA = await service.open({ targetPort: target.port });
     const jar = new Map<string, string>();
-    await browserCall(jar, {
-      port: portalA.listenPort,
-      path: `/?${portalA.tokenQuery}`,
-    });
+    await browserCall(jar, portalA, `/?${portalA.tokenQuery}`);
     await service.close(portalA.id);
 
     const receivedCookiesB: Array<string | undefined> = [];
-    targetHandler = (req, res) => {
+    target.handler = (req, res) => {
       receivedCookiesB.push(req.headers.cookie);
       if (req.url === "/set") {
         res.setHeader("Set-Cookie", "session=portal-b; Path=/; HttpOnly");
       }
       res.end("target-b");
     };
-    const portalB = await service.open({ targetPort });
+    const portalB = await service.open({ targetPort: target.port });
     expect(portalB.tokenQuery).not.toBe(portalA.tokenQuery);
 
-    await browserCall(jar, {
-      port: portalB.listenPort,
-      path: `/?${portalB.tokenQuery}`,
-    });
-    await browserCall(jar, { port: portalB.listenPort, path: "/set" });
-    await browserCall(jar, { port: portalB.listenPort });
+    await browserCall(jar, portalB, `/?${portalB.tokenQuery}`);
+    await browserCall(jar, portalB, "/set");
+    await browserCall(jar, portalB);
 
     expect(receivedCookiesB).toEqual([undefined, undefined, "session=portal-b"]);
   });
 
-  it.each(["localhost"])(
-    "keeps absolute %s app redirects on the published portal origin",
-    async (host) => {
-      targetHandler = (_req, res) => {
-        res.writeHead(302, { Location: `http://${host}:${targetPort}/nested/page?q=1#section` });
-        res.end();
+  it.each(["loopback", "/nested/page?q=1", "https://accounts.example.test/login"])(
+    "handles the %s redirect on the published origin",
+    async (redirect) => {
+      const path = "/nested/page?q=1#section";
+      const location =
+        redirect === "loopback" ? `http://localhost:${target.port}${path}` : redirect;
+      target.handler = (_req, res) => {
+        res.writeHead(302, { Location: location }).end();
       };
       const portal = await openPortal();
       const response = await authenticatedCall(portal);
-      expect(response.status).toBe(302);
-      expect(response.headers.location).toBe(
-        new URL("/nested/page?q=1#section", portal.publicUrl).href,
-      );
-    },
-  );
-
-  it.each(["/nested/page?q=1", "https://accounts.example.test/login"])(
-    "preserves intentional redirect %s",
-    async (location) => {
-      targetHandler = (_req, res) => {
-        res.writeHead(302, { Location: location });
-        res.end();
-      };
-      const portal = await openPortal();
-      const response = await authenticatedCall(portal);
-      expect(response.headers.location).toBe(location);
+      expect(response).toMatchObject({
+        status: 302,
+        headers: {
+          location: redirect === "loopback" ? new URL(path, portal.publicUrl).href : location,
+        },
+      });
     },
   );
 
   it("shows a retry page when the target closes the connection", async () => {
-    targetHandler = (_req, res) => res.destroy();
+    target.handler = (_req, res) => res.destroy();
     const portal = await openPortal();
 
-    expectWaiting(await authenticatedCall(portal), targetPort);
+    expectWaiting(await authenticatedCall(portal), target.port);
   });
 
   it("proxies worker HTTP and WebSocket traffic through a fresh paired duplex per connection", async () => {
     const remotePort = 4173;
     let receivedHost: string | undefined;
     let connectionCount = 0;
-    targetHandler = (req, res) => {
+    target.handler = (req, res) => {
       receivedHost = req.headers.host;
       res.end("worker proxied");
     };
@@ -601,7 +497,7 @@ describe("portal HTTP proxy", () => {
       targetPort: remotePort,
       target: workerTarget(async () => {
         connectionCount += 1;
-        return createWorkerStream(targetPort);
+        return createWorkerStream(target.port);
       }, remotePort),
     });
 
@@ -620,7 +516,7 @@ describe("portal HTTP proxy", () => {
   });
 
   it("waits for asynchronous worker stream attachment before forwarding the HTTP request", async () => {
-    targetHandler = (req, res) => {
+    target.handler = (req, res) => {
       res.end(`worker ${req.url}`);
     };
     const dialStarted = createDeferredCore();
@@ -631,7 +527,7 @@ describe("portal HTTP proxy", () => {
       target: workerTarget(async () => {
         dialStarted.resolve();
         await dialReleased.promise;
-        return createWorkerStream(targetPort);
+        return createWorkerStream(target.port);
       }, remotePort),
     });
 
@@ -646,22 +542,22 @@ describe("portal HTTP proxy", () => {
   });
 
   it("contains browser socket errors while a worker WebSocket is attaching", async () => {
-    targetHandler = (_req, res) => res.end("still available");
+    target.handler = (_req, res) => res.end("still available");
     const httpServers: Server[] = [];
     const service = portalService(httpServers);
     const dialing = createDeferredCore();
     const attachment = createDeferredCore<Duplex>();
     let firstConnection = true;
     const portal = await service.open({
-      targetPort,
+      targetPort: target.port,
       target: workerTarget(async () => {
         if (!firstConnection) {
-          return createWorkerStream(targetPort);
+          return createWorkerStream(target.port);
         }
         firstConnection = false;
         dialing.resolve();
         return await attachment.promise;
-      }, targetPort),
+      }, target.port),
     });
     const upgrade = createDeferredCore<Duplex>();
     httpServers[0]!.once("upgrade", (_req, socket) => upgrade.resolve(socket));
@@ -703,7 +599,7 @@ describe("portal HTTP proxy", () => {
   ] as const)("closes both sides when the %s portal's %s disconnects", async (kind, disconnect) => {
     let appResponse: ServerResponse | undefined;
     let appClosed = false;
-    targetHandler = (_req, res) => {
+    target.handler = (_req, res) => {
       appResponse = res;
       res.once("close", () => {
         appClosed = true;
@@ -712,10 +608,10 @@ describe("portal HTTP proxy", () => {
       res.write("data: ready\n\n");
     };
     const portal = await openPortal({
-      targetPort,
+      targetPort: target.port,
       ...(kind === "worker"
         ? {
-            target: workerTarget(async () => createWorkerStream(targetPort), targetPort),
+            target: workerTarget(async () => createWorkerStream(target.port), target.port),
           }
         : {}),
     });
@@ -748,7 +644,7 @@ describe("portal HTTP proxy", () => {
     "delivers %s response headers before the first body chunk and handles %s",
     async (kind, completion) => {
       let appResponse: ServerResponse | undefined;
-      targetHandler = (req, res) => {
+      target.handler = (req, res) => {
         if (req.url === "/events") {
           appResponse = res;
           res.setHeader("Content-Type", "text/event-stream");
@@ -768,9 +664,9 @@ describe("portal HTTP proxy", () => {
         res.writeHead(404).end();
       };
       const portal = await openPortal({
-        targetPort,
+        targetPort: target.port,
         ...(kind === "worker"
-          ? { target: workerTarget(async () => createWorkerStream(targetPort), targetPort) }
+          ? { target: workerTarget(async () => createWorkerStream(target.port), target.port) }
           : {}),
       });
       const connection = {
@@ -880,67 +776,40 @@ describe("portal HTTP proxy", () => {
 
   it("splices WebSockets and destroys upgraded sockets and listeners on close", async () => {
     const service = portalService();
-    const portal = await service.open({ targetPort });
+    const portal = await service.open({ targetPort: target.port });
     targetWebSocketSetCookie = "socket=ready; Domain=target.example; Path=/; HttpOnly";
-    let upgradeCookies: string[] | undefined;
-    const ws = new WebSocket(
+    const { socket: ws, setCookies: upgradeCookies } = await openWebSocket(
       `ws://127.0.0.1:${portal.listenPort}/hmr?channel=dev&${portal.tokenQuery}`,
       {
-        headers: {
-          Cookie: "openclaw_plugin_tab=secret",
-          "Tailscale-User-Login": "private@example.test",
-          "X-Forwarded-Host": "forged.example",
-          "X-Forwarded-Proto": "https",
-          Forwarded: "host=forged.example",
-          "Cf-Access-Jwt-Assertion": "synthetic-edge-assertion",
-          "Cf-Access-Authenticated-User-Email": "private@example.test",
-          Authorization: "Bearer synthetic-app-token",
-          "X-Remove-Me": "remove",
-        },
-        finishRequest: (req) => {
-          // ws installs its own Connection header after user headers.
-          req.setHeader("Connection", "Upgrade, x-remove-me");
-          req.end();
-        },
+        ...privateHeaders,
+        "X-Forwarded-Host": "forged.example",
+        "X-Forwarded-Proto": "https",
+        Forwarded: "host=forged.example",
+        "Cf-Access-Authenticated-User-Email": "private@example.test",
+      },
+      (req) => {
+        // ws installs its own Connection header after user headers.
+        req.setHeader("Connection", "Upgrade, x-remove-me");
+        req.end();
       },
     );
-    ws.once("upgrade", (response) => {
-      upgradeCookies = response.headers["set-cookie"];
-    });
-    await new Promise<void>((resolve, reject) => {
-      ws.once("open", () => resolve());
-      ws.once("error", reject);
-    });
     await expectEcho(ws, "hot reload");
     expect(targetWebSocketPath).toBe("/hmr?channel=dev");
-    expect(targetWebSocketCookie).toBeUndefined();
-    expect(targetWebSocketHeaders?.["x-forwarded-host"]).toBe(new URL(portal.publicUrl).host);
-    expect(targetWebSocketHeaders?.["x-forwarded-proto"]).toBe("http");
-    expect(targetWebSocketHeaders?.authorization).toBe("Bearer synthetic-app-token");
-    for (const name of [
-      "tailscale-user-login",
-      "forwarded",
-      "x-remove-me",
-      "cf-access-jwt-assertion",
-      "cf-access-authenticated-user-email",
-    ]) {
-      expect(targetWebSocketHeaders?.[name]).toBeUndefined();
-    }
+    expectSafeHeaders(targetWebSocketHeaders, portal.publicUrl);
+    expect(targetWebSocketHeaders?.["cf-access-authenticated-user-email"]).toBeUndefined();
     expect(upgradeCookies).toHaveLength(1);
     expect(upgradeCookies?.[0]).toMatch(
       /^oc_portal_[a-f0-9]{32}_socket=ready; Path=\/; HttpOnly$/u,
     );
 
-    const closed = new Promise<void>((resolve) => {
-      ws.once("close", () => resolve());
-    });
+    const closed = once(ws, "close");
     await service.close(portal.id);
     await closed;
     await expect(httpCall({ port: portal.listenPort })).rejects.toThrow();
   });
 
   it("keeps portal A WebSocket authorized after portal B replaces the active URL", async () => {
-    targetHandler = (_req, res) => {
+    target.handler = (_req, res) => {
       res.statusCode = 200;
       res.end("target-a");
     };
@@ -949,17 +818,11 @@ describe("portal HTTP proxy", () => {
       res.end("target-b");
     });
     const service = portalService();
-    const portalA = await service.open({ targetPort });
+    const portalA = await service.open({ targetPort: target.port });
     const portalB = await service.open({ targetPort: targetPortB });
     const jar = new Map<string, string>();
-    await browserCall(jar, {
-      port: portalA.listenPort,
-      path: `/?${portalA.tokenQuery}`,
-    });
-    await browserCall(jar, {
-      port: portalB.listenPort,
-      path: `/?${portalB.tokenQuery}`,
-    });
+    await browserCall(jar, portalA, `/?${portalA.tokenQuery}`);
+    await browserCall(jar, portalB, `/?${portalB.tokenQuery}`);
 
     const { socket: ws } = await openWebSocket(
       `ws://127.0.0.1:${portalA.listenPort}/hmr?channel=dev`,
@@ -972,7 +835,7 @@ describe("portal HTTP proxy", () => {
 
   it("does not forward WebSocket cookies from a closed portal when its target port is reused", async () => {
     const service = portalService();
-    const portalA = await service.open({ targetPort });
+    const portalA = await service.open({ targetPort: target.port });
     targetWebSocketSetCookie = "socket=portal-a-secret; Path=/; HttpOnly";
     const connectionA = await openWebSocket(
       `ws://127.0.0.1:${portalA.listenPort}/hmr?${portalA.tokenQuery}`,
@@ -982,7 +845,7 @@ describe("portal HTTP proxy", () => {
     await closeWebSocket(connectionA.socket);
     await service.close(portalA.id);
 
-    const portalB = await service.open({ targetPort });
+    const portalB = await service.open({ targetPort: target.port });
     targetWebSocketSetCookie = "socket=portal-b; Path=/; HttpOnly";
     const connectionB = await openWebSocket(
       `ws://127.0.0.1:${portalB.listenPort}/hmr?${portalB.tokenQuery}`,
