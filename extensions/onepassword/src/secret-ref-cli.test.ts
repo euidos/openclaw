@@ -8,15 +8,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveTrustedOnePasswordCli } from "../onepassword-op-path.js";
 import { registerOnePasswordSecretRefCommands } from "./secret-ref-cli.js";
 
-const readTokenFileMock = vi.hoisted(() =>
-  vi.fn<
-    (
-      filePath: string | undefined,
-      label: string,
-      options?: Parameters<typeof tryReadSecretFileSync>[2],
-    ) => string | undefined
-  >(),
-);
+const readTokenFileMock = vi.hoisted(() => vi.fn<typeof tryReadSecretFileSync>());
+const tokenFile = path.join(os.tmpdir(), "openclaw-onepassword-missing-token");
+const pluginIntegration = { pluginId: "onepassword", integrationId: "onepassword" };
 
 vi.mock("../onepassword-op-path.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../onepassword-op-path.js")>()),
@@ -27,7 +21,9 @@ vi.mock("openclaw/plugin-sdk/secret-file-runtime", async (importOriginal) => ({
   tryReadSecretFileSync: readTokenFileMock,
 }));
 
-beforeEach(() => {
+let tempDir: string;
+beforeEach(async () => {
+  tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-onepassword-cli-"));
   vi.stubEnv("PATH", "");
   vi.stubEnv("CLAW_1PASSWORD_OP", undefined);
   vi.mocked(resolveTrustedOnePasswordCli).mockReset();
@@ -48,52 +44,36 @@ function captureStdout() {
   return () => output;
 }
 
-function createProgram(config: OpenClawConfig = {}): Command {
+async function run(args: string[], config: OpenClawConfig = {}): Promise<string> {
+  const output = captureStdout();
   const program = new Command().exitOverride();
   const onepassword = program.command("onepassword");
   registerOnePasswordSecretRefCommands({
     command: onepassword,
     config,
-    tokenFile: path.join(os.tmpdir(), "openclaw-onepassword-missing-token"),
+    tokenFile,
   });
-  return program;
-}
-
-async function runStatus(
-  config: OpenClawConfig,
-  args: string[] = [],
-): Promise<Record<string, unknown>> {
-  const output = captureStdout();
-  await createProgram(config).parseAsync(
-    ["onepassword", "secretref", "status", "--json", ...args],
-    { from: "user" },
-  );
-  return JSON.parse(output()) as Record<string, unknown>;
-}
-
-async function runSetup(planPath: string, args: string[]): Promise<string> {
-  const output = captureStdout();
-  await createProgram().parseAsync(
-    ["onepassword", "secretref", "setup", "--plan-out", planPath, ...args],
-    { from: "user" },
-  );
+  await program.parseAsync(["onepassword", "secretref", ...args], { from: "user" });
   return output();
 }
 
-async function createSetupPlan(args: string[]): Promise<OnePasswordPlan> {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-onepassword-cli-"));
-  const planPath = path.join(dir, "plan.json");
-  try {
-    await runSetup(planPath, args);
-    return JSON.parse(await fs.readFile(planPath, "utf8")) as OnePasswordPlan;
-  } finally {
-    await fs.rm(dir, { recursive: true, force: true });
-  }
+async function runStatus(config: OpenClawConfig): Promise<Record<string, unknown>> {
+  return JSON.parse(await run(["status", "--json"], config)) as Record<string, unknown>;
 }
 
-afterEach(() => {
+const runSetup = (planPath: string, args: string[]) =>
+  run(["setup", "--plan-out", planPath, ...args]);
+
+async function createSetupPlan(args: string[]): Promise<OnePasswordPlan> {
+  const planPath = path.join(tempDir, "plan.json");
+  await runSetup(planPath, args);
+  return JSON.parse(await fs.readFile(planPath, "utf8")) as OnePasswordPlan;
+}
+
+afterEach(async () => {
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
+  await fs.rm(tempDir, { recursive: true, force: true });
 });
 
 describe("1Password SecretRef setup", () => {
@@ -109,7 +89,7 @@ describe("1Password SecretRef setup", () => {
 
     expect(plan.providerUpserts.onepassword).toEqual({
       source: "exec",
-      pluginIntegration: { pluginId: "onepassword", integrationId: "onepassword" },
+      pluginIntegration,
     });
     expect(plan.targets).toEqual([
       expect.objectContaining({
@@ -140,44 +120,34 @@ describe("1Password SecretRef setup", () => {
   it.skipIf(process.platform === "win32")(
     "rejects plan output in a directory writable by another account",
     async () => {
-      const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-secret-plan-test-"));
       const planPath = path.join(tempDir, "plan.json");
-      try {
-        await fs.chmod(tempDir, 0o777);
-        await expect(
-          runSetup(planPath, ["--openai-id", "op://openclaw/OpenAI/credential"]),
-        ).rejects.toThrow("path is writable by another user");
-        await expect(fs.stat(planPath)).rejects.toMatchObject({ code: "ENOENT" });
-      } finally {
-        await fs.chmod(tempDir, 0o700);
-        await fs.rm(tempDir, { recursive: true, force: true });
-      }
+      await fs.chmod(tempDir, 0o777);
+      await expect(
+        runSetup(planPath, ["--openai-id", "op://openclaw/OpenAI/credential"]),
+      ).rejects.toThrow("path is writable by another user");
+      await expect(fs.stat(planPath)).rejects.toMatchObject({ code: "ENOENT" });
     },
   );
 
   it.skipIf(process.platform === "win32")(
     "writes through the canonical directory instead of a replaceable alias",
     async () => {
-      const trustedDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-secret-plan-trusted-"));
-      const aliasParent = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-secret-plan-alias-"));
+      const trustedDir = path.join(tempDir, "trusted");
+      const aliasParent = path.join(tempDir, "alias");
+      await fs.mkdir(trustedDir);
+      await fs.mkdir(aliasParent);
       const aliasDir = path.join(aliasParent, "output");
       const canonicalPlanPath = path.join(await fs.realpath(trustedDir), "plan.json");
-      try {
-        await fs.symlink(trustedDir, aliasDir);
-        await fs.chmod(aliasParent, 0o777);
-        const output = await runSetup(path.join(aliasDir, "plan.json"), [
-          "--openai-id",
-          "op://openclaw/OpenAI/credential",
-        ]);
-        expect(output).toContain(`Plan written to ${canonicalPlanPath}`);
-        expect(JSON.parse(await fs.readFile(canonicalPlanPath, "utf8"))).toMatchObject({
-          version: 1,
-        });
-      } finally {
-        await fs.chmod(aliasParent, 0o700);
-        await fs.rm(aliasParent, { recursive: true, force: true });
-        await fs.rm(trustedDir, { recursive: true, force: true });
-      }
+      await fs.symlink(trustedDir, aliasDir);
+      await fs.chmod(aliasParent, 0o777);
+      const output = await runSetup(path.join(aliasDir, "plan.json"), [
+        "--openai-id",
+        "op://openclaw/OpenAI/credential",
+      ]);
+      expect(output).toContain(`Plan written to ${canonicalPlanPath}`);
+      expect(JSON.parse(await fs.readFile(canonicalPlanPath, "utf8"))).toMatchObject({
+        version: 1,
+      });
     },
   );
 });
@@ -193,7 +163,7 @@ describe("1Password readiness", () => {
       opCommand: "/trusted/op",
       opBinaryPath: "/trusted/op",
       opStatus: "ready",
-      tokenFile: path.join(os.tmpdir(), "openclaw-onepassword-missing-token"),
+      tokenFile,
       tokenFileStatus: "ready",
       prerequisitesReady: true,
     });
@@ -203,7 +173,7 @@ describe("1Password readiness", () => {
       pathEnv: "/bin",
     });
     expect(tryReadSecretFileSync).toHaveBeenCalledWith(
-      path.join(os.tmpdir(), "openclaw-onepassword-missing-token"),
+      tokenFile,
       "1Password service account token",
       expect.objectContaining({ rejectHardlinks: false, rejectSymlink: true }),
     );
@@ -219,7 +189,7 @@ describe("1Password readiness", () => {
       opCommand: "op",
       opBinaryPath: null,
       opStatus: "untrusted",
-      tokenFile: path.join(os.tmpdir(), "openclaw-onepassword-missing-token"),
+      tokenFile,
       tokenFileStatus: "missing-or-unsafe",
       prerequisitesReady: false,
     });
@@ -233,7 +203,7 @@ describe("1Password CLI status", () => {
         providers: {
           "corp-onepassword": {
             source: "exec",
-            pluginIntegration: { pluginId: "onepassword", integrationId: "onepassword" },
+            pluginIntegration,
           },
         },
       },
