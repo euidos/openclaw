@@ -38,6 +38,7 @@ import type {
   AgentDatabaseRequestExecutionSource,
   OpenClawAgentDatabaseAdmissionExecution,
 } from "../state/openclaw-agent-execution-admission-contract.js";
+import { toAgentExecutionConstraints } from "../state/openclaw-agent-execution-scope.js";
 import { captureOpenClawAgentDatabasePreparationExecution } from "../state/openclaw-agent-execution.js";
 import {
   runOpenClawAgentWorkerWrite,
@@ -71,14 +72,7 @@ export function captureClientVoiceSessionWriter(params: {
   const existing = captured.identity.key.startsWith("file:");
   const execution = captureOpenClawAgentDatabasePreparationExecution(
     options,
-    existing
-      ? {
-          kind: "file",
-          physicalIdentity: captured.identity.key.slice("file:".length),
-          birthtime: captured.identity.birthtime,
-          nativeLocation: captured.identity.canonicalPath,
-        }
-      : undefined,
+    toAgentExecutionConstraints(captured.identity).expectedIdentity,
   );
   const assertCurrent = () => {
     assertClientVoiceSessionSettlementCurrent(captured.settlementContext);

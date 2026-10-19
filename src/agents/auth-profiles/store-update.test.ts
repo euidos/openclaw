@@ -514,12 +514,12 @@ it("keeps a shared rotation that commits while a local save awaits publication",
     const publish = publication.publishAuthProfileStoreUpdate;
     let rotated = false;
     vi.spyOn(publication, "publishAuthProfileStoreUpdate").mockImplementation(
-      async (owner, committed, assertCurrent, nativeCommits, committedIsCurrent) => {
+      async (committed, owner, assertCurrent, nativeCommits, committedIsCurrent) => {
         if (!rotated && owner.databasePath !== owner.sharedDatabasePath) {
           rotated = true;
           await update({ profiles: { shared: "synthetic-shared-after" } }, undefined, true);
         }
-        return publish(owner, committed, assertCurrent, nativeCommits, committedIsCurrent);
+        return publish(committed, owner, assertCurrent, nativeCommits, committedIsCurrent);
       },
     );
     await update({ profiles: { local: "synthetic-local-after" } }, agentDir);
