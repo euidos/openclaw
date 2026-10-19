@@ -113,6 +113,7 @@ export async function recoverStore(params: {
   for (const { sessionKey, entry: loadedEntry } of entries) {
     let entry = loadedEntry;
     let completionSource: SessionSourceAssertion | undefined;
+    let releaseCompletionSource: (() => void) | undefined;
     const isRecoveryCandidate =
       !loadedEntry.mainRestartRecovery?.tombstone &&
       hasMainSessionRecoveryClaim(loadedEntry) &&
@@ -478,6 +479,34 @@ export async function recoverStore(params: {
       if (
         !recoverableHarnessCompletion &&
         !completionSource &&
+        !requesterOrigin &&
+        source !== "cron" &&
+        expectedRecoverySourceRunId &&
+        requiresDelegatedRecoverySource(entry, source)
+      ) {
+        const { prepareConsumedSessionSendSource } =
+          await import("../../gateway/session-send-recovery-source.js");
+        const recovered = await prepareConsumedSessionSendSource({
+          config: params.cfg,
+          target: {
+            ...target,
+            sessionId: entry.sessionId,
+            lifecycleRevision: entry.lifecycleRevision,
+          },
+          sourceRunId: expectedRecoverySourceRunId,
+          signal: params.signal,
+          assertCurrent: () => {
+            if (params.shouldContinue?.() === false) {
+              throw new Error("Session delivery restart recovery is no longer current");
+            }
+          },
+        });
+        completionSource = recovered?.source;
+        releaseCompletionSource = recovered?.release;
+      }
+      if (
+        !recoverableHarnessCompletion &&
+        !completionSource &&
         (source === "cron" || !requesterOrigin) &&
         requiresDelegatedRecoverySource(entry, source)
       ) {
@@ -573,6 +602,8 @@ export async function recoverStore(params: {
       if (stopped()) {
         return result;
       }
+      const releaseDispatchedCompletionSource = releaseCompletionSource;
+      releaseCompletionSource = undefined;
       const resumeResult = await resumeMainSession({
         ...target,
         canonicalSessionKey: dispatchSessionKey,
@@ -580,6 +611,7 @@ export async function recoverStore(params: {
         entry,
         observation: recoveryView.observation,
         completionSource,
+        releaseCompletionSource: releaseDispatchedCompletionSource,
         recoveryAttempt: recoveryView.nextAttempt,
         controllerInput: params.controllerInput,
         lane: params.lane,
@@ -632,6 +664,7 @@ export async function recoverStore(params: {
       );
       result.failed++;
     } finally {
+      releaseCompletionSource?.();
       if (isRecoveryCandidate && isMainRestartRecoveryCandidate(loadedEntry, sessionKey)) {
         mainSessionRecoveryLog.info(
           `main-session restart recovery candidate ${JSON.stringify({
