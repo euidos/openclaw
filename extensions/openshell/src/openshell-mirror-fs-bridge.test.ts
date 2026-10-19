@@ -30,6 +30,17 @@ describe("openshell mirror fs bridges", () => {
   let bridge: OpenShellFsBridge;
   const local = (filePath: string) => path.join(workspaceDir, filePath);
   const readLocal = (filePath: string) => fs.readFile(local(filePath), "utf8");
+  async function expectLocal(filePath: string, text: string) {
+    await expect(readLocal(filePath)).resolves.toBe(text);
+  }
+  async function expectRead(filePath: string, text: string, maxBytes?: number) {
+    await expect(bridge.readFile({ filePath, maxBytes })).resolves.toEqual(Buffer.from(text));
+  }
+  async function expectDirectory(filePath: string, entries: [string, boolean][], cwd?: string) {
+    await expect(bridge.readDirectory({ filePath, cwd })).resolves.toEqual(
+      entries.map(([name, isDirectory]) => ({ name, isDirectory })),
+    );
+  }
   async function seedLocal(filePath: string, data = "payload") {
     await fs.mkdir(path.dirname(local(filePath)), { recursive: true });
     await fs.writeFile(local(filePath), data);
@@ -90,13 +101,12 @@ describe("openshell mirror fs bridges", () => {
   );
 
   it("creates mirror files exclusively before syncing them", async () => {
-    await expect(
-      bridge.createFileExclusive({ filePath: "nested/file.txt", data: "first" }),
-    ).resolves.toBe("created");
-    await expect(
-      bridge.createFileExclusive({ filePath: "nested/file.txt", data: "replacement" }),
-    ).resolves.toBe("exists");
-    await expect(readLocal("nested/file.txt")).resolves.toBe("first");
+    const filePath = "nested/file.txt";
+    await expect(bridge.createFileExclusive({ filePath, data: "first" })).resolves.toBe("created");
+    await expect(bridge.createFileExclusive({ filePath, data: "replacement" })).resolves.toBe(
+      "exists",
+    );
+    await expectLocal(filePath, "first");
     expect(backend.syncLocalPathToRemote).toHaveBeenCalledTimes(1);
   });
 
@@ -124,23 +134,20 @@ describe("openshell mirror fs bridges", () => {
   it.runIf(process.platform !== "win32").each([
     { link: "symlink", error: "Sandbox symlink rename sources are not supported" },
     { link: "link", error: "Sandbox hardlinked rename sources are not supported" },
-  ] as const)(
-    "rejects $link rename sources before the remote backend commit",
-    async ({ link, error }) => {
-      await seedLocal("target.txt");
-      await fs[link](link === "symlink" ? "target.txt" : local("target.txt"), local("link.txt"));
-      await expect(bridge.rename({ from: "link.txt", to: "moved.txt" })).rejects.toThrow(error);
-      expect(backend.renameRemotePath).not.toHaveBeenCalled();
-      await expect(readLocal("link.txt")).resolves.toBe("payload");
-      if (link === "symlink") {
-        await expect(fs.readlink(local("link.txt"))).resolves.toBe("target.txt");
-      }
-      await expectPathMissing(local("moved.txt"));
-    },
-  );
+  ] as const)("rejects $link rename sources before remote commit", async ({ link, error }) => {
+    await seedLocal("target.txt");
+    await fs[link](link === "symlink" ? "target.txt" : local("target.txt"), local("link.txt"));
+    await expect(bridge.rename({ from: "link.txt", to: "moved.txt" })).rejects.toThrow(error);
+    expect(backend.renameRemotePath).not.toHaveBeenCalled();
+    await expect(readLocal("link.txt")).resolves.toBe("payload");
+    if (link === "symlink") {
+      await expect(fs.readlink(local("link.txt"))).resolves.toBe("target.txt");
+    }
+    await expectPathMissing(local("moved.txt"));
+  });
 
   it.runIf(process.platform !== "win32")(
-    "removes recursive mirror directories without following symlink leaves",
+    "removes trees without following symlink leaves",
     async () => {
       await using outside = await createOpenShellTestWorkspace("outside");
       const target = path.join(outside.dir, "target.txt");
@@ -155,23 +162,20 @@ describe("openshell mirror fs bridges", () => {
     },
   );
 
-  it.runIf(process.platform !== "win32")(
-    "unlinks a mirror symlink without removing its target",
-    async () => {
-      await using outside = await createOpenShellTestWorkspace("outside");
-      const target = path.join(outside.dir, "target.txt");
-      await fs.writeFile(target, "outside");
-      await fs.symlink(target, local("link.txt"));
-      await bridge.remove({ filePath: "link.txt", force: false, recursive: false });
-      await expectPathMissing(local("link.txt"));
-      await expect(fs.readFile(target, "utf8")).resolves.toBe("outside");
-      expect(backend.removeRemotePath).toHaveBeenCalledWith("/sandbox/link.txt", {
-        recursive: false,
-        signal: undefined,
-        ignoreMissing: false,
-      });
-    },
-  );
+  it.runIf(process.platform !== "win32")("unlinks symlinks without removing targets", async () => {
+    await using outside = await createOpenShellTestWorkspace("outside");
+    const target = path.join(outside.dir, "target.txt");
+    await fs.writeFile(target, "outside");
+    await fs.symlink(target, local("link.txt"));
+    await bridge.remove({ filePath: "link.txt", force: false, recursive: false });
+    await expectPathMissing(local("link.txt"));
+    await expect(fs.readFile(target, "utf8")).resolves.toBe("outside");
+    expect(backend.removeRemotePath).toHaveBeenCalledWith("/sandbox/link.txt", {
+      recursive: false,
+      signal: undefined,
+      ignoreMissing: false,
+    });
+  });
 
   it("preserves missing local mirror path handling", async () => {
     await expect(
@@ -183,9 +187,8 @@ describe("openshell mirror fs bridges", () => {
   it.each(["mkdirpRemotePath", "removeRemotePath", "renameRemotePath"] as const)(
     "keeps local state unchanged when %s is rejected",
     async (operation) => {
-      const sourcePath = path.join(workspaceDir, "source.txt");
       if (operation !== "mkdirpRemotePath") {
-        await fs.writeFile(sourcePath, "payload", "utf8");
+        await seedLocal("source.txt");
       }
       backend[operation].mockRejectedValue(new Error("remote rejected"));
       const mutation =
@@ -196,14 +199,11 @@ describe("openshell mirror fs bridges", () => {
             : bridge.rename({ from: "source.txt", to: "nested/target.txt" });
       await expect(mutation).rejects.toThrow("remote rejected");
       if (operation !== "mkdirpRemotePath") {
-        await expect(fs.readFile(sourcePath, "utf8")).resolves.toBe("payload");
+        await expectLocal("source.txt", "payload");
       }
       if (operation !== "removeRemotePath") {
         await expectPathMissing(
-          path.join(
-            workspaceDir,
-            operation === "mkdirpRemotePath" ? "nested" : "nested/target.txt",
-          ),
+          local(operation === "mkdirpRemotePath" ? "nested" : "nested/target.txt"),
         );
       }
     },
@@ -269,7 +269,7 @@ describe("openshell mirror fs bridges", () => {
       bridge.createFileExclusive({ filePath: "link.txt", data: "owned" }),
     ).rejects.toThrow();
     await expect(fs.readlink(local("link.txt"))).resolves.toBe("existing.txt");
-    await expect(readLocal("existing.txt")).resolves.toBe("keep");
+    await expectLocal("existing.txt", "keep");
     expect(backend.syncLocalPathToRemote).not.toHaveBeenCalled();
   });
 
@@ -286,16 +286,16 @@ describe("openshell mirror fs bridges", () => {
   it("reads regular files and directories through the shared safe fs root", async () => {
     await fs.mkdir(local("subdir/nested"), { recursive: true });
     await seedLocal("subdir/secret.txt", "inside");
-    await expect(bridge.readDirectory({ filePath: "." })).resolves.toEqual([
-      { name: "subdir", isDirectory: true },
-    ]);
-    await expect(bridge.readDirectory({ filePath: ".", cwd: "/sandbox/subdir" })).resolves.toEqual([
-      { name: "nested", isDirectory: true },
-      { name: "secret.txt", isDirectory: false },
-    ]);
-    await expect(bridge.readFile({ filePath: "subdir/secret.txt", maxBytes: 6 })).resolves.toEqual(
-      Buffer.from("inside"),
+    await expectDirectory(".", [["subdir", true]]);
+    await expectDirectory(
+      ".",
+      [
+        ["nested", true],
+        ["secret.txt", false],
+      ],
+      "/sandbox/subdir",
     );
+    await expectRead("subdir/secret.txt", "inside", 6);
     await expect(bridge.readFile({ filePath: "subdir/secret.txt", maxBytes: 5 })).rejects.toThrow(
       "Sandbox boundary checks failed",
     );
@@ -309,14 +309,10 @@ describe("openshell mirror fs bridges", () => {
 
   it("keeps literal tilde directories inside the mirror workspace", async () => {
     await seedLocal("~/file.txt", "literal");
-    await expect(bridge.readFile({ filePath: "./~/file.txt" })).resolves.toEqual(
-      Buffer.from("literal"),
-    );
-    await expect(bridge.readDirectory({ filePath: "./~" })).resolves.toEqual([
-      { name: "file.txt", isDirectory: false },
-    ]);
+    await expectRead("./~/file.txt", "literal");
+    await expectDirectory("./~", [["file.txt", false]]);
     await bridge.writeFile({ filePath: "./~/file.txt", data: "updated" });
-    await expect(readLocal("~/file.txt")).resolves.toBe("updated");
+    await expectLocal("~/file.txt", "updated");
     await expect(
       bridge.createFileExclusive({ filePath: "./~/created.txt", data: "created" }),
     ).resolves.toBe("created");
@@ -329,7 +325,7 @@ describe("openshell mirror fs bridges", () => {
       "/sandbox/~/nested/target/moved.txt",
       undefined,
     );
-    await expect(readLocal("~/nested/target/moved.txt")).resolves.toBe("created");
+    await expectLocal("~/nested/target/moved.txt", "created");
     await bridge.remove({ filePath: "./~/file.txt", force: false });
     expect(backend.removeRemotePath).toHaveBeenCalledWith("/sandbox/~/file.txt", {
       recursive: false,
@@ -350,25 +346,15 @@ describe("openshell mirror fs bridges", () => {
     await seedLocal("materialized/skills/demo/examples.md", "examples");
     await seedLocal(virtual, "# Demo\nworkspace shadow\n");
     bridge = createBridge({ skillsWorkspaceDir });
-    await expect(
-      bridge.readDirectory({ filePath: path.posix.dirname(`/sandbox/${virtual}`) }),
-    ).resolves.toEqual([
-      { name: "SKILL.md", isDirectory: false },
-      { name: "examples.md", isDirectory: false },
+    await expectDirectory(path.posix.dirname(`/sandbox/${virtual}`), [
+      ["SKILL.md", false],
+      ["examples.md", false],
     ]);
-    await expect(bridge.readFile({ filePath: `/sandbox/${virtual}` })).resolves.toEqual(
-      Buffer.from(text),
-    );
-    await expect(bridge.readFile({ filePath: virtual })).resolves.toEqual(Buffer.from(text));
-    await expect(bridge.writeFile({ filePath: virtual, data: "owned" })).rejects.toThrow(
-      /read-only/,
-    );
-    await expect(bridge.writeFile({ filePath: local(virtual), data: "owned" })).rejects.toThrow(
-      /read-only/,
-    );
-    await expect(bridge.writeFile({ filePath: local(skill), data: "owned" })).rejects.toThrow(
-      /read-only/,
-    );
+    await expectRead(`/sandbox/${virtual}`, text);
+    await expectRead(virtual, text);
+    for (const filePath of [virtual, local(virtual), local(skill)]) {
+      await expect(bridge.writeFile({ filePath, data: "owned" })).rejects.toThrow(/read-only/);
+    }
     await expect(readLocal(skill)).resolves.toContain("materialized");
     expect(await readLocal(virtual)).toContain("workspace shadow");
     expect(backend.syncLocalPathToRemote).not.toHaveBeenCalled();
@@ -397,12 +383,8 @@ describe("openshell mirror fs bridges", () => {
     expect(bridge.resolvePath({ filePath: "/native-agent-root/note.txt" }).hostPath).toBe(
       path.join(agent.dir, "note.txt"),
     );
-    await expect(bridge.readFile({ filePath: "/native-agent-root/note.txt" })).resolves.toEqual(
-      Buffer.from("agent"),
-    );
-    await expect(bridge.readDirectory({ filePath: "/native-agent-root" })).resolves.toEqual([
-      { name: "note.txt", isDirectory: false },
-    ]);
+    await expectRead("/native-agent-root/note.txt", "agent");
+    await expectDirectory("/native-agent-root", [["note.txt", false]]);
   });
 
   it.each([
