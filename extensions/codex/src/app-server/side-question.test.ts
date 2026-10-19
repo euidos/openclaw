@@ -1062,15 +1062,7 @@ describe("runCodexAppServerSideQuestion", () => {
         lateBindRuntimeConfig: true,
         hostnameAllowlistRef: toolOptions.webFetchHostnameAllowlistRef,
       });
-      return [
-        {
-          name: "web_search",
-          description: "Search the web",
-          parameters: { type: "object", properties: {}, additionalProperties: true },
-          execute: toolExecuteMock,
-        },
-        ...(webFetchTool ? [webFetchTool] : []),
-      ];
+      return webFetchTool ? [webFetchTool] : [];
     });
     const fetchMock = vi.fn(
       async () =>
@@ -1080,6 +1072,7 @@ describe("runCodexAppServerSideQuestion", () => {
 
     const { toolResponse } = await runSideQuestionWithManagedWebSearchCall(
       sideParams({
+        preparedWebSearchPolicy: { allowed: true, persistentAllowed: true },
         cfg: {
           tools: {
             web: {
