@@ -16,6 +16,7 @@ import { prepareTalkSessionTarget } from "../session-target.js";
 import {
   createIdleRelayProvider,
   drainRelayTestSessions,
+  ensureActiveRelayTurnId,
   makeRelayTransport,
 } from "./index.test-support.js";
 import {
@@ -83,34 +84,32 @@ async function createRelayFixture(transportOverrides: Partial<RealtimeVoiceBridg
   };
 }
 
-function ensureActiveRelayTurnId(relaySessionId: string): string {
-  const relay = relaySessions.get(relaySessionId);
-  if (!relay) {
-    throw new Error(`Missing relay test session ${relaySessionId}`);
-  }
-  if (!relay.harness.talk.activeTurnId) {
-    relay.harness.talk.startTurn({ turnId: "turn-1" });
-  }
-  return relay.harness.talk.activeTurnId ?? "turn-1";
+function sendAudio(relaySessionId: string, audioBase64 = "AQI=") {
+  return sendTalkRealtimeRelayAudio({ relaySessionId, connId: "conn-1", audioBase64 });
+}
+
+function responseCreated(request: RealtimeVoiceBridgeCreateRequest, responseId: string) {
+  request.onEvent?.({ direction: "server", type: "response.created", responseId });
+}
+
+function cancelTurn(relaySessionId: string, reason?: string) {
+  return cancelTalkRealtimeRelayTurn({
+    relaySessionId,
+    connId: "conn-1",
+    turnId: ensureActiveRelayTurnId(relaySessionId),
+    reason,
+  });
 }
 
 async function cancelPastDeadline(fixture: Awaited<ReturnType<typeof createRelayFixture>>) {
-  const cancellation = cancelTalkRealtimeRelayTurn({
-    relaySessionId: fixture.relaySessionId,
-    connId: "conn-1",
-    turnId: ensureActiveRelayTurnId(fixture.relaySessionId),
-  });
+  const cancellation = cancelTurn(fixture.relaySessionId);
   await vi.advanceTimersByTimeAsync(1_000);
   await expect(cancellation).resolves.toEqual({ status: "applied", turnId: expect.any(String) });
 }
 
 /** The phone captures continuously; a microphone frame re-arms a turn, then the reply speaks. */
 async function speakFreshReply(fixture: Awaited<ReturnType<typeof createRelayFixture>>) {
-  await sendTalkRealtimeRelayAudio({
-    relaySessionId: fixture.relaySessionId,
-    connId: "conn-1",
-    audioBase64: "AQI=",
-  });
+  await sendAudio(fixture.relaySessionId);
   fixture.request.onAudio(Buffer.from("fresh audio"));
 }
 
@@ -123,6 +122,7 @@ describe("talk realtime relay cancellation recovery", () => {
       scenario: "minimal",
     });
     await ensureClientVoiceAgentSessionEntry({ agentId: "main", sessionKey: "agent:main:main" });
+    vi.useFakeTimers();
   });
 
   afterEach(async () => {
@@ -140,35 +140,16 @@ describe("talk realtime relay cancellation recovery", () => {
   it.each(["turn-bound", "exact-response"] as const)(
     "accepts typed cancellation confirmation before the deadline for %s output",
     async (mode) => {
-      vi.useFakeTimers();
       const { relaySessionId, request, transport, payloadsOfType } = await createRelayFixture();
-      await sendTalkRealtimeRelayAudio({
-        relaySessionId,
-        connId: "conn-1",
-        audioBase64: "AQI=",
-      });
+      await sendAudio(relaySessionId);
       if (mode === "exact-response") {
-        request.onEvent?.({
-          direction: "server",
-          type: "response.created",
-          responseId: "response-old",
-        });
+        responseCreated(request, "response-old");
       }
       request.onAudio(Buffer.from("old reply"));
       let settled = false;
-      const cancellation = cancelTalkRealtimeRelayTurn({
-        relaySessionId,
-        connId: "conn-1",
-        turnId: ensureActiveRelayTurnId(relaySessionId),
-      });
+      const cancellation = cancelTurn(relaySessionId);
       void cancellation.then(() => (settled = true));
-      const resumedInput = Promise.resolve(
-        sendTalkRealtimeRelayAudio({
-          relaySessionId,
-          connId: "conn-1",
-          audioBase64: "AwQ=",
-        }),
-      );
+      const resumedInput = Promise.resolve(sendAudio(relaySessionId, "AwQ="));
       void resumedInput.catch(() => {});
       if (mode === "exact-response") {
         request.onResponseDone?.({ status: "cancelled" });
@@ -190,11 +171,7 @@ describe("talk realtime relay cancellation recovery", () => {
       await resumedInput;
       expect(transport.sendAudio).toHaveBeenLastCalledWith(Buffer.from([3, 4]));
       if (mode === "exact-response") {
-        request.onEvent?.({
-          direction: "server",
-          type: "response.created",
-          responseId: "response-next",
-        });
+        responseCreated(request, "response-next");
       }
       request.onAudio(Buffer.from("next reply"));
       expect(payloadsOfType("audio").map((payload) => payload.audioBase64)).toEqual([
@@ -209,34 +186,23 @@ describe("talk realtime relay cancellation recovery", () => {
   it.each(["turn-bound", "exact-response"] as const)(
     "keeps an unconfirmed %s cancellation open past its deadline and discards stale output",
     async (mode) => {
-      vi.useFakeTimers();
       const pending = createDeferred();
       const { relaySessionId, relay, request, transport, payloadsOfType } =
         await createRelayFixture(
           mode === "turn-bound" ? { submitToolResult: vi.fn(() => pending.promise) } : {},
         );
       if (mode === "exact-response") {
-        request.onEvent?.({
-          direction: "server",
-          type: "response.created",
-          responseId: "response-1",
-        });
+        responseCreated(request, "response-1");
       }
       let cancellationSettled = false;
-      const cancellation = cancelTalkRealtimeRelayTurn({
+      const cancellation = cancelTurn(
         relaySessionId,
-        connId: "conn-1",
-        reason: mode === "turn-bound" ? "android-stop-tts" : undefined,
-        turnId: ensureActiveRelayTurnId(relaySessionId),
-      });
+        mode === "turn-bound" ? "android-stop-tts" : undefined,
+      );
       void cancellation.then(() => (cancellationSettled = true));
       let audioSettled = false;
       const pendingAudio =
-        mode === "turn-bound"
-          ? Promise.resolve(
-              sendTalkRealtimeRelayAudio({ relaySessionId, connId: "conn-1", audioBase64: "AQI=" }),
-            )
-          : undefined;
+        mode === "turn-bound" ? Promise.resolve(sendAudio(relaySessionId)) : undefined;
       void pendingAudio?.then(
         () => (audioSettled = true),
         () => (audioSettled = true),
@@ -279,15 +245,11 @@ describe("talk realtime relay cancellation recovery", () => {
         request.onResponseDone?.({ status: "cancelled" });
         // Retire the stale generation without settling the fresh turn.
         expect(relay.harness.talk.activeTurnId).toBe(freshTurnId);
-        await sendTalkRealtimeRelayAudio({ relaySessionId, connId: "conn-1", audioBase64: "AQI=" });
+        await sendAudio(relaySessionId);
       } else {
         expect(payloadsOfType("audio")).toHaveLength(audioBefore);
         relay.harness.talk.startTurn({ turnId: "turn-next" });
-        request.onEvent?.({
-          direction: "server",
-          type: "response.created",
-          responseId: "response-2",
-        });
+        responseCreated(request, "response-2");
       }
       request.onAudio(Buffer.from("fresh audio"));
       expect(payloadsOfType("audio")).toHaveLength(audioBefore + 1);
@@ -299,12 +261,11 @@ describe("talk realtime relay cancellation recovery", () => {
   );
 
   it("keeps a still-generating stale reply fenced and reconnects instead of admitting it", async () => {
-    vi.useFakeTimers();
     const fixture = await createRelayFixture();
     const { relaySessionId, request, transport, payloadsOfType } = fixture;
     await cancelPastDeadline(fixture);
     // Microphone input opened another turn; the cancelled reply is still generating.
-    await sendTalkRealtimeRelayAudio({ relaySessionId, connId: "conn-1", audioBase64: "AQI=" });
+    await sendAudio(relaySessionId);
     const before = payloadsOfType("audio").length;
     for (let second = 0; second < 29; second += 1) {
       await vi.advanceTimersByTimeAsync(1_000);
@@ -327,7 +288,6 @@ describe("talk realtime relay cancellation recovery", () => {
   });
 
   it("does not let an earlier cancellation's watchdog retire a later cancellation's fence", async () => {
-    vi.useFakeTimers();
     const fixture = await createRelayFixture();
     const { relaySessionId, request, payloadsOfType } = fixture;
     await cancelPastDeadline(fixture);
@@ -356,7 +316,6 @@ describe("talk realtime relay cancellation recovery", () => {
   });
 
   it("clears the discard fence when provider continuity resets during a discard", async () => {
-    vi.useFakeTimers();
     const fixture = await createRelayFixture();
     const { relaySessionId, request, payloadsOfType } = fixture;
     await cancelPastDeadline(fixture);
@@ -379,20 +338,15 @@ describe("talk realtime relay cancellation recovery", () => {
   it.each(["turn-bound", "exact-response"] as const)(
     "keeps cancellation bound to the provider-owned turn for %s output",
     async (mode) => {
-      vi.useFakeTimers();
       const fixture = await createRelayFixture();
       const { relaySessionId, request, payloadsOfType } = fixture;
-      await sendTalkRealtimeRelayAudio({ relaySessionId, connId: "conn-1", audioBase64: "AQI=" });
+      await sendAudio(relaySessionId);
       if (mode === "exact-response") {
-        request.onEvent?.({
-          direction: "server",
-          type: "response.created",
-          responseId: "response-a",
-        });
+        responseCreated(request, "response-a");
       }
       request.onAudio(Buffer.from("reply A"));
       await cancelPastDeadline(fixture);
-      await sendTalkRealtimeRelayAudio({ relaySessionId, connId: "conn-1", audioBase64: "AwQ=" });
+      await sendAudio(relaySessionId, "AwQ=");
       const turnB = ensureActiveRelayTurnId(relaySessionId);
 
       // Input B can already queue upstream output. A's completion cannot confirm its stop.
@@ -407,11 +361,7 @@ describe("talk realtime relay cancellation recovery", () => {
         ...(mode === "exact-response" ? { responseId: "response-a" } : {}),
       });
       if (mode === "exact-response") {
-        request.onEvent?.({
-          direction: "server",
-          type: "response.created",
-          responseId: "response-b",
-        });
+        responseCreated(request, "response-b");
         request.onResponseDone?.({ status: "cancelled", responseId: "response-a" });
         request.onEvent?.({
           direction: "server",
@@ -430,7 +380,7 @@ describe("talk realtime relay cancellation recovery", () => {
       });
       await vi.advanceTimersByTimeAsync(1_000);
       await expect(cancellationB).resolves.toEqual({ status: "applied", turnId: turnB });
-      await sendTalkRealtimeRelayAudio({ relaySessionId, connId: "conn-1", audioBase64: "BQY=" });
+      await sendAudio(relaySessionId, "BQY=");
       const turnC = ensureActiveRelayTurnId(relaySessionId);
       if (mode === "exact-response") {
         request.onResponseDone?.({ status: "cancelled", responseId: "response-a" });
@@ -456,11 +406,7 @@ describe("talk realtime relay cancellation recovery", () => {
         ...(mode === "exact-response" ? { responseId: "response-b" } : {}),
       });
       if (mode === "exact-response") {
-        request.onEvent?.({
-          direction: "server",
-          type: "response.created",
-          responseId: "response-c",
-        });
+        responseCreated(request, "response-c");
       }
       request.onAudio(Buffer.from("reply C"));
       expect(payloadsOfType("audio").at(-1)).toMatchObject({
@@ -475,23 +421,15 @@ describe("talk realtime relay cancellation recovery", () => {
   it.each(["normal", "cancelling", "discarding"] as const)(
     "preserves transcript ownership during provider close in the %s phase",
     async (phase) => {
-      vi.useFakeTimers();
       const finalText = "Provider finalization transcript";
       const { relaySessionId, payloadsOfType, request } = await createRelayFixture({
         close: vi.fn(() => {
           request.onTranscript?.("assistant", finalText, true);
         }),
       });
-      await sendTalkRealtimeRelayAudio({ relaySessionId, connId: "conn-1", audioBase64: "AQI=" });
+      await sendAudio(relaySessionId);
       request.onAudio(Buffer.from("initial reply"));
-      const cancellation =
-        phase === "normal"
-          ? undefined
-          : cancelTalkRealtimeRelayTurn({
-              relaySessionId,
-              connId: "conn-1",
-              turnId: ensureActiveRelayTurnId(relaySessionId),
-            });
+      const cancellation = phase === "normal" ? undefined : cancelTurn(relaySessionId);
       if (phase === "discarding") {
         await vi.advanceTimersByTimeAsync(1_000);
       }

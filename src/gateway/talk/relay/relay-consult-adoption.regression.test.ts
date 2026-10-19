@@ -125,7 +125,12 @@ describe("Talk relay keyed consult adoption", () => {
         .filter((entry) => entry.type === "message");
     const openManager = () =>
       SessionManager.openBounded(scope, { maxBytes: 100_000, maxEvents: 100 });
-    return { scope, consult, recordSpeech, messages, openManager };
+    const expectRejected = async (message: typeof consult, error: string) => {
+      const before = await messages();
+      expect(() => openManager().appendMessage(message)).toThrow(error);
+      expect(await messages()).toEqual(before);
+    };
+    return { scope, consult, recordSpeech, messages, openManager, expectRejected };
   }
 
   it.each([
@@ -173,7 +178,7 @@ describe("Talk relay keyed consult adoption", () => {
     { boundary: "other kind", provenance: { kind: "internal_system", sourceChannel: "talk" } },
     { boundary: "missing channel", provenance: { kind: "realtime_voice" } },
   ])("does not reopen a consult after $boundary", async ({ boundary, provenance }) => {
-    const { scope, consult, recordSpeech, messages, openManager } = await createConsult();
+    const { scope, consult, recordSpeech, expectRejected } = await createConsult();
     await appendTranscriptMessage(scope, {
       eventId: "closing-message",
       message:
@@ -188,24 +193,15 @@ describe("Talk relay keyed consult adoption", () => {
     if (!provenance) {
       await recordSpeech(["user", "assistant"]);
     }
-    const beforeAdoption = await messages();
-
-    expect(() => openManager().appendMessage(consult)).toThrow(
-      "Session transcript keyed user is outside the current turn",
-    );
-    expect(await messages()).toEqual(beforeAdoption);
+    await expectRejected(consult, "Session transcript keyed user is outside the current turn");
   });
 
   it("rejects a changed payload using the consult key after live speech", async () => {
-    const { consult, recordSpeech, messages, openManager } = await createConsult();
+    const { consult, recordSpeech, expectRejected } = await createConsult();
     await recordSpeech(["assistant"]);
-    const beforeAdoption = await messages();
-
-    expect(() =>
-      openManager().appendMessage({ ...consult, content: "Publish a different task." }),
-    ).toThrow(
+    await expectRejected(
+      { ...consult, content: "Publish a different task." },
       'Transcript idempotency key "talk-consult:user" conflicts with the admitted message.',
     );
-    expect(await messages()).toEqual(beforeAdoption);
   });
 });
