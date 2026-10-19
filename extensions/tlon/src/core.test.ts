@@ -37,13 +37,15 @@ const shipCredentials = {
 };
 const configure = (prompter: WizardPrompter, cfg: OpenClawConfig = {}) =>
   runSetupWizardConfigure({ configure: tlonConfigure, cfg, prompter, options: {} });
-
-function parseTlonConfig(value: unknown) {
-  const runtime = tlonChannelConfigSchema.runtime;
-  if (!runtime) {
-    throw new Error("expected Tlon channel config runtime");
-  }
-  return runtime.safeParse(value);
+function promptText(answers: Record<string, string>) {
+  const byMessage = new Map(Object.entries(answers));
+  return vi.fn(async ({ message }: { message: string }) => {
+    const answer = byMessage.get(message);
+    if (answer === undefined) {
+      throw new Error(`Unexpected prompt: ${message}`);
+    }
+    return answer;
+  });
 }
 
 describe("tlon core", () => {
@@ -67,7 +69,7 @@ describe("tlon core", () => {
 
   it("preserves mention policy at root and account scope", () => {
     expect(
-      parseTlonConfig({
+      tlonChannelConfigSchema.runtime?.safeParse({
         implicitMentions: { threadParticipation: false },
         requireMentionInBotThreads: true,
         accounts: {
@@ -95,13 +97,7 @@ describe("tlon core", () => {
       "DM allowlist (comma-separated ship names)": "~zod, nec",
     };
     const prompter = createTestWizardPrompter({
-      text: vi.fn(async ({ message }: { message: string }) => {
-        const answer = answers[message];
-        if (answer !== undefined) {
-          return answer;
-        }
-        throw new Error(`Unexpected prompt: ${message}`);
-      }) as WizardPrompter["text"],
+      text: promptText(answers) as WizardPrompter["text"],
       confirm: vi.fn(async ({ message }: { message: string }) =>
         [
           "Add group channels manually? (optional)",
@@ -126,12 +122,7 @@ describe("tlon core", () => {
 
   it("never sends an existing login code back through setup prompts", async () => {
     const existingCode = "lidlut-existing-secret-code";
-    const text = vi.fn(async ({ message }: { message: string }) => {
-      if (message === "Login code") {
-        return "lidlut-replacement-code";
-      }
-      throw new Error(`Unexpected prompt: ${message}`);
-    });
+    const text = promptText({ "Login code": "lidlut-replacement-code" });
     const confirm = vi.fn(
       async ({ message }: { message: string }) =>
         message.startsWith("Ship name") ||
@@ -203,7 +194,6 @@ describe("tlon core", () => {
       accountOverrides: { tlon: "work" },
     });
 
-    expect(status.configured).toBe(true);
-    expect(status.statusLines).toEqual(["Tlon (work): configured"]);
+    expect(status).toMatchObject({ configured: true, statusLines: ["Tlon (work): configured"] });
   });
 });

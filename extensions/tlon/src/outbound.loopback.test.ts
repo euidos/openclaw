@@ -1,4 +1,3 @@
-// Exercise preferred Tlon sends through real HTTP against a loopback Urbit fixture.
 import { once } from "node:events";
 import * as http from "node:http";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
@@ -16,19 +15,6 @@ const targets = [
   { name: "thread", to: "chat/~nec/general", threadId: "1700000000000" },
 ];
 
-function loopbackConfig(port: number) {
-  return {
-    channels: {
-      tlon: {
-        ship: "~zod",
-        url: `http://127.0.0.1:${port}`,
-        code: "mock-code",
-        network: { dangerouslyAllowPrivateNetwork: true },
-      },
-    },
-  };
-}
-
 function finishLogin(response: http.ServerResponse) {
   response.writeHead(200, { "set-cookie": "urbauth-~zod=mock-cookie" });
   response.end("ok");
@@ -44,37 +30,35 @@ function readBody(request: http.IncomingMessage, accept: (body: string) => void)
 }
 
 type TlonPoke = {
-  app?: string;
-  mark?: string;
   json?: {
-    ship?: string;
     diff?: {
       delta?: {
         add?: {
-          memo?: { content?: unknown; author?: string };
+          memo?: { content?: Array<{ inline?: unknown[] }> };
         };
       };
     };
   };
 };
 
-/** Join the plain-string run of a Tlon story the same way a reader reconstructs text. */
-function extractStoryText(content: unknown): string {
-  const verses: unknown[] = Array.isArray(content) ? content : [];
-  return verses
-    .flatMap((verse) =>
-      verse && typeof verse === "object" && "inline" in verse && Array.isArray(verse.inline)
-        ? verse.inline.filter((item: unknown) => typeof item === "string")
-        : [],
-    )
+const storyText = (poke: TlonPoke) =>
+  (poke.json?.diff?.delta?.add?.memo?.content ?? [])
+    .flatMap((verse) => verse.inline ?? [])
+    .filter((item) => typeof item === "string")
     .join("");
-}
 
 describe("tlon outbound loopback", () => {
   let server: http.Server | undefined;
 
-  async function listenLoopback(handler: http.RequestListener): Promise<number> {
-    server = http.createServer(handler);
+  async function listenLoopback(handler: http.RequestListener, strictLogin = false) {
+    let login = finishLogin;
+    server = http.createServer((req, res) => {
+      if (req.url === "/~/login" && (!strictLogin || req.method === "POST")) {
+        login(res);
+      } else {
+        handler(req, res);
+      }
+    });
     server.on("clientError", (_err, socket) => socket.destroy());
     server.listen(0, "127.0.0.1");
     await once(server, "listening");
@@ -82,7 +66,35 @@ describe("tlon outbound loopback", () => {
     if (!address || typeof address === "string") {
       throw new Error("expected loopback server address");
     }
-    return address.port;
+    const cfg = {
+      channels: {
+        tlon: {
+          ship: "~zod",
+          url: `http://127.0.0.1:${address.port}`,
+          code: "mock-code",
+          network: { dangerouslyAllowPrivateNetwork: true },
+        },
+      },
+    };
+    const controller = new AbortController();
+    const dispatch = vi.fn(async () => {});
+    type Send = Parameters<NonNullable<typeof textSender>>[0];
+    return {
+      cfg,
+      controller,
+      dispatch,
+      setLogin: (loginHandler: typeof finishLogin) => {
+        login = loginHandler;
+      },
+      send: (params: Pick<Send, "text"> & Partial<Pick<Send, "to" | "threadId">>) =>
+        textSender({
+          cfg,
+          to: "~nec",
+          assertDirectAdapterHandoff: () => controller.signal.throwIfAborted(),
+          onPlatformSendDispatch: dispatch,
+          ...params,
+        }),
+    };
   }
 
   afterEach(async () => {
@@ -101,36 +113,26 @@ describe("tlon outbound loopback", () => {
       const paused = createDeferred<http.ServerResponse | undefined>();
       const resume = createDeferred<void>();
       const laterRequests: string[] = [];
-      const port = await listenLoopback((req, res) => {
-        if (req.url === "/~/login") {
-          if (phase !== "dispatch refresh") {
-            paused.resolve(res);
-          } else {
-            finishLogin(res);
-          }
-        } else {
-          laterRequests.push(req.url ?? "");
-          res.writeHead(204);
-          res.end();
-        }
+      const fixture = await listenLoopback((req, res) => {
+        laterRequests.push(req.url ?? "");
+        res.writeHead(204);
+        res.end();
       });
-      const controller = new AbortController();
-      const revoked = new Error(`authority closed during ${phase}`);
-      const onPlatformSendDispatch = vi.fn(async () => {
+      if (phase !== "dispatch refresh") {
+        fixture.setLogin((res) => {
+          paused.resolve(res);
+        });
+      }
+      fixture.dispatch.mockImplementation(async () => {
         if (phase === "dispatch refresh") {
           paused.resolve(undefined);
           await resume.promise;
         }
       });
-      const result = textSender({
-        cfg: loopbackConfig(port),
-        to: "~nec",
-        text: "cancelled message",
-        assertDirectAdapterHandoff: () => controller.signal.throwIfAborted(),
-        onPlatformSendDispatch,
-      }).catch((error: unknown) => error);
+      const revoked = new Error(`authority closed during ${phase}`);
+      const result = fixture.send({ text: "cancelled message" }).catch((error: unknown) => error);
       const response = await paused.promise;
-      controller.abort(revoked);
+      fixture.controller.abort(revoked);
       if (response) {
         if (phase === "redirect") {
           response.writeHead(302, { location: "/~/redirected-login" });
@@ -143,7 +145,7 @@ describe("tlon outbound loopback", () => {
 
       expect(await result).toBe(revoked);
       expect(laterRequests).toEqual([]);
-      expect(onPlatformSendDispatch).toHaveBeenCalledTimes(phase === "dispatch refresh" ? 1 : 0);
+      expect(fixture.dispatch).toHaveBeenCalledTimes(phase === "dispatch refresh" ? 1 : 0);
     },
   );
 
@@ -151,26 +153,16 @@ describe("tlon outbound loopback", () => {
     "retains an accepted $name result after authority closes",
     async ({ name, to, threadId }) => {
       const accepted = createDeferred<{ response: http.ServerResponse; payload: unknown }>();
-      const port = await listenLoopback((req, res) => {
-        if (req.url === "/~/login") {
-          finishLogin(res);
-          return;
-        }
+      const fixture = await listenLoopback((req, res) => {
         readBody(req, (body) => accepted.resolve({ response: res, payload: JSON.parse(body) }));
       });
-      const controller = new AbortController();
-      const onPlatformSendDispatch = vi.fn(async () => {});
-      const result = textSender({
-        cfg: loopbackConfig(port),
-        to,
-        threadId,
-        text: "accepted message",
-        assertDirectAdapterHandoff: () => controller.signal.throwIfAborted(),
-        onPlatformSendDispatch,
-      });
+      const result = fixture.send({ to, threadId, text: "accepted message" });
       const { response, payload } = await accepted.promise;
-      expect(onPlatformSendDispatch).toHaveBeenCalledTimes(1);
+      expect(fixture.dispatch).toHaveBeenCalledTimes(1);
       const memo = { content: [{ inline: ["accepted message"] }], author: "~zod" };
+      const post = threadId
+        ? { reply: { id: "1.700.000.000.000", action: { add: memo } } }
+        : { add: memo };
       expect(payload).toMatchObject([
         name === "DM"
           ? {
@@ -181,26 +173,18 @@ describe("tlon outbound loopback", () => {
           : {
               app: "channels",
               mark: "channel-action-1",
-              json: {
-                channel: {
-                  nest: "chat/~nec/general",
-                  action: {
-                    post: threadId
-                      ? { reply: { id: "1.700.000.000.000", action: { add: memo } } }
-                      : { add: memo },
-                  },
-                },
-              },
+              json: { channel: { nest: "chat/~nec/general", action: { post } } },
             },
       ]);
-      controller.abort(new Error("authority closed after poke acceptance"));
+      fixture.controller.abort(new Error("authority closed after poke acceptance"));
       response.writeHead(204);
       response.end();
 
       const sent = await result;
-      expect(sent.receipt.parts).toHaveLength(1);
-      expect(sent.receipt.parts[0]?.kind).toBe("text");
-      expect(sent.receipt.platformMessageIds).toEqual([sent.messageId]);
+      expect(sent.receipt).toMatchObject({
+        parts: [{ kind: "text" }],
+        platformMessageIds: [sent.messageId],
+      });
     },
   );
 
@@ -208,22 +192,13 @@ describe("tlon outbound loopback", () => {
     const pokes: TlonPoke[] = [];
     const rejectedOversized: Array<{ length: number }> = [];
     let loginCount = 0;
-    const port = await listenLoopback((req, res) => {
+    const fixture = await listenLoopback((req, res) => {
       const url = new URL(req.url ?? "/", "http://127.0.0.1");
-      if (req.method === "POST" && url.pathname === "/~/login") {
-        loginCount += 1;
-        res.setHeader("Content-Type", "text/plain");
-        finishLogin(res);
-        return;
-      }
       if (req.method === "PUT" && url.pathname.startsWith("/~/channel/")) {
         readBody(req, (body) => {
           const received = JSON.parse(body) as TlonPoke[];
           pokes.push(...received);
-          const oversized = received.some(
-            (poke) =>
-              extractStoryText(poke.json?.diff?.delta?.add?.memo?.content).length > TEXT_LIMIT,
-          );
+          const oversized = received.some((poke) => storyText(poke).length > TEXT_LIMIT);
           if (oversized) {
             rejectedOversized.push({ length: received.length });
             res.writeHead(413, { "Content-Type": "text/plain" });
@@ -237,9 +212,12 @@ describe("tlon outbound loopback", () => {
       }
       res.writeHead(404, { "Content-Type": "text/plain" });
       res.end("not found");
+    }, true);
+    fixture.setLogin((res) => {
+      loginCount += 1;
+      res.setHeader("Content-Type", "text/plain");
+      finishLogin(res);
     });
-
-    const cfg = loopbackConfig(port);
 
     const outbound = tlonPlugin.outbound;
     if (!outbound) {
@@ -253,39 +231,32 @@ describe("tlon outbound loopback", () => {
     const text = "x".repeat(10_001);
     const chunks = chunker(text, TEXT_LIMIT);
     for (const chunk of chunks) {
-      await outbound.sendText?.({ cfg, to: "~nec", text: chunk });
+      await outbound.sendText?.({ cfg: fixture.cfg, to: "~nec", text: chunk });
     }
 
     expect(outbound.chunkerMode).toBe("markdown");
     expect(chunks).toEqual(["x".repeat(TEXT_LIMIT), "x"]);
     expect(pokes).toHaveLength(chunks.length);
     expect(loginCount).toBeGreaterThan(0);
-    // Every unit fits the transport limit, so the urbit transport accepts each poke.
     expect(rejectedOversized).toEqual([]);
-    const delivered = pokes.map((poke) =>
-      extractStoryText(poke.json?.diff?.delta?.add?.memo?.content),
-    );
+    const delivered = pokes.map(storyText);
     expect(delivered.every((part) => part.length <= TEXT_LIMIT)).toBe(true);
     expect(delivered.join("")).toBe(text);
   });
 
   it("redacts a reflected session cookie from a rejected poke", async () => {
     const cookie = "urbauth-~zod=0v1g.abcde.ijklm.prst";
-    const port = await listenLoopback((req, res) => {
-      if (req.url === "/~/login") {
-        res.writeHead(200, { "set-cookie": cookie });
-        res.end("ok");
-        return;
-      }
+    const fixture = await listenLoopback((req, res) => {
       res.writeHead(500, { "Content-Type": "text/plain" });
       res.end(`invalid session: ${req.headers.cookie}`);
     });
-
-    const error = await textSender({
-      cfg: loopbackConfig(port),
-      to: "~nec",
-      text: "reflected credentials",
-    }).catch((caught: unknown) => caught);
+    fixture.setLogin((res) => {
+      res.writeHead(200, { "set-cookie": cookie });
+      res.end("ok");
+    });
+    const error = await fixture
+      .send({ text: "reflected credentials" })
+      .catch((caught: unknown) => caught);
 
     expect(error).toBeInstanceOf(Error);
     const message = (error as Error).message;

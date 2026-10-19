@@ -16,7 +16,6 @@ const scries = {
   "/~/scry/storage/credentials.json": "credentials",
   "/~/scry/genuine/secret.json": "secret",
 } as const;
-const scryPhases = new Map(Object.entries(scries));
 type Phase = (typeof scries)[keyof typeof scries] | "source" | "allocation" | "upload" | "poke";
 type RequestRecord = { phase: Phase; url: string; dispatchCount: number };
 const fixtureCleanups: Array<() => Promise<void>> = [];
@@ -47,6 +46,70 @@ function createAccount(ship: string, storage: Storage) {
 
 type Account = ReturnType<typeof createAccount>;
 
+function requestJson(init?: RequestInit): unknown {
+  if (typeof init?.body !== "string") {
+    throw new Error("Expected a Tlon JSON request body");
+  }
+  return JSON.parse(init.body);
+}
+
+async function fixtureResponse(
+  account: Account,
+  phase: Phase,
+  init: RequestInit | undefined,
+  failUpload: boolean,
+) {
+  const credentials = {
+    endpoint: account.s3Endpoint,
+    accessKeyId: account.accessKeyId,
+    secretAccessKey: `fake-secret-${account.ship}`,
+  };
+  const scryResponses = {
+    storage: {
+      currentBucket: "media",
+      region: "us-east-1",
+      publicUrlBase: account.publicUrlBase,
+      service: account.storage === "memex" ? "presigned-url" : "credentials",
+    },
+    credentials: { "storage-update": account.storage === "memex" ? {} : { credentials } },
+    secret: { secret: `fake-genuine-${account.ship}` },
+  };
+  switch (phase) {
+    case "source":
+      return new Response(IMAGE, { headers: { "Content-Type": "image/png" } });
+    case "login":
+      expect(init?.body).toBe(`password=${account.code}`);
+      return new Response("ok", {
+        headers: {
+          "Set-Cookie": `urbauth-~${account.ship}=fake-cookie-${account.ship}; Path=/; HttpOnly`,
+        },
+      });
+    case "storage":
+    case "credentials":
+    case "secret":
+      return Response.json(scryResponses[phase]);
+    case "allocation":
+      expect(requestJson(init)).toMatchObject({
+        token: `fake-genuine-${account.ship}`,
+        contentLength: IMAGE.byteLength,
+        contentType: "image/png",
+        fileName: expect.stringMatching(new RegExp(`^${account.ship}/.+-${account.ship}\\.png$`)),
+      });
+      return Response.json({ url: account.uploadUrl, filePath: account.hostedUrl });
+    case "upload":
+      if (init?.body == null) {
+        throw new Error("Expected the Tlon image upload body");
+      }
+      expect(Buffer.from(await new Response(init.body).arrayBuffer())).toEqual(IMAGE);
+      return new Response(new ReadableStream<Uint8Array>({ cancel: account.uploadCanceled }), {
+        status: failUpload ? 503 : 200,
+      });
+    case "poke":
+      account.pokes.push(requestJson(init));
+      return new Response(null, { status: 204 });
+  }
+}
+
 function createFixture(
   accounts: Account[],
   pauseAt?: { ship: string; phase: Phase },
@@ -62,23 +125,30 @@ function createFixture(
     resume.resolve();
     await Promise.allSettled(pending);
   });
-  const cfg = {
-    channels: {
-      tlon: {
-        accounts: Object.fromEntries(
-          accounts.map((account) => [
-            account.ship,
-            {
-              ship: `~${account.ship}`,
-              url: account.shipUrl,
-              code: account.code,
-              mediaMaxMb: 1,
-            },
-          ]),
-        ),
-      },
-    },
-  } satisfies OpenClawConfig;
+  const configuredAccounts = Object.fromEntries(
+    accounts.map(({ ship, shipUrl: url, code }) => [
+      ship,
+      { ship: `~${ship}`, url, code, mediaMaxMb: 1 },
+    ]),
+  );
+  const cfg = { channels: { tlon: { accounts: configuredAccounts } } } satisfies OpenClawConfig;
+  const routes = new Map<string, { account: Account; phase: Phase }>();
+  for (const account of accounts) {
+    const paths: [string, Phase][] = [
+      [account.sourceUrl, "source"],
+      [account.allocationUrl, "allocation"],
+      [account.uploadUrl, "upload"],
+      [account.s3Endpoint, "upload"],
+      [`${account.shipUrl}/~/channel/`, "poke"],
+      ...Object.entries(scries).map(([path, phase]): [string, Phase] => [
+        account.shipUrl + path,
+        phase,
+      ]),
+    ];
+    for (const [url, phase] of paths) {
+      routes.set(url, { account, phase });
+    }
+  }
 
   // Only the final HTTP boundary is replaced; registration, preparation,
   // authentication, signing, and the guarded-fetch request check remain real.
@@ -86,30 +156,12 @@ function createFixture(
     "fetch",
     vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       const url = new URL(input instanceof Request ? input.url : String(input));
-      const scryPhase = scryPhases.get(url.pathname);
-      const account = accounts.find(
-        (candidate) =>
-          [candidate.sourceUrl, candidate.allocationUrl, candidate.uploadUrl].includes(url.href) ||
-          [candidate.shipUrl, candidate.s3Endpoint].includes(url.origin),
-      );
-      if (!account) {
+      const key = url.pathname.startsWith("/~/channel/") ? `${url.origin}/~/channel/` : url.href;
+      const route = routes.get(key) ?? routes.get(url.origin);
+      if (!route) {
         throw new Error(`Unexpected Tlon fixture request: ${url.origin}${url.pathname}`);
       }
-
-      let phase: Phase;
-      if (url.href === account.sourceUrl) {
-        phase = "source";
-      } else if (url.href === account.allocationUrl) {
-        phase = "allocation";
-      } else if (url.href === account.uploadUrl || url.origin === account.s3Endpoint) {
-        phase = "upload";
-      } else if (scryPhase) {
-        phase = scryPhase;
-      } else if (url.pathname.startsWith("/~/channel/")) {
-        phase = "poke";
-      } else {
-        throw new Error(`Unexpected Tlon fixture path: ${url.pathname}`);
-      }
+      const { account, phase } = route;
       account.requests.push({
         phase,
         url: url.href,
@@ -129,82 +181,7 @@ function createFixture(
         );
       }
 
-      let response: Response;
-      switch (phase) {
-        case "source":
-          response = new Response(IMAGE, { headers: { "Content-Type": "image/png" } });
-          break;
-        case "login":
-          expect(init?.body).toBe(`password=${account.code}`);
-          response = new Response("ok", {
-            headers: {
-              "Set-Cookie": `urbauth-~${account.ship}=fake-cookie-${account.ship}; Path=/; HttpOnly`,
-            },
-          });
-          break;
-        case "storage":
-          response = Response.json({
-            currentBucket: "media",
-            buckets: ["media"],
-            region: "us-east-1",
-            publicUrlBase: account.publicUrlBase,
-            presignedUrl: "",
-            service: account.storage === "memex" ? "presigned-url" : "credentials",
-          });
-          break;
-        case "credentials":
-          response = Response.json({
-            "storage-update":
-              account.storage === "memex"
-                ? {}
-                : {
-                    credentials: {
-                      endpoint: account.s3Endpoint,
-                      accessKeyId: account.accessKeyId,
-                      secretAccessKey: `fake-secret-${account.ship}`,
-                    },
-                  },
-          });
-          break;
-        case "secret":
-          response = Response.json({ secret: `fake-genuine-${account.ship}` });
-          break;
-        case "allocation": {
-          if (typeof init?.body !== "string") {
-            throw new Error("Expected the Memex allocation JSON body");
-          }
-          const body: unknown = JSON.parse(init.body);
-          expect(body).toMatchObject({
-            token: `fake-genuine-${account.ship}`,
-            contentLength: IMAGE.byteLength,
-            contentType: "image/png",
-            fileName: expect.stringMatching(
-              new RegExp(`^${account.ship}/.+-${account.ship}\\.png$`),
-            ),
-          });
-          response = Response.json({ url: account.uploadUrl, filePath: account.hostedUrl });
-          break;
-        }
-        case "upload":
-          if (init?.body == null) {
-            throw new Error("Expected the Tlon image upload body");
-          }
-          expect(Buffer.from(await new Response(init.body).arrayBuffer())).toEqual(IMAGE);
-          response = new Response(
-            new ReadableStream<Uint8Array>({ cancel: account.uploadCanceled }),
-            { status: failUpload ? 503 : 200 },
-          );
-          break;
-        case "poke": {
-          if (typeof init?.body !== "string") {
-            throw new Error("Expected the Tlon poke JSON body");
-          }
-          const body: unknown = JSON.parse(init.body);
-          account.pokes.push(body);
-          response = new Response(null, { status: 204 });
-          break;
-        }
-      }
+      const response = await fixtureResponse(account, phase, init, failUpload);
       if (pauseAt?.ship === account.ship && pauseAt.phase === phase) {
         entered.resolve(response);
         await resume.promise;

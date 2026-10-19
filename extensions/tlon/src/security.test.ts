@@ -53,27 +53,22 @@ describe.each(allowlistShipMatchingCases)("Security: $label", ({ isAllowed }) =>
   });
 });
 
-it("uses the ingress command gate for owner-only command authorization", async () => {
-  const authorized = await resolveTlonCommandAuthorizationWithIngress({
-    senderShip: "~zod",
-    ownerShip: "zod",
+it.each([
+  ["~zod", "zod", true],
+  ["~nec", "~zod", false],
+] as const)("authorizes %s with owner %s: %s", async (senderShip, ownerShip, authorized) => {
+  const { commandAccess } = await resolveTlonCommandAuthorizationWithIngress({
+    senderShip,
+    ownerShip,
   });
-  expect(authorized.commandAccess).toMatchObject({
+  expect(commandAccess).toMatchObject({
     requested: true,
-    authorized: true,
-    shouldBlockControlCommand: false,
-    reasonCode: "command_authorized",
-  });
-
-  const unauthorized = await resolveTlonCommandAuthorizationWithIngress({
-    senderShip: "~nec",
-    ownerShip: "~zod",
-  });
-  expect(unauthorized.commandAccess).toMatchObject({
-    requested: true,
-    authorized: false,
+    authorized,
     shouldBlockControlCommand: false,
   });
+  if (authorized) {
+    expect(commandAccess.reasonCode).toBe("command_authorized");
+  }
 });
 
 describe("Security: Bot Mention Detection", () => {
@@ -141,12 +136,11 @@ describe("Security: Group Mention Policy", () => {
 });
 
 describe("Security: Message Text Extraction", () => {
-  it("extracts @all mentions from sect null", () => {
-    expect(extractMessageText([{ inline: [{ sect: null }] }])).toContain("@all");
-  });
-
-  it("extracts ship mentions", () => {
-    expect(extractMessageText([{ inline: [{ ship: "~zod" }] }])).toContain("~zod");
+  it.each([
+    [{ sect: null }, "@all"],
+    [{ ship: "~zod" }, "~zod"],
+  ] as const)("extracts mention %j", (mention, expected) => {
+    expect(extractMessageText([{ inline: [mention] }])).toContain(expected);
   });
 
   it("handles malformed input safely", () => {
