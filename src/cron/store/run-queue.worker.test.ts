@@ -13,13 +13,29 @@ import { projectCronRunHistoryPage } from "../run-history.js";
 import { saveCronStore } from "../store.js";
 import type { CronJob, CronJobPatch } from "../types.js";
 import { readCronRunHistoryCandidates, readCronRunHistoryRecords } from "./read-only.js";
-import type { CronRunQueueOperations, CronRunRequestContext } from "./run-queue.types.js";
+import type {
+  CronQueuedRun,
+  CronRunQueueOperations,
+  CronRunRequestContext,
+} from "./run-queue.types.js";
 import type { CronRunReceiptHandle } from "./run-receipt.types.js";
 import { createCronScheduledRunId } from "./run-request-id.js";
 
 const now = 1_800_000_000_000;
 let fixture: OpenClawTestState;
 let context: OpenClawStateWorkerContext;
+type Request = CronRunQueueOperations["cron.requestRuns"]["input"]["requests"][number];
+
+function requestFor(current: CronJob, input: Omit<Request, "jobId" | "configRevision">): Request {
+  return { jobId: current.id, configRevision: resolveCronJobConfigRevision(current), ...input };
+}
+
+const jobIds = (runs: CronQueuedRun[]) => runs.map(({ job: entry }) => entry.id);
+const runIds = (runs: { runReceipt: CronRunReceiptHandle }[]) =>
+  runs.map(({ runReceipt }) => runReceipt.receiptId);
+const rejected = (request: Request, reason = "already-requested") => [
+  { jobId: request.jobId, receiptId: request.receiptId, reason },
+];
 
 async function readHistoryRecords(storeKey: string) {
   const { records } = await readCronRunHistoryCandidates(storeKey);
@@ -73,6 +89,13 @@ async function store(label: string, jobs: CronJob[]) {
   return {
     storeKey,
     read,
+    history: async (runId?: string) =>
+      projectCronRunHistoryPage(await readHistoryRecords(storeKey), { storeKey, runId }),
+    recover: () =>
+      executeOpenClawStateWorker(context, {
+        type: "cron.recoverRuns",
+        input: { storeKey, nowMs: now + 2 },
+      }),
     readReceipt: async (handle: CronRunReceiptHandle) => {
       const result = await executeExistingOpenClawStateRead(
         { path: context.admission.databasePath, env: context.environment },
@@ -130,13 +153,11 @@ async function store(label: string, jobs: CronJob[]) {
 }
 
 function scheduled(storeKey: string, current: CronJob) {
-  return {
-    jobId: current.id,
-    configRevision: resolveCronJobConfigRevision(current),
+  return requestFor(current, {
     receiptId: createCronScheduledRunId(storeKey, current.id, now),
     scheduledSlotMs: now,
     mode: "scheduled" as const,
-  };
+  });
 }
 
 it("keeps the first execution link across binding retries without changing the run claim", async () => {
@@ -169,14 +190,10 @@ it("deduplicates committed slots and drains persisted job order within worker ca
   const requests = jobs.map((current) => scheduled(queue.storeKey, current));
   const admitted = await queue.request([requests[2]!, requests[0]!, requests[0]!, requests[1]!]);
   expect(admitted.accepted).toHaveLength(3);
-  expect(admitted.rejected).toEqual([
-    { jobId: "z-first", receiptId: requests[0]!.receiptId, reason: "already-requested" },
-  ]);
-  expect((await queue.request([requests[0]!])).rejected).toEqual([
-    { jobId: "z-first", receiptId: requests[0]!.receiptId, reason: "already-requested" },
-  ]);
+  expect(admitted.rejected).toEqual(rejected(requests[0]!));
+  expect((await queue.request([requests[0]!])).rejected).toEqual(rejected(requests[0]!));
   const first = await queue.drain();
-  expect(first.launches.map((entry) => entry.job.id)).toEqual(["z-first"]);
+  expect(jobIds(first.launches)).toEqual(["z-first"]);
   expect(first.launches[0]?.job.state.lastError).toBe("previous run failed");
   expect((await queue.drain()).launches).toEqual([]);
   const persisted = await queue.read();
@@ -189,7 +206,7 @@ it("deduplicates committed slots and drains persisted job order within worker ca
   ]);
   await queue.cancel([first.launches[0]!.runReceipt.receiptId], "superseded");
   expect((await readCronRunHistoryCandidates(queue.storeKey, "z-first")).records).toEqual([]);
-  expect((await queue.drain()).launches.map((entry) => entry.job.id)).toEqual(["a-second"]);
+  expect(jobIds((await queue.drain()).launches)).toEqual(["a-second"]);
 });
 
 it("advances a consumed scheduled slot without reclaiming its terminal receipt", async () => {
@@ -201,9 +218,7 @@ it("advances a consumed scheduled slot without reclaiming its terminal receipt",
   expect((await queue.read()).jobs[0]?.state.nextRunAtMs).toBe(now);
   const retry = await queue.request([request]);
   expect(retry.accepted).toEqual([]);
-  expect(retry.rejected).toEqual([
-    { jobId: current.id, receiptId: request.receiptId, reason: "already-requested" },
-  ]);
+  expect(retry.rejected).toEqual(rejected(request));
   expect((await queue.read()).jobs[0]?.state.nextRunAtMs).toBeGreaterThan(now);
   expect((await queue.drain()).launches).toEqual([]);
 });
@@ -218,20 +233,17 @@ it("returns durable receipt handles across queued edits and records disabled req
     payload: { kind: "command", argv: ["echo", "new payload"] },
     agentId: "edited-agent",
   });
-  expect(edited).toMatchObject({
-    outcome: {
-      store: {
-        jobs: [
-          {
-            id: original.id,
-            agentId: "edited-agent",
-            payload: { kind: "command", argv: ["echo", "new payload"] },
-            state: { queuedAtMs: now },
-          },
-        ],
-      },
+  if (!("outcome" in edited)) {
+    throw new Error("Expected the queued edit to commit");
+  }
+  expect(edited.outcome.store.jobs).toMatchObject([
+    {
+      id: original.id,
+      agentId: "edited-agent",
+      payload: { kind: "command", argv: ["echo", "new payload"] },
+      state: { queuedAtMs: now },
     },
-  });
+  ]);
   expect(edited).toMatchObject({ outcome: { store: await queue.read() } });
   const activated = (await queue.drain()).launches[0]!;
   expect(activated.job.payload).toEqual({
@@ -245,19 +257,15 @@ it("returns durable receipt handles across queued edits and records disabled req
     startedAtMs: now + 1,
   });
   expect(await queue.readReceipt(activated.runReceipt)).toEqual(activated.runReceipt);
-  expect((await queue.request([request])).rejected).toEqual([
-    { jobId: original.id, receiptId: request.receiptId, reason: "already-requested" },
-  ]);
+  expect((await queue.request([request])).rejected).toEqual(rejected(request));
 
   const cancelJob = job("disabled");
   const cancelled = await store("disable", [cancelJob]);
-  const manual = {
-    jobId: cancelJob.id,
+  const manual = requestFor(cancelJob, {
     receiptId: "cron:request:disabled",
     requestRunId: "public-ack",
     mode: "if-enabled" as const,
-    configRevision: resolveCronJobConfigRevision(cancelJob),
-  };
+  });
   await cancelled.request([manual]);
   const disabled = await cancelled.update(cancelJob.id, { enabled: false });
   expect(disabled).toMatchObject({ outcome: { store: await cancelled.read() } });
@@ -268,12 +276,9 @@ it("returns durable receipt handles across queued edits and records disabled req
   expect(disabled.outcome.store.jobs[0]?.state.queuedAtMs).toBeUndefined();
   const drained = await cancelled.drain([manual]);
   expect(drained.launches).toEqual([]);
-  expect(drained.skipped.map((entry) => entry.runReceipt.receiptId)).toEqual([manual.receiptId]);
+  expect(runIds(drained.skipped)).toEqual([manual.receiptId]);
   expect((await cancelled.read()).jobs[0]?.state.queuedAtMs).toBeUndefined();
-  const page = projectCronRunHistoryPage(await readHistoryRecords(cancelled.storeKey), {
-    storeKey: cancelled.storeKey,
-    runId: "public-ack",
-  });
+  const page = await cancelled.history("public-ack");
   expect(page.entries).toMatchObject([
     {
       status: "skipped",
@@ -287,31 +292,27 @@ it("holds scheduled requests while paused and activates an explicit request behi
   const jobs = [job("timed-paused"), job("manual-paused")];
   const queue = await store("paused", jobs);
   const timed = scheduled(queue.storeKey, jobs[0]!);
-  const manual = {
-    jobId: jobs[1]!.id,
+  const manual = requestFor(jobs[1]!, {
     receiptId: "cron-request.paused",
     mode: "force" as const,
-    configRevision: resolveCronJobConfigRevision(jobs[1]!),
-  };
+  });
   await queue.request([timed, manual]);
   const paused = await queue.drain([manual], 1, true);
-  expect(paused.launches.map((entry) => entry.job.id)).toEqual(["manual-paused"]);
+  expect(jobIds(paused.launches)).toEqual(["manual-paused"]);
   expect(paused.skipped).toEqual([]);
   expect((await queue.read()).jobs[0]?.state.queuedAtMs).toBe(now);
   await queue.cancel([manual.receiptId], "superseded");
-  expect((await queue.drain()).launches.map((entry) => entry.job.id)).toEqual(["timed-paused"]);
+  expect(jobIds((await queue.drain()).launches)).toEqual(["timed-paused"]);
 });
 
 it("launches explicit force on a disabled job and retains a consumed exit event through rearming", async () => {
   const disabled = job("force", { enabled: false });
   const forced = await store("force", [disabled]);
-  const force = {
-    jobId: disabled.id,
+  const force = requestFor(disabled, {
     receiptId: "cron:request:force",
     mode: "force" as const,
-    configRevision: resolveCronJobConfigRevision(disabled),
     preserveSchedule: true,
-  };
+  });
   expect((await forced.request([force])).accepted).toHaveLength(1);
   expect((await forced.drain([force])).launches[0]?.job.enabled).toBe(false);
 
@@ -320,33 +321,26 @@ it("launches explicit force on a disabled job and retains a consumed exit event 
     state: {},
   });
   const exit = await store("exit", [onExit]);
-  const event = {
-    jobId: onExit.id,
+  const event = requestFor(onExit, {
     receiptId: "cron:request:exit",
     mode: "on-exit" as const,
     onExitSchedule: { kind: "on-exit" as const, command: "synthetic-watch" },
-    configRevision: resolveCronJobConfigRevision(onExit),
-  };
+  });
   expect((await exit.request([event])).accepted[0]?.job.enabled).toBe(false);
   await exit.update(onExit.id, { enabled: true });
   const result = await exit.drain([event]);
   expect(result.skipped).toEqual([]);
-  expect(result.launches.map((entry) => entry.job.id)).toEqual(["exit"]);
+  expect(jobIds(result.launches)).toEqual(["exit"]);
 });
 
 it("recovers a timed request without replaying active work or reconstructing a lost manual payload", async () => {
   const timedJob = job("recover", { schedule: { kind: "at", at: new Date(now).toISOString() } });
   const queue = await store("recover", [timedJob]);
   const requested = (await queue.request([scheduled(queue.storeKey, timedJob)])).accepted[0]!;
-  const recover = () =>
-    executeOpenClawStateWorker(context, {
-      type: "cron.recoverRuns",
-      input: { storeKey: queue.storeKey, nowMs: now + 2 },
-    });
-  expect((await recover()).jobs[0]?.state.queuedAtMs).toBe(now);
+  expect((await queue.recover()).jobs[0]?.state.queuedAtMs).toBe(now);
   const active = (await queue.drain()).launches[0]!;
   expect(active.runReceipt.receiptId).toBe(requested.runReceipt.receiptId);
-  expect((await recover()).interruptedRuns).toHaveLength(1);
+  expect((await queue.recover()).interruptedRuns).toHaveLength(1);
   expect((await queue.drain()).launches).toEqual([]);
   const interrupted = (await queue.read()).jobs[0]!;
   expect(interrupted.state.lastRunStatus).toBe("error");
@@ -355,25 +349,18 @@ it("recovers a timed request without replaying active work or reconstructing a l
 
   const manualJob = job("legacy");
   const legacy = await store("legacy", [manualJob]);
-  const manual = {
-    jobId: manualJob.id,
+  const manual = requestFor(manualJob, {
     receiptId: "old-random-receipt-id",
     mode: "force" as const,
-    configRevision: resolveCronJobConfigRevision(manualJob),
-  };
+  });
   await legacy.request([manual]);
   const held = await legacy.drain();
   expect(held).toEqual({ launches: [], skipped: [] });
   expect((await legacy.read()).jobs[0]?.state.queuedAtMs).toBe(now);
-  await executeOpenClawStateWorker(context, {
-    type: "cron.recoverRuns",
-    input: { storeKey: legacy.storeKey, nowMs: now + 2 },
-  });
+  await legacy.recover();
   expect((await legacy.read()).jobs[0]?.state.queuedAtMs).toBeUndefined();
   expect((await legacy.drain()).launches).toEqual([]);
-  const history = projectCronRunHistoryPage(await readHistoryRecords(legacy.storeKey), {
-    storeKey: legacy.storeKey,
-  });
+  const history = await legacy.history();
   expect(history.entries).toMatchObject([
     { status: "skipped", error: "cron: queued request lost its launch context" },
   ]);
@@ -407,16 +394,12 @@ it.each(["request", "cancellation"] as const)(
     if (phase === "request") {
       expect((await queue.read()).jobs[0]?.state.queuedAtMs).toBe(now);
       const resumed = await queue.drain();
-      expect(resumed.launches.map((entry) => entry.runReceipt.receiptId)).toEqual([
-        request.receiptId,
-      ]);
+      expect(runIds(resumed.launches)).toEqual([request.receiptId]);
       expect((await queue.request([request])).rejected[0]?.reason).toBe("already-requested");
     } else {
       expect((await queue.read()).jobs[0]?.state.queuedAtMs).toBeUndefined();
       expect((await queue.drain()).launches).toEqual([]);
-      const history = projectCronRunHistoryPage(await readHistoryRecords(queue.storeKey), {
-        storeKey: queue.storeKey,
-      });
+      const history = await queue.history();
       expect(history.entries).toHaveLength(1);
       expect(history.entries[0]?.status).toBe("skipped");
     }
@@ -434,11 +417,8 @@ it("cancels a removed queued job and rejects a plan made before its definition c
   const changed = job("changed");
   const stale = await store("stale-plan", [changed]);
   await stale.update(changed.id, { enabled: false });
-  expect((await stale.request([scheduled(stale.storeKey, changed)])).rejected).toEqual([
-    {
-      jobId: changed.id,
-      receiptId: createCronScheduledRunId(stale.storeKey, changed.id, now),
-      reason: "job-ineligible",
-    },
-  ]);
+  const staleRequest = scheduled(stale.storeKey, changed);
+  expect((await stale.request([staleRequest])).rejected).toEqual(
+    rejected(staleRequest, "job-ineligible"),
+  );
 });

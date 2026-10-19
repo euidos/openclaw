@@ -11,31 +11,59 @@ import { resolveCronJobConfigRevision } from "../config-revision.js";
 import { saveCronStore } from "../store.js";
 import type { CronJob } from "../types.js";
 import { loadCronStoreFromDatabase } from "./load.kernel.js";
+import type { CronRunQueueOperations } from "./run-queue.types.js";
 import { drainCronQueueInWorker } from "./run-queue.worker.js";
 import { createCronScheduledRunId } from "./run-request-id.js";
+
+const now = 1_800_000_000_000;
+function makeJob(id: string, onExit = false): CronJob {
+  return {
+    id,
+    name: id,
+    agentId: "main",
+    enabled: true,
+    createdAtMs: now - 1000,
+    updatedAtMs: now - 1000,
+    schedule: onExit
+      ? { kind: "on-exit", command: "synthetic-watch" }
+      : { kind: "every", everyMs: 60_000 },
+    payload: { kind: "command", argv: ["echo", "synthetic"] },
+    sessionTarget: "isolated",
+    wakeMode: "next-heartbeat",
+    delivery: { mode: "none" },
+    state: { nextRunAtMs: now },
+  };
+}
+
+function requestFor(storeKey: string, job: CronJob) {
+  const onExit = job.schedule.kind === "on-exit";
+  return {
+    jobId: job.id,
+    receiptId: onExit ? "cron:request:exit" : createCronScheduledRunId(storeKey, job.id, now),
+    configRevision: resolveCronJobConfigRevision(job),
+    mode: onExit ? ("on-exit" as const) : ("scheduled" as const),
+    onExitSchedule: job.schedule.kind === "on-exit" ? job.schedule : undefined,
+    scheduledSlotMs: onExit ? undefined : now,
+  };
+}
+
+async function requestRuns(
+  storeKey: string,
+  requests: CronRunQueueOperations["cron.requestRuns"]["input"]["requests"],
+  nowMs = now,
+) {
+  return executeOpenClawStateWorker(captureOpenClawStateWorkerContext(), {
+    type: "cron.requestRuns",
+    input: { storeKey, nowMs, requests },
+  });
+}
 
 it.each([false, true])(
   "keeps authored job bytes and row ownership when requesting an exit event: %s",
   async (onExit) => {
     await withOpenClawTestState({ label: "cron-queue-authored-data" }, async (fixture) => {
-      const now = 1_800_000_000_000;
       const storeKey = fixture.statePath("cron", "jobs.json");
-      const job: CronJob = {
-        id: "authored",
-        name: "authored",
-        agentId: "main",
-        enabled: true,
-        createdAtMs: now - 1000,
-        updatedAtMs: now - 1000,
-        schedule: onExit
-          ? { kind: "on-exit", command: "synthetic-watch" }
-          : { kind: "every", everyMs: 60_000 },
-        payload: { kind: "command", argv: ["echo", "synthetic"] },
-        sessionTarget: "isolated",
-        wakeMode: "next-heartbeat",
-        delivery: { mode: "none" },
-        state: { nextRunAtMs: now },
-      };
+      const job = makeJob("authored", onExit);
       await saveCronStore(storeKey, { version: 1, jobs: [job] });
       await closeOpenClawStateDatabaseAsync();
       let db = openOpenClawStateDatabase().db;
@@ -60,25 +88,7 @@ it.each([false, true])(
         throw new Error(loaded.error.message);
       }
       const current = loaded.loaded.store.jobs[0]!;
-      const result = await executeOpenClawStateWorker(context, {
-        type: "cron.requestRuns",
-        input: {
-          storeKey,
-          nowMs: now,
-          requests: [
-            {
-              jobId: job.id,
-              receiptId: onExit
-                ? "cron:request:exit"
-                : createCronScheduledRunId(storeKey, job.id, now),
-              configRevision: resolveCronJobConfigRevision(current),
-              mode: onExit ? "on-exit" : "scheduled",
-              onExitSchedule: onExit ? { kind: "on-exit", command: "synthetic-watch" } : undefined,
-              scheduledSlotMs: onExit ? undefined : now,
-            },
-          ],
-        },
-      });
+      const result = await requestRuns(storeKey, [requestFor(storeKey, current)]);
       expect(result.rejected).toEqual([]);
       expect(result.accepted).toHaveLength(1);
       await closeOpenClawStateDatabaseAsync();
@@ -95,35 +105,11 @@ it.each([false, true])(
 
 it("preserves a durable claim when its runtime queue marker is absent", async () => {
   await withOpenClawTestState({ label: "cron-queue-claim-conflict" }, async (fixture) => {
-    const now = 1_800_000_000_000;
     const storeKey = fixture.statePath("cron", "jobs.json");
-    const job: CronJob = {
-      id: "claimed",
-      name: "claimed",
-      agentId: "main",
-      enabled: true,
-      createdAtMs: now - 1000,
-      updatedAtMs: now - 1000,
-      schedule: { kind: "every", everyMs: 60_000 },
-      payload: { kind: "command", argv: ["echo", "synthetic"] },
-      sessionTarget: "isolated",
-      wakeMode: "next-heartbeat",
-      delivery: { mode: "none" },
-      state: { nextRunAtMs: now },
-    };
+    const job = makeJob("claimed");
     await saveCronStore(storeKey, { version: 1, jobs: [job] });
-    const request = {
-      jobId: job.id,
-      receiptId: createCronScheduledRunId(storeKey, job.id, now),
-      configRevision: resolveCronJobConfigRevision(job),
-      mode: "scheduled" as const,
-      scheduledSlotMs: now,
-    };
-    let context = captureOpenClawStateWorkerContext();
-    const first = await executeOpenClawStateWorker(context, {
-      type: "cron.requestRuns",
-      input: { storeKey, nowMs: now, requests: [request] },
-    });
+    const request = requestFor(storeKey, job);
+    const first = await requestRuns(storeKey, [request]);
     expect(first.accepted).toHaveLength(1);
     await closeOpenClawStateDatabaseAsync();
     const db = openOpenClawStateDatabase().db;
@@ -137,12 +123,8 @@ it("preserves a durable claim when its runtime queue marker is absent", async ()
       .prepare("SELECT * FROM cron_run_receipts WHERE receipt_id = ?")
       .get(request.receiptId);
     await closeOpenClawStateDatabaseAsync();
-    context = captureOpenClawStateWorkerContext();
     const competing = { ...request, mode: "force" as const, receiptId: "cron:request:competing" };
-    const retry = await executeOpenClawStateWorker(context, {
-      type: "cron.requestRuns",
-      input: { storeKey, nowMs: now + 1, requests: [request, competing] },
-    });
+    const retry = await requestRuns(storeKey, [request, competing], now + 1);
     expect(retry.accepted).toEqual([]);
     expect(retry.rejected).toEqual([
       { jobId: job.id, receiptId: request.receiptId, reason: "already-requested" },
@@ -159,40 +141,13 @@ it("preserves a durable claim when its runtime queue marker is absent", async ()
 
 it("keeps requested occurrences and siblings intact when activation rolls back", async () => {
   await withOpenClawTestState({ label: "cron-queue-activation-rollback" }, async (fixture) => {
-    const now = 1_800_000_000_000;
     const storeKey = fixture.statePath("cron", "jobs.json");
-    const jobs: CronJob[] = ["failing", "sibling"].map((id) => ({
-      id,
-      name: id,
-      agentId: "main",
-      enabled: true,
-      createdAtMs: now - 1000,
-      updatedAtMs: now - 1000,
-      schedule: { kind: "every", everyMs: 60_000 },
-      payload: { kind: "command", argv: ["echo", "synthetic"] },
-      sessionTarget: "isolated",
-      wakeMode: "next-heartbeat",
-      delivery: { mode: "none" },
-      state: { nextRunAtMs: now },
-    }));
+    const jobs = ["failing", "sibling"].map((id) => makeJob(id));
     await saveCronStore(storeKey, { version: 1, jobs });
     const context = captureOpenClawStateWorkerContext();
     await executeOpenClawStateWorker(context, { type: "cron.initializeRunReceipts", input: {} });
-    const requests = jobs.map((job) => ({
-      jobId: job.id,
-      receiptId: createCronScheduledRunId(storeKey, job.id, now),
-      configRevision: resolveCronJobConfigRevision(job),
-      mode: "scheduled" as const,
-      scheduledSlotMs: now,
-    }));
-    expect(
-      (
-        await executeOpenClawStateWorker(context, {
-          type: "cron.requestRuns",
-          input: { storeKey, nowMs: now, requests },
-        })
-      ).accepted,
-    ).toHaveLength(2);
+    const requests = jobs.map((job) => requestFor(storeKey, job));
+    expect((await requestRuns(storeKey, requests)).accepted).toHaveLength(2);
     await closeOpenClawStateDatabaseAsync();
     const database = openOpenClawStateDatabase();
     // Install the fault after admission on the connection this storage operation owns.
