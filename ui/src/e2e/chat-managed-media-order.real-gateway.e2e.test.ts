@@ -590,6 +590,38 @@ suite.define(() => {
               await assertDecoded();
               const liveNodes = await bubble.evaluateHandle((element) => {
                 const pane = element.closest<ChatPaneElement>("openclaw-chat-pane");
+                const readOwner = () => {
+                  const state = (
+                    element.closest(".chat-pane-cache__pane") as HTMLElement & {
+                      state: ChatPageHost;
+                    }
+                  ).state;
+                  const selected = state.sessionsResult?.sessions.find(
+                    (session) => session.key === state.sessionKey,
+                  );
+                  return {
+                    connected: state.connected,
+                    paneConnected: pane?.isConnected ?? false,
+                    paneActive: pane?.classList.contains("chat-pane-cache__pane--active") ?? false,
+                    connectionEpoch: state.connectionEpoch,
+                    mediaPolicyEpoch: state.mediaPolicyEpoch ?? 0,
+                    scope: JSON.stringify([
+                      state.resourceBasePath,
+                      state.sessionKey,
+                      state.assistantAgentId,
+                    ]),
+                    policy: JSON.stringify([
+                      selected?.permissionMode,
+                      selected?.permissionModePending,
+                      selected?.execNode,
+                      selected?.execCwd,
+                      selected?.sessionRoot,
+                      selected?.spawnedWorkspaceDir,
+                      selected?.spawnedCwd,
+                      selected?.worktree?.id,
+                    ]),
+                  };
+                };
                 const readPresentation = (target: ChatPaneElement | null) => ({
                   presented: target?.presented ?? null,
                   visuallyPresented: target?.visuallyPresented ?? null,
@@ -640,6 +672,15 @@ suite.define(() => {
                   readPresentation,
                   events,
                   stop: () => abort.abort(),
+                  imagePresentation: imageNodes.map((image) => ({
+                    source: image.getAttribute("src"),
+                    currentSource: image.currentSrc,
+                    frame: image.closest(".chat-image-frame"),
+                    gallery: image.closest(".chat-message-images"),
+                    container: image.closest(".chat-message-images")?.parentElement,
+                  })),
+                  owner: readOwner(),
+                  readOwner,
                 };
               });
               let liveOrder: string[];
@@ -663,16 +704,22 @@ suite.define(() => {
                     const frames = Array.from(current?.querySelectorAll(".chat-image-frame") ?? []);
                     const count = (selector: string) =>
                       current?.querySelectorAll(selector).length ?? 0;
-                    const slots = Array.from(
-                      current?.querySelectorAll(".chat-text div") ?? [],
-                    ).filter((element) =>
-                      Array.from(element.childNodes).some(
-                        (node) =>
-                          node.nodeType === Node.COMMENT_NODE && node.textContent === "lit-content",
-                      ),
+                    const currentImages = Array.from(
+                      current?.querySelectorAll<HTMLImageElement>("img.chat-message-image") ?? [],
                     );
+                    const owner = before.readOwner();
+                    const sourceKind = (source: string | null | undefined) =>
+                      source?.startsWith("blob:")
+                        ? "blob"
+                        : source?.startsWith("data:")
+                          ? "inline"
+                          : source?.startsWith("http:") || source?.startsWith("https:")
+                            ? "http"
+                            : source
+                              ? "relative"
+                              : "none";
                     return {
-                      schemaVersion: 1,
+                      schemaVersion: 2,
                       kind: "managed-image-order-after-capture",
                       matchingBubbles: matches.length,
                       originalBubbleConnected: before.bubble.isConnected,
@@ -702,11 +749,46 @@ suite.define(() => {
                         after: before.readPresentation(pane),
                         events: before.events,
                       },
-                      originalImages: before.images.map((image) => ({
-                        connected: image.isConnected,
-                        inOriginalBubble: before.bubble.contains(image),
-                        inCurrentBubble: current?.contains(image) ?? false,
-                      })),
+                      owner: {
+                        before: {
+                          connected: before.owner.connected,
+                          paneConnected: before.owner.paneConnected,
+                          paneActive: before.owner.paneActive,
+                          connectionEpoch: before.owner.connectionEpoch,
+                          mediaPolicyEpoch: before.owner.mediaPolicyEpoch,
+                        },
+                        after: {
+                          connected: owner.connected,
+                          paneConnected: owner.paneConnected,
+                          paneActive: owner.paneActive,
+                          connectionEpoch: owner.connectionEpoch,
+                          mediaPolicyEpoch: owner.mediaPolicyEpoch,
+                        },
+                        sameScope: owner.scope === before.owner.scope,
+                        samePolicy: owner.policy === before.owner.policy,
+                      },
+                      originalImages: before.images.map((image, index) => {
+                        const initial = before.imagePresentation[index]!;
+                        const replacement = currentImages[index];
+                        return {
+                          connected: image.isConnected,
+                          inOriginalBubble: before.bubble.contains(image),
+                          inCurrentBubble: current?.contains(image) ?? false,
+                          beforeSourceKind: sourceKind(initial.source),
+                          afterSourceKind: sourceKind(replacement?.getAttribute("src")),
+                          sameSource: replacement?.getAttribute("src") === initial.source,
+                          sameCurrentSource: replacement?.currentSrc === initial.currentSource,
+                          originalFrameConnected: initial.frame?.isConnected ?? null,
+                          sameFrame: replacement?.closest(".chat-image-frame") === initial.frame,
+                          originalGalleryConnected: initial.gallery?.isConnected ?? null,
+                          sameGallery:
+                            replacement?.closest(".chat-message-images") === initial.gallery,
+                          originalContainerConnected: initial.container?.isConnected ?? null,
+                          sameContainer:
+                            replacement?.closest(".chat-message-images")?.parentElement ===
+                            initial.container,
+                        };
+                      }),
                       current: {
                         images: count("img.chat-message-image"),
                         allImages: count("img"),
@@ -715,11 +797,6 @@ suite.define(() => {
                         skeletons: count(".chat-image-skeleton"),
                         unavailable: count(".chat-image-frame--compact"),
                         busyFrames: count('.chat-image-frame[aria-busy="true"]'),
-                        mediaSlots: slots.map((slot) => ({
-                          childElements: slot.childElementCount,
-                          images: slot.querySelectorAll("img.chat-message-image").length,
-                          galleries: slot.querySelectorAll(".chat-message-images").length,
-                        })),
                       },
                     };
                   }, intro);
