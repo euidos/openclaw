@@ -1,3 +1,4 @@
+import { expectDefined } from "openclaw/plugin-sdk/expect-runtime";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { authenticate } from "./urbit/auth.js";
@@ -36,10 +37,7 @@ const AVATAR_UPLOAD = {
 };
 
 const MEMEX_STORAGE = {
-  configuration: {
-    currentBucket: "uploads",
-    service: "presigned-url",
-  },
+  configuration: { currentBucket: "uploads", service: "presigned-url" },
   secret: "genuine-secret",
 };
 
@@ -59,20 +57,16 @@ const CUSTOM_STORAGE = {
 
 let testClientConfig: ClientConfig;
 
-function createGuardedResult(
+const createGuardedResult = (
   response: Response,
   finalUrl: string,
   release: () => Promise<void> = mockRelease,
-) {
-  return { response, finalUrl, release };
-}
+) => ({ response, finalUrl, release });
 
-function responseWithCancelableBody(
+const responseWithCancelableBody = (
   status: number,
   cancelBody: () => void | PromiseLike<void>,
-): Response {
-  return new Response(new ReadableStream<Uint8Array>({ cancel: cancelBody }), { status });
-}
+): Response => new Response(new ReadableStream<Uint8Array>({ cancel: cancelBody }), { status });
 
 function configureTestClient(shipUrl: string, dangerouslyAllowPrivateNetwork?: boolean): void {
   testClientConfig = {
@@ -88,21 +82,16 @@ function mockStorageScry(params: {
   credentials?: Record<string, unknown>;
   secret?: string;
 }): void {
-  const responses = new Map<string, unknown>([
-    ["/storage/configuration.json", params.configuration],
-    [
-      "/storage/credentials.json",
-      { "storage-update": params.credentials ? { credentials: params.credentials } : {} },
-    ],
-  ]);
-  if (params.secret) {
-    responses.set("/genuine/secret.json", { secret: params.secret });
-  }
   mockScryUrbitPath.mockImplementation(async (_deps, { path }) => {
-    if (!responses.has(path)) {
-      throw new Error(`Unexpected scry path: ${path}`);
-    }
-    return responses.get(path);
+    const value =
+      path === "/storage/configuration.json"
+        ? params.configuration
+        : path === "/storage/credentials.json"
+          ? { "storage-update": params.credentials ? { credentials: params.credentials } : {} }
+          : path === "/genuine/secret.json" && params.secret
+            ? { secret: params.secret }
+            : undefined;
+    return expectDefined(value, `Unexpected scry path: ${path}`);
   });
 }
 
@@ -117,9 +106,8 @@ function mockGuardedResponse(
   mockGuardedFetch.mockResolvedValueOnce(createGuardedResult(response, finalUrl));
 }
 
-function uploadAvatar(clientConfig: ClientConfig = testClientConfig) {
-  return uploadFile(AVATAR_UPLOAD, clientConfig);
-}
+const uploadAvatar = (clientConfig: ClientConfig = testClientConfig) =>
+  uploadFile(AVATAR_UPLOAD, clientConfig);
 
 function expectGuardCleanup(fetches: number, releases = fetches) {
   expect(globalThis.fetch).not.toHaveBeenCalled();
@@ -130,6 +118,7 @@ function expectGuardCleanup(fetches: number, releases = fetches) {
 function expectGuardRequest(index: number, url: string, auditContext: string, timeoutMs = 300_000) {
   const call = mockGuardedFetch.mock.calls[index]?.[0];
   expect(call).toMatchObject({ url, auditContext, capture: false, maxRedirects: 0, timeoutMs });
+  expect(call?.init?.method).toBe("PUT");
   return call;
 }
 
@@ -158,12 +147,9 @@ describe("uploadFile memex upload hardening", () => {
     mockGuardedResponse(MEMEX_ENDPOINT, lookupResponse);
     mockGuardedResponse(MEMEX_UPLOAD_URL, responseWithCancelableBody(200, uploadCancel));
 
-    const result = await uploadAvatar();
-
-    expect(result).toEqual({ url: MEMEX_FILE });
+    await expect(uploadAvatar()).resolves.toEqual({ url: MEMEX_FILE });
     expectGuardCleanup(2);
     const firstCall = expectGuardRequest(0, MEMEX_ENDPOINT, "tlon-memex-upload-url", 30_000);
-    expect(firstCall?.init?.method).toBe("PUT");
     expect(firstCall?.init?.headers).toEqual({ "Content-Type": "application/json" });
     const firstBodyRaw = firstCall?.init?.body;
     expect(typeof firstBodyRaw).toBe("string");
@@ -175,7 +161,6 @@ describe("uploadFile memex upload hardening", () => {
     });
     expect(typeof firstBody.fileName).toBe("string");
     const secondCall = expectGuardRequest(1, MEMEX_UPLOAD_URL, "tlon-memex-upload", 300_000);
-    expect(secondCall?.init?.method).toBe("PUT");
     expect(secondCall?.init?.headers).toEqual({
       "Cache-Control": "public, max-age=3600",
       "Content-Type": "image/png",
@@ -299,17 +284,13 @@ describe("uploadFile custom S3 upload hardening", () => {
     mockGetSignedUrl.mockResolvedValueOnce(url);
     mockGuardedResponse(url, responseWithCancelableBody(200, cancelBody));
 
-    const result = await uploadAvatar();
-
-    expect(result.url.startsWith("https://files.example.com/")).toBe(true);
-    const signedUrlCall = mockGetSignedUrl.mock.calls[0];
-    if (!signedUrlCall) {
-      throw new Error("expected S3 signed URL call");
-    }
+    await expect(uploadAvatar()).resolves.toMatchObject({
+      url: expect.stringMatching(/^https:\/\/files\.example\.com\//),
+    });
+    const signedUrlCall = expectDefined(mockGetSignedUrl.mock.calls[0], "S3 signed URL call");
     expect((await signedUrlCall[0].config.endpoint()).protocol).toBe("https:");
     expectGuardCleanup(1);
     const uploadCall = expectGuardRequest(0, url, "tlon-custom-s3-upload", 300_000);
-    expect(uploadCall?.init?.method).toBe("PUT");
     expect(uploadCall?.init?.headers).toEqual(headers);
     expect(uploadCall?.policy).toBeUndefined();
     expect(cancelBody).toHaveBeenCalledTimes(1);
@@ -321,13 +302,12 @@ describe("uploadFile custom S3 upload hardening", () => {
     mockGetSignedUrl.mockResolvedValueOnce(url);
     mockGuardedResponse(url);
 
-    const result = await uploadAvatar();
-
-    expect(result.url.startsWith("https://files.example.com/")).toBe(true);
-    expect(mockGuardedFetch).toHaveBeenCalledTimes(1);
+    await expect(uploadAvatar()).resolves.toMatchObject({
+      url: expect.stringMatching(/^https:\/\/files\.example\.com\//),
+    });
+    expectGuardCleanup(1);
     const uploadCall = expectGuardRequest(0, url, "tlon-custom-s3-upload");
     expect(uploadCall?.policy).toEqual({ allowPrivateNetwork: true });
-    expect(mockRelease).toHaveBeenCalledTimes(1);
   });
 
   it("rejects custom S3 result URLs that are not http(s)", async () => {
@@ -343,8 +323,7 @@ describe("uploadFile custom S3 upload hardening", () => {
 
     await expect(uploadAvatar()).rejects.toThrow("Upload result URL must use http or https");
 
-    expect(mockGuardedFetch).toHaveBeenCalledTimes(1);
-    expect(mockRelease).toHaveBeenCalledTimes(1);
+    expectGuardCleanup(1);
   });
 });
 
@@ -355,12 +334,8 @@ describe("uploadFile send authority", () => {
     const signingStarted = createDeferred<void>();
     const signedUrl = createDeferred<string>();
     const authorityError = new Error("Tlon send authority revoked");
-    let revoked = false;
-    const assertDirectAdapterHandoff = () => {
-      if (revoked) {
-        throw authorityError;
-      }
-    };
+    const authority = new AbortController();
+    const assertDirectAdapterHandoff = () => authority.signal.throwIfAborted();
     mockGetSignedUrl.mockImplementationOnce(() => {
       signingStarted.resolve();
       return signedUrl.promise;
@@ -375,7 +350,7 @@ describe("uploadFile send authority", () => {
     const upload = uploadAvatar({ ...testClientConfig, assertDirectAdapterHandoff });
     const rejected = expect(upload).rejects.toBe(authorityError);
     await signingStarted.promise;
-    revoked = true;
+    authority.abort(authorityError);
     signedUrl.resolve(S3_UPLOAD_URL);
     await rejected;
 

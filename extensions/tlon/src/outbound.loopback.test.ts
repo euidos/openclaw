@@ -1,14 +1,13 @@
 import { once } from "node:events";
 import * as http from "node:http";
+import { text as readBody } from "node:stream/consumers";
+import { expectDefined } from "openclaw/plugin-sdk/expect-runtime";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { tlonPlugin } from "./channel.js";
 
 const TEXT_LIMIT = 10_000;
-const textSender = tlonPlugin.message?.send?.text;
-if (!textSender) {
-  throw new Error("expected preferred Tlon text sender");
-}
+const textSender = expectDefined(tlonPlugin.message?.send?.text, "preferred Tlon text sender");
 const targets = [
   { name: "DM", to: "~nec", threadId: undefined },
   { name: "group", to: "chat/~nec/general", threadId: undefined },
@@ -20,26 +19,8 @@ function finishLogin(response: http.ServerResponse) {
   response.end("ok");
 }
 
-function readBody(request: http.IncomingMessage, accept: (body: string) => void) {
-  let body = "";
-  request.setEncoding("utf8");
-  request.on("data", (chunk: string) => {
-    body += chunk;
-  });
-  request.on("end", () => accept(body));
-}
-
-type TlonPoke = {
-  json?: {
-    diff?: {
-      delta?: {
-        add?: {
-          memo?: { content?: Array<{ inline?: unknown[] }> };
-        };
-      };
-    };
-  };
-};
+type Memo = { memo?: { content?: Array<{ inline?: unknown[] }> } };
+type TlonPoke = { json?: { diff?: { delta?: { add?: Memo } } } };
 
 const storyText = (poke: TlonPoke) =>
   (poke.json?.diff?.delta?.add?.memo?.content ?? [])
@@ -66,16 +47,13 @@ describe("tlon outbound loopback", () => {
     if (!address || typeof address === "string") {
       throw new Error("expected loopback server address");
     }
-    const cfg = {
-      channels: {
-        tlon: {
-          ship: "~zod",
-          url: `http://127.0.0.1:${address.port}`,
-          code: "mock-code",
-          network: { dangerouslyAllowPrivateNetwork: true },
-        },
-      },
+    const tlon = {
+      ship: "~zod",
+      url: `http://127.0.0.1:${address.port}`,
+      code: "mock-code",
+      network: { dangerouslyAllowPrivateNetwork: true },
     };
+    const cfg = { channels: { tlon } };
     const controller = new AbortController();
     const dispatch = vi.fn(async () => {});
     type Send = Parameters<NonNullable<typeof textSender>>[0];
@@ -153,8 +131,8 @@ describe("tlon outbound loopback", () => {
     "retains an accepted $name result after authority closes",
     async ({ name, to, threadId }) => {
       const accepted = createDeferred<{ response: http.ServerResponse; payload: unknown }>();
-      const fixture = await listenLoopback((req, res) => {
-        readBody(req, (body) => accepted.resolve({ response: res, payload: JSON.parse(body) }));
+      const fixture = await listenLoopback(async (req, res) => {
+        accepted.resolve({ response: res, payload: JSON.parse(await readBody(req)) });
       });
       const result = fixture.send({ to, threadId, text: "accepted message" });
       const { response, payload } = await accepted.promise;
@@ -163,18 +141,16 @@ describe("tlon outbound loopback", () => {
       const post = threadId
         ? { reply: { id: "1.700.000.000.000", action: { add: memo } } }
         : { add: memo };
+      const direct = name === "DM";
+      const json = direct
+        ? { ship: "~nec", diff: { delta: { add: { memo } } } }
+        : { channel: { nest: "chat/~nec/general", action: { post } } };
       expect(payload).toMatchObject([
-        name === "DM"
-          ? {
-              app: "chat",
-              mark: "chat-dm-action",
-              json: { ship: "~nec", diff: { delta: { add: { memo } } } },
-            }
-          : {
-              app: "channels",
-              mark: "channel-action-1",
-              json: { channel: { nest: "chat/~nec/general", action: { post } } },
-            },
+        {
+          app: direct ? "chat" : "channels",
+          mark: direct ? "chat-dm-action" : "channel-action-1",
+          json,
+        },
       ]);
       fixture.controller.abort(new Error("authority closed after poke acceptance"));
       response.writeHead(204);
@@ -190,24 +166,17 @@ describe("tlon outbound loopback", () => {
 
   it("delivers each chunked unit as a bounded independent poke the urbit transport accepts", async () => {
     const pokes: TlonPoke[] = [];
-    const rejectedOversized: Array<{ length: number }> = [];
+    let rejectedOversized = 0;
     let loginCount = 0;
-    const fixture = await listenLoopback((req, res) => {
+    const fixture = await listenLoopback(async (req, res) => {
       const url = new URL(req.url ?? "/", "http://127.0.0.1");
       if (req.method === "PUT" && url.pathname.startsWith("/~/channel/")) {
-        readBody(req, (body) => {
-          const received = JSON.parse(body) as TlonPoke[];
-          pokes.push(...received);
-          const oversized = received.some((poke) => storyText(poke).length > TEXT_LIMIT);
-          if (oversized) {
-            rejectedOversized.push({ length: received.length });
-            res.writeHead(413, { "Content-Type": "text/plain" });
-            res.end("memo too long");
-            return;
-          }
-          res.writeHead(200, { "Content-Type": "text/plain" });
-          res.end("ok");
-        });
+        const received = JSON.parse(await readBody(req)) as TlonPoke[];
+        pokes.push(...received);
+        const oversized = received.some((poke) => storyText(poke).length > TEXT_LIMIT);
+        rejectedOversized += Number(oversized);
+        res.writeHead(oversized ? 413 : 200, { "Content-Type": "text/plain" });
+        res.end(oversized ? "memo too long" : "ok");
         return;
       }
       res.writeHead(404, { "Content-Type": "text/plain" });
@@ -219,14 +188,9 @@ describe("tlon outbound loopback", () => {
       finishLogin(res);
     });
 
-    const outbound = tlonPlugin.outbound;
-    if (!outbound) {
-      throw new Error("expected tlon plugin to declare an outbound adapter");
-    }
-    const chunker = outbound.chunker;
-    if (!chunker || outbound.textChunkLimit !== TEXT_LIMIT) {
-      throw new Error("expected tlon outbound to declare a bounded chunker");
-    }
+    const outbound = expectDefined(tlonPlugin.outbound, "Tlon outbound adapter");
+    const chunker = expectDefined(outbound.chunker, "Tlon chunker");
+    expect(outbound.textChunkLimit).toBe(TEXT_LIMIT);
 
     const text = "x".repeat(10_001);
     const chunks = chunker(text, TEXT_LIMIT);
@@ -238,7 +202,7 @@ describe("tlon outbound loopback", () => {
     expect(chunks).toEqual(["x".repeat(TEXT_LIMIT), "x"]);
     expect(pokes).toHaveLength(chunks.length);
     expect(loginCount).toBeGreaterThan(0);
-    expect(rejectedOversized).toEqual([]);
+    expect(rejectedOversized).toBe(0);
     const delivered = pokes.map(storyText);
     expect(delivered.every((part) => part.length <= TEXT_LIMIT)).toBe(true);
     expect(delivered.join("")).toBe(text);

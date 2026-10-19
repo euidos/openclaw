@@ -1,5 +1,6 @@
 import type { ChannelMessageSendResult } from "openclaw/plugin-sdk/channel-outbound";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import { expectDefined } from "openclaw/plugin-sdk/expect-runtime";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { tlonPlugin } from "./channel.js";
@@ -18,7 +19,7 @@ const scries = {
 } as const;
 type Phase = (typeof scries)[keyof typeof scries] | "source" | "allocation" | "upload" | "poke";
 type RequestRecord = { phase: Phase; url: string; dispatchCount: number };
-const fixtureCleanups: Array<() => Promise<void>> = [];
+let cleanup: (() => Promise<void>) | undefined;
 
 function createAccount(ship: string, storage: Storage) {
   const requests: RequestRecord[] = [];
@@ -34,6 +35,7 @@ function createAccount(ship: string, storage: Storage) {
     s3Endpoint: `https://${ship}.s3.example`,
     publicUrlBase: `https://${ship}.files.example/`,
     code: `fake-code-${ship}`,
+    cookie: `urbauth-~${ship}=fake-cookie-${ship}`,
     accessKeyId: `TESTACCESSKEY${ship.toUpperCase()}`,
     controller: new AbortController(),
     revoked: new Error(`Tlon ${ship} delivery authority revoked`),
@@ -79,11 +81,7 @@ async function fixtureResponse(
       return new Response(IMAGE, { headers: { "Content-Type": "image/png" } });
     case "login":
       expect(init?.body).toBe(`password=${account.code}`);
-      return new Response("ok", {
-        headers: {
-          "Set-Cookie": `urbauth-~${account.ship}=fake-cookie-${account.ship}; Path=/; HttpOnly`,
-        },
-      });
+      return new Response("ok", { headers: { "Set-Cookie": account.cookie } });
     case "storage":
     case "credentials":
     case "secret":
@@ -118,13 +116,13 @@ function createFixture(
   const entered = createDeferred<Response>();
   const resume = createDeferred<void>();
   const pending: Promise<unknown>[] = [];
-  fixtureCleanups.push(async () => {
+  cleanup = async () => {
     for (const account of accounts) {
       account.controller.abort(account.revoked);
     }
     resume.resolve();
     await Promise.allSettled(pending);
-  });
+  };
   const configuredAccounts = Object.fromEntries(
     accounts.map(({ ship, shipUrl: url, code }) => [
       ship,
@@ -176,9 +174,7 @@ function createFixture(
             : "GET",
       );
       if (url.origin === account.shipUrl && phase !== "login") {
-        expect(new Headers(init?.headers).get("cookie")).toContain(
-          `urbauth-~${account.ship}=fake-cookie-${account.ship}`,
-        );
+        expect(new Headers(init?.headers).get("cookie")).toContain(account.cookie);
       }
 
       const response = await fixtureResponse(account, phase, init, failUpload);
@@ -190,10 +186,7 @@ function createFixture(
     }),
   );
 
-  const send = tlonPlugin.message?.send?.media;
-  if (!send) {
-    throw new Error("Expected the preferred Tlon media sender");
-  }
+  const send = expectDefined(tlonPlugin.message?.send?.media, "preferred Tlon media sender");
   return {
     entered: entered.promise,
     resume: () => resume.resolve(),
@@ -216,10 +209,7 @@ function createFixture(
 function getUploadedUrl(account: Account): string {
   const uploads = account.requests.filter(({ phase }) => phase === "upload");
   expect(uploads).toHaveLength(1);
-  const upload = uploads[0];
-  if (!upload) {
-    throw new Error("Expected an image upload before the Tlon poke");
-  }
+  const upload = expectDefined(uploads[0], "image upload before the Tlon poke");
   if (account.storage === "memex") {
     return account.hostedUrl;
   }
@@ -264,9 +254,8 @@ function expectDelivered(account: Account, result: ChannelMessageSendResult, med
 }
 
 afterEach(async () => {
-  for (const cleanup of fixtureCleanups.splice(0)) {
-    await cleanup();
-  }
+  await cleanup?.();
+  cleanup = undefined;
   vi.unstubAllGlobals();
 });
 
@@ -281,16 +270,13 @@ describe("Tlon preferred media send authority", () => {
     async ({ storage, phase }) => {
       const account = createAccount("zod", storage);
       const fixture = createFixture([account], { ship: account.ship, phase });
-      const result = fixture.send(account).then(
-        (value) => ({ value }),
-        (error: unknown) => ({ error }),
-      );
+      const result = fixture.send(account).catch((error: unknown) => error);
       await fixture.entered;
       const submitted = [...account.requests];
       account.controller.abort(account.revoked);
       fixture.resume();
 
-      expect(await result).toEqual({ error: account.revoked });
+      expect(await result).toBe(account.revoked);
       expect(account.requests).toEqual(submitted);
       expect(account.pokes).toEqual([]);
       expect(account.onPlatformSendDispatch).not.toHaveBeenCalled();
