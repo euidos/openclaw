@@ -83,6 +83,11 @@ export async function proveGeneratedWorkspaceExpiry(owner: LocalWorkspaceOwner) 
 }
 
 export async function proveGeneratedWorkspaceRecovery(owner: LocalWorkspaceOwner, copied: boolean) {
+  const generatedCaches = [
+    ...packageCaches,
+    ".artifacts/build-all-cache/compile/outputs/dist/output.js",
+    ".artifacts/build-cache-inputs/compile.json",
+  ];
   const projection = await withLocalWorkspaceProjection(owner, (state) => state.prepare());
   const cache = ".cache/vitest/results.json";
   const lock = ".artifacts/dist-artifacts.lock/owner.json";
@@ -109,7 +114,7 @@ export async function proveGeneratedWorkspaceRecovery(owner: LocalWorkspaceOwner
   const files = {
     ...projectFiles,
     [cache]: "captured cache\n",
-    ...Object.fromEntries(packageCaches.map((name) => [name, "captured cache\n"])),
+    ...Object.fromEntries(generatedCaches.map((name) => [name, "captured cache\n"])),
     [lock]: "departed owner\n",
     [workerPackage]: '{"type":"module"}\n',
     [retainedWorker]: "next compiler output\n",
@@ -147,14 +152,14 @@ export async function proveGeneratedWorkspaceRecovery(owner: LocalWorkspaceOwner
   });
   await writeWorkspaceFiles(
     owner.worktree.path,
-    Object.fromEntries([cache, ...packageCaches].map((name) => [name, "local cache churn\n"])),
+    Object.fromEntries([cache, ...generatedCaches].map((name) => [name, "local cache churn\n"])),
   );
   await fs.rm(path.join(owner.worktree.path, lock), { force: true });
   await fs.rm(path.join(projection, lock));
   await fs.rm(path.join(projection, ".artifacts/vitest-workers"), { recursive: true });
   await writeWorkspaceFiles(
     projection,
-    Object.fromEntries([cache, ...packageCaches].map((name) => [name, "guest cache churn\n"])),
+    Object.fromEntries([cache, ...generatedCaches].map((name) => [name, "guest cache churn\n"])),
   );
   await closeOpenClawStateDatabaseAsync();
 
@@ -176,7 +181,7 @@ export async function proveGeneratedWorkspaceRecovery(owner: LocalWorkspaceOwner
       await expect(fs.stat(path.join(directory, name))).rejects.toMatchObject({ code: "ENOENT" });
     }
   }
-  for (const name of [cache, ...packageCaches]) {
+  for (const name of [cache, ...generatedCaches]) {
     expect(await fs.readFile(path.join(owner.worktree.path, name), "utf8")).toBe(
       "local cache churn\n",
     );

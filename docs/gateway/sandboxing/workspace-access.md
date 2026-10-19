@@ -67,10 +67,12 @@ At the checkout root, `.cache/vitest/`, `.cache/bun-transpiler/`, `.cache/opencl
 `.cache/ms-playwright/`, and `.local/share/pnpm/store/` caches stay with the runtime
 that produced them, along with `.artifacts/vitest-workers/` compiler outputs,
 `.artifacts/vitest-worker-cache/` retained compiler outputs,
-`.artifacts/vitest-shard-timings.json` scheduling samples, and
+`.artifacts/vitest-shard-timings.json` scheduling samples,
+`.artifacts/build-all-cache/` build snapshots,
+`.artifacts/build-cache-inputs/` temporary build receipts, and
 `.artifacts/dist-artifacts.lock/` ownership files.
 Synchronization and recovery of older pending results exclude these exact paths,
-so dependency and test-tool downloads do not count as authored workspace results.
+so dependency downloads and disposable test/build caches do not count as authored workspace results.
 Other guest-created files under `.cache/`, `.local/`, and `.artifacts/` still
 reconcile, including nested paths and explicit staged inputs; an ignore
 rule alone does not make a file disposable. Source changes cannot remove a

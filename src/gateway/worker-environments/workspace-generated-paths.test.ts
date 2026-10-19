@@ -23,7 +23,11 @@ import {
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const cache = ".cache/vitest/results.json";
+const buildOutput = ".artifacts/build-all-cache/compile/outputs/dist/output.js";
+const buildReceipt = ".artifacts/build-cache-inputs/compile.json";
 const packageCaches = [
+  buildOutput,
+  buildReceipt,
   ".local/share/pnpm/store/v11/files/10/package-content",
   ".cache/openclaw/bun/pinned/linux-x64/bin/bun",
   ".cache/ms-playwright/chromium-1248/chrome-linux64/chrome",
@@ -42,6 +46,12 @@ const userFiles = {
   [`${stagedRoot}/.gitignore`]: STAGED_INPUT_GITIGNORE,
   [`${stagedRoot}/.local/share/pnpm/store/input.txt`]: "staged input\n",
   ".artifacts/report.md": "user report\n",
+  ".artifacts/build-all-cache-notes.md": "user notes\n",
+  ".artifacts/build-cache-inputs-notes.md": "user notes\n",
+  "fixtures/.artifacts/build-all-cache/input.js": "nested user fixture\n",
+  "fixtures/.artifacts/build-cache-inputs/input.json": "nested user fixture\n",
+  [`${stagedRoot}/.artifacts/build-all-cache/input.js`]: "staged input\n",
+  [`${stagedRoot}/.artifacts/build-cache-inputs/input.json`]: "staged input\n",
   ".artifacts/vitest-worker-cache-notes.md": "user notes\n",
   ".artifacts/vitest-shard-timings.json-notes": "user notes\n",
   "fixtures/.artifacts/vitest-worker-cache/input.js": "nested user fixture\n",
@@ -75,6 +85,12 @@ it("excludes only generated runtime roots from capture and transfer", async () =
   });
   for (const name of packageCaches) {
     await fs.truncate(path.join(workspace, name), MAX_RECONCILIATION_FILE_BYTES + 1);
+  }
+  if (process.platform !== "win32" && process.getuid?.() !== 0) {
+    await fs.chmod(path.join(workspace, buildOutput), 0);
+    await expect(fs.readFile(path.join(workspace, buildOutput))).rejects.toMatchObject({
+      code: "EACCES",
+    });
   }
   const local = await readActualWorkspaceManifestImpl({ root: workspace, baseCommit: null });
   const result = parseChangedWorkspaceResult(
@@ -178,11 +194,11 @@ it.each([false, true])(
     const { workspace, runManifest, manifestRoot } = await createScriptWorkspace(
       tempDirs.make("workspace-legacy-cache-capture-"),
     );
-    const cachePath = ".artifacts/vitest-worker-cache/out.js";
+    const cachePaths = [".artifacts/vitest-worker-cache/out.js", buildOutput, buildReceipt];
     await writeWorkspaceFiles(workspace, {
       ".gitignore": ".artifacts/\nmedia/inbound/\n",
       "source.txt": "source",
-      [cachePath]: "cache",
+      ...Object.fromEntries(cachePaths.map((name) => [name, "cache"])),
       [`${stagedRoot}/.gitignore`]: STAGED_INPUT_GITIGNORE,
       [`${stagedRoot}/__pycache__/input.pyc`]: "staged input",
       ...(report ? { ".artifacts/report.md": "guest evidence" } : {}),
@@ -190,24 +206,26 @@ it.each([false, true])(
     await fs.mkdir(path.join(workspace, "kept-empty"));
     const baseCommit = await initializeScriptGitWorkspace(workspace, ".");
     const current = await readActualWorkspaceManifestImpl({ root: workspace, baseCommit });
-    const directories = new Set([
-      ...(current.manifest.directories ?? []),
-      ".artifacts",
-      ".artifacts/vitest-worker-cache",
-    ]);
+    const directories = new Set(current.manifest.directories);
+    for (const name of cachePaths) {
+      const segments = name.split("/");
+      for (let index = 1; index < segments.length; index++) {
+        directories.add(segments.slice(0, index).join("/"));
+      }
+    }
     const legacy = JSON.stringify({
       version: 1,
       baseCommit,
       entries: [
         ...[...directories].map((name) => ({ path: name, type: "directory", mode: 0o700 })),
         ...current.manifest.entries,
-        {
-          path: cachePath,
+        ...cachePaths.map((name) => ({
+          path: name,
           type: "file",
           mode: 0o644,
           size: 5,
           sha256: createHash("sha256").update("cache").digest("hex"),
-        },
+        })),
       ].toSorted((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0)),
     });
     const digest = createHash("sha256").update(legacy).digest("hex");
