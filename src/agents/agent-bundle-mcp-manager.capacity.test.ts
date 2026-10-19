@@ -237,6 +237,56 @@ describe("MCP capacity catalog continuity", () => {
     await refused.dispose();
   });
 
+  it("bounds evicted static catalogs and retains the most recently used session", async () => {
+    const { manager } = setup();
+    const input = (index: number) => ({
+      ...params,
+      sessionId: `one-off-${index}`,
+      sessionKey: `agent:test:one-off-${index}`,
+    });
+    for (let index = 0; index < 512; index++) {
+      const lease = await manager.acquire(input(index));
+      await lease.runtime.getCatalog();
+      lease.releaseLease();
+    }
+    expect(manager.listSessionIdsForAgent("test")).toHaveLength(512);
+    // Refused reuse still refreshes retention recency, without creating a runtime.
+    for (let index = 256; index < 512; index++) {
+      held.push(await manager.acquire(input(index)));
+    }
+    const continuing = await manager.acquire(input(0));
+    expect((await continuing.runtime.getCatalog()).tools).toHaveLength(1);
+    continuing.releaseLease();
+    held.shift()!.releaseLease();
+    const next = await manager.acquire(input(512));
+    await next.runtime.getCatalog();
+    held.push(next);
+    expect(manager.listSessionIdsForAgent("test")).toHaveLength(512);
+    expect(manager.resolveSessionId(input(1).sessionKey)).toBeUndefined();
+    expect(manager.resolveSessionId(input(0).sessionKey)).toBe("one-off-0");
+    const retained = await manager.acquire(input(0));
+    expect((await retained.runtime.getCatalog()).tools).toHaveLength(1);
+    retained.releaseLease();
+    await manager.disposeSession("one-off-0");
+    expect(manager.resolveSessionId(input(0).sessionKey)).toBeUndefined();
+  });
+
+  it.each([false, true])(
+    "retires an evicted static catalog through deferred retirement (retainAcrossReuse=%s)",
+    async (retainAcrossReuse) => {
+      const { manager, fill } = setup();
+      const first = await materializeBundleMcpToolsForRun(await manager.acquire(params));
+      await first.dispose();
+      await fill();
+      expect(manager.deferRetirement(params.sessionId, { retainAcrossReuse })).toBe(true);
+      expect(await manager.completeDeferredRetirement(params.sessionId)).toBe(true);
+      expect(manager.resolveSessionId(params.sessionKey)).toBeUndefined();
+      const retired = await materializeBundleMcpToolsForRun(await manager.acquire(params));
+      expect(retired.tools).toEqual([]);
+      await retired.dispose();
+    },
+  );
+
   it("allows only the owning agent to retire an evicted static catalog", async () => {
     const { manager, fill } = setup();
     const first = await materializeBundleMcpToolsForRun(await manager.acquire(params));

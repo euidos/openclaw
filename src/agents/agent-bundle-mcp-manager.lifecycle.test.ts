@@ -341,6 +341,48 @@ describe("MCP manager creation ownership", () => {
     }
   });
 
+  it("waits for an evicted process to close before reacquiring its session", async () => {
+    const factory = vi.fn<CreateSessionMcpRuntime>(createRuntimeFixture);
+    const manager = createManager(factory);
+    const cfg = { mcp: { servers: { fixture: { command: "true" } } } };
+    const input = (sessionId: string) => ({ ...params, sessionId, cfg });
+    const original = await manager.getOrCreate(input("slow-owner"));
+    const closing = holdDisposal(original);
+    await manager.getOrCreate(input("fast-owner"));
+    const leases: SessionMcpRuntimeLease[] = [];
+    for (let index = 0; index < 254; index++) {
+      leases.push(await manager.acquire(input(`busy-${index}`)));
+    }
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    let reacquiring: Promise<SessionMcpRuntimeLease> | undefined;
+    try {
+      const overflow = manager.acquire(input("overflow"));
+      await closing.started;
+      await vi.advanceTimersByTimeAsync(5_000);
+      leases.push(await overflow);
+      expect(manager.peekSession({ sessionId: "slow-owner" })).toBeUndefined();
+      reacquiring = manager.acquire(input("slow-owner"));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(factory.mock.calls.filter(([entry]) => entry.sessionId === "slow-owner")).toHaveLength(
+        1,
+      );
+      closing.release();
+      const replacement = await reacquiring;
+      leases.push(replacement);
+      expect(replacement.runtime).not.toBe(original);
+      expect(factory.mock.calls.filter(([entry]) => entry.sessionId === "slow-owner")).toHaveLength(
+        2,
+      );
+    } finally {
+      closing.release();
+      if (reacquiring) {
+        (await reacquiring).releaseLease();
+      }
+      leases.forEach((lease) => lease.releaseLease());
+      vi.useRealTimers();
+    }
+  });
+
   it("counts requester creation and physical cleanup until closure completes", async () => {
     const held = holdFactory();
     const factory = vi.fn<CreateSessionMcpRuntime>(createRuntimeFixture);

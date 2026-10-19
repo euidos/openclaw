@@ -436,6 +436,7 @@ export function createSessionMcpRuntimeManager(opts: SessionMcpRuntimeManagerOpt
       }
       if (
         lifecycle.runtimeKeysForSessionId(sessionId).length === 0 &&
+        !store.staticCatalogBySessionId.has(sessionId) &&
         !store.requiredRetirementSessionIds.has(sessionId)
       ) {
         return false;
@@ -466,7 +467,7 @@ export function createSessionMcpRuntimeManager(opts: SessionMcpRuntimeManagerOpt
         return false;
       }
       const runtimeKeys = lifecycle.runtimeKeysForSessionId(sessionId);
-      if (runtimeKeys.length === 0) {
+      if (runtimeKeys.length === 0 && !store.staticCatalogBySessionId.has(sessionId)) {
         return false;
       }
       const pendingWork = runtimeKeys
@@ -495,6 +496,7 @@ export function createSessionMcpRuntimeManager(opts: SessionMcpRuntimeManagerOpt
       };
       store.advertisedScopedCatalogBySessionId.clear();
       store.staticCatalogBySessionId.clear();
+      lifecycle.pruneSessionBookkeeping();
       for (const runtime of store.runtimesBySessionId.values()) {
         const slot = store.runtimeSlots.get(runtime);
         if (slot) {

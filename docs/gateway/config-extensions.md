@@ -121,6 +121,9 @@ requires [`uv`/`uvx`](https://docs.astral.sh/uv/getting-started/installation/).
   Waiting for idle cleanup is bounded; unfinished cleanup retains its slot and continues
   under the lifecycle owner. Usable static or requester connections remain available. Previously advertised
   tool schemas stay stable; unavailable bindings return an error without contacting MCP.
+  Static tool catalogs for up to 256 evicted sessions are retained in least-recently-used
+  order, in addition to sessions with live ownership. Session retirement or config reload
+  clears retained catalogs; older evicted sessions rediscover their tools on reconnect.
   A runtime can own multiple
   configured server connections. Sessions without available MCP servers and
   sign-in-only catalogs do not consume this limit. Native client runtimes manage their own bounds.

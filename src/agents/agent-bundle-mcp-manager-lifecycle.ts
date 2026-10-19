@@ -222,9 +222,7 @@ export function createSessionMcpRuntimeManagerLifecycle(
         store.runtimesBySessionId.delete(runtimeKey);
         store.connectionMetaByRuntimeKey.delete(runtimeKey);
         store.runtimeSlots.delete(runtime);
-        if (runtimeKeysForSessionId(runtime.sessionId).length === 0) {
-          forgetSessionKeysForSessionId(runtime.sessionId);
-        }
+        pruneSessionBookkeeping();
       }
     }
   };
@@ -273,11 +271,7 @@ export function createSessionMcpRuntimeManagerLifecycle(
           }
         }
         // A pending close can outlive the last empty runtime or queued acquisition.
-        for (const sessionId of new Set(runtimeKeys.map(parseRuntimeCacheSessionId))) {
-          if (runtimeKeysForSessionId(sessionId).length === 0) {
-            forgetSessionKeysForSessionId(sessionId);
-          }
-        }
+        pruneSessionBookkeeping();
       });
     for (const runtimeKey of runtimeKeys) {
       const pending = store.pendingDisposals.get(runtimeKey) ?? { pending: new Set() };
@@ -286,13 +280,39 @@ export function createSessionMcpRuntimeManagerLifecycle(
     }
     return disposal;
   };
-  const forgetSessionKeysForSessionId = (sessionId: string) => {
-    if (store.staticCatalogBySessionId.get(sessionId)?.catalog) {
-      return;
+  const pruneSessionBookkeeping = () => {
+    const ownedSessionIds = new Set([
+      ...[...store.runtimesBySessionId.values()].map((runtime) => runtime.sessionId),
+      ...[...store.runtimeWorkChains.keys(), ...store.pendingDisposals.keys()].map(
+        parseRuntimeCacheSessionId,
+      ),
+    ]);
+    for (const runId of listLiveAgentRunIds()) {
+      if (hasAgentRunContextExecutionOwner(runId)) {
+        const run = getAgentRunContext(runId);
+        const sessionId = run?.sessionId ?? store.sessionIdBySessionKey.get(run?.sessionKey ?? "");
+        if (sessionId) {
+          ownedSessionIds.add(sessionId);
+        }
+      }
     }
-    store.staticCatalogBySessionId.delete(sessionId);
-    for (const [sessionKey, mappedSessionId] of store.sessionIdBySessionKey.entries()) {
-      if (mappedSessionId === sessionId) {
+    // Map order tracks last acquisition, including refused reuse. Live owners are
+    // exempt; keep only one runtime-cap's worth of evicted session snapshots.
+    const evicted: string[] = [];
+    for (const [sessionId, entry] of store.staticCatalogBySessionId) {
+      if (!ownedSessionIds.has(sessionId)) {
+        if (entry.catalog) {
+          evicted.push(sessionId);
+        } else {
+          store.staticCatalogBySessionId.delete(sessionId);
+        }
+      }
+    }
+    for (const sessionId of evicted.slice(0, -SESSION_MCP_MAX_LIVE_RUNTIMES)) {
+      store.staticCatalogBySessionId.delete(sessionId);
+    }
+    for (const [sessionKey, sessionId] of store.sessionIdBySessionKey) {
+      if (!ownedSessionIds.has(sessionId) && !store.staticCatalogBySessionId.has(sessionId)) {
         store.sessionIdBySessionKey.delete(sessionKey);
       }
     }
@@ -339,11 +359,7 @@ export function createSessionMcpRuntimeManagerLifecycle(
     );
     void settled.finally(() => {
       // A full admission may install a requester after discarding its empty static partition.
-      for (const sessionId of new Set(runtimeKeys.map(parseRuntimeCacheSessionId))) {
-        if (runtimeKeysForSessionId(sessionId).length === 0) {
-          forgetSessionKeysForSessionId(sessionId);
-        }
-      }
+      pruneSessionBookkeeping();
     });
     return run;
   };
@@ -373,13 +389,15 @@ export function createSessionMcpRuntimeManagerLifecycle(
     for (const sessionId of touchedSessionIds) {
       if (runtimeKeysForSessionId(sessionId).length === 0) {
         store.deferredRetirementSessionIds.delete(sessionId);
-        forgetSessionKeysForSessionId(sessionId);
       }
     }
     await Promise.allSettled(
-      expired.map(({ runtimeKey, runtime }) =>
-        trackDisposal([runtimeKey], () => disposeRuntime(runtime)),
-      ),
+      expired.map(({ runtimeKey, runtime }) => {
+        // Reserve the evicted key through physical cleanup, even if admission
+        // stops waiting. Reacquisition must not overlap the original process.
+        const closing = runExclusiveOnRuntimeKeys([runtimeKey], () => disposeRuntime(runtime));
+        return trackDisposal([runtimeKey], () => closing);
+      }),
     );
     ensureIdleSweepTimer();
   };
@@ -619,6 +637,9 @@ export function createSessionMcpRuntimeManagerLifecycle(
         current.sessionKey !== binding.sessionKey)
     ) {
       store.staticCatalogBySessionId.delete(binding.sessionId);
+    } else if (current) {
+      store.staticCatalogBySessionId.delete(binding.sessionId);
+      store.staticCatalogBySessionId.set(binding.sessionId, current);
     }
   };
 
@@ -720,6 +741,7 @@ export function createSessionMcpRuntimeManagerLifecycle(
   return {
     store,
     runtimeKeysForSessionId,
+    pruneSessionBookkeeping,
     totalActiveLeasesForSessionId,
     runExclusiveOnRuntimeKeys,
     sweepIdleRuntimes,
