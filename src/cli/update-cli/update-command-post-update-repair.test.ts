@@ -22,6 +22,7 @@ import {
 import { renderUpdateRunReport } from "../../infra/update-run-report.js";
 import { defaultRuntime } from "../../runtime.js";
 import { classifyUpdateOutcome } from "../../shared/update-outcome.js";
+import { writeOpenClawPackageFixture } from "./update-cli-package.test-support.js";
 import { registerUnverifiedDefinitionRecoveryTests } from "./update-command-definition-recovery.test-support.js";
 import { withUpdateCommandExecutor } from "./update-command-executor.js";
 import type { FinishUpdateParams } from "./update-command-finish-types.js";
@@ -327,10 +328,7 @@ describe("post-activation failure settlement without inference", () => {
     async ({ rollback, restoredHealthy }) => {
       const params = fixture();
       const installedRoot = dirs.make("repair-installed-runtime-");
-      await fs.writeFile(
-        path.join(installedRoot, "package.json"),
-        JSON.stringify({ name: "openclaw", version: "2026.9.3" }),
-      );
+      await writeOpenClawPackageFixture(installedRoot, "2026.9.3");
       params.result.root = installedRoot;
       if (rollback === "unavailable") {
         params.result.mode = "git";
@@ -496,10 +494,7 @@ describe("post-activation failure settlement without inference", () => {
       vi.stubEnv("OPENCLAW_WINDOWS_TASK_NAME", "repair-plugin-fixture");
       run.env.OPENCLAW_WINDOWS_TASK_NAME = "repair-plugin-fixture";
       const root = await fs.realpath(dirs.make("repair-plugin-windows-candidate-"));
-      await fs.writeFile(
-        path.join(root, "package.json"),
-        JSON.stringify({ name: "openclaw", version: "2026.9.3" }),
-      );
+      await writeOpenClawPackageFixture(root, "2026.9.3");
       const state: GatewayServiceState = {
         installed: true,
         loadState: { status: "loaded" },
@@ -673,13 +668,7 @@ describe("post-activation failure settlement without inference", () => {
         receipt === "migration-verified" ? await createRetainedPackageSwap(stateDir) : undefined;
       mocks.version = swap ? "2.0.0" : "2026.9.7";
       const root = swap?.packageRoot ?? path.join(stateDir, "candidate");
-      await fs.mkdir(root, { recursive: true });
-      await fs.writeFile(
-        path.join(root, "package.json"),
-        JSON.stringify({ name: "openclaw", version: mocks.version }),
-      );
-      await fs.mkdir(path.join(root, "dist"), { recursive: true });
-      await fs.writeFile(path.join(root, "dist/index.js"), "export {};\n");
+      await writeOpenClawPackageFixture(root, mocks.version, { entrySource: "export {};\n" });
       const scratch = path.join(root, "tmp");
       await fs.mkdir(scratch);
       vi.spyOn(tempRoot, "resolvePreferredOpenClawTmpDir").mockReturnValue(scratch);
