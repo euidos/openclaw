@@ -304,17 +304,6 @@ plugin activation closes a dock that activation still owns. Use
 changes. See the [dock contract](/plugins/sdk-subpaths#control-ui-conversation-dock)
 for replacement, visibility, access, and context limits.
 
-### Translate plugin messages
-
-Use `createControlUiTranslator(messages, () => host.locale)` from
-`openclaw/plugin-sdk/control-ui` for plugin-owned nested message dictionaries.
-The returned translator reads the locale on each call, resolves dot-separated
-keys, and falls back to `messages.en` for missing translations. It interpolates
-`{name}` placeholders from an optional string-parameter record, preserves
-unresolved placeholders and empty strings, and returns the key when no text is
-available. Settings views can supply a getter for their current snapshot's
-locale instead.
-
 ## Build and reload
 
 `package.json` names the browser **source**:

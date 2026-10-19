@@ -1,4 +1,4 @@
-import { createPluginConfigSafeParse } from "openclaw/plugin-sdk/extension-shared";
+import { mapPluginConfigIssues } from "openclaw/plugin-sdk/extension-shared";
 import {
   buildPluginConfigSchema,
   type OpenClawPluginConfigSchema,
@@ -147,9 +147,24 @@ const DiffsPluginJsonSchemaSource = z.strictObject({
 });
 
 const diffsPluginConfigSchemaBase = buildPluginConfigSchema(DiffsPluginJsonSchemaSource, {
-  safeParse: createPluginConfigSafeParse(
-    DiffsPluginJsonSchemaSource.transform(buildDiffsPluginConfigShape).optional(),
-  ),
+  safeParse(value: unknown) {
+    if (value === undefined) {
+      return { success: true, data: undefined };
+    }
+    const result = DiffsPluginJsonSchemaSource.safeParse(value);
+    if (result.success) {
+      return {
+        success: true,
+        data: buildDiffsPluginConfigShape(result.data),
+      };
+    }
+    return {
+      success: false,
+      error: {
+        issues: mapPluginConfigIssues(result.error.issues),
+      },
+    };
+  },
 });
 
 export const diffsPluginConfigSchema: OpenClawPluginConfigSchema = {

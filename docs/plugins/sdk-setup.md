@@ -472,16 +472,6 @@ Plugin config is validated against the JSON Schema in your manifest. Users confi
 
 Your plugin receives this config as `api.pluginConfig` during registration.
 
-For a Zod-backed runtime parser, pass `createPluginConfigSafeParse(schema)` from
-`openclaw/plugin-sdk/extension-shared` as the `safeParse` option to
-`buildPluginConfigSchema` from `openclaw/plugin-sdk/plugin-entry`. The adapter
-preserves parsed data and formats plugin status issue messages and paths. Use
-Zod's `.optional()` and `.transform(...)` to define omitted-config and
-normalization behavior: an outer `.optional()` skips normalization for
-`undefined`, while a transform after `.optional()` can supply resolved defaults.
-Keep the original, untransformed schema as `buildPluginConfigSchema`'s first
-argument so runtime normalization does not change the generated JSON Schema.
-
 For channel-specific config, use the channel config section instead:
 
 ```json5

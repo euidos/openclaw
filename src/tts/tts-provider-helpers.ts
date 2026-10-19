@@ -3,14 +3,8 @@ import {
   normalizeOptionalLowercaseString,
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
-import { normalizeResolvedSecretInputString } from "../config/types.secrets.js";
 
 const TEMP_FILE_CLEANUP_DELAY_MS = 5 * 60 * 1000; // 5 minutes
-
-/** An explicit blank Talk key clears the inherited key; an absent field leaves it alone. */
-export function resolveSpeechTalkApiKeyOverride(value: unknown, path: string) {
-  return value === undefined ? {} : { apiKey: normalizeResolvedSecretInputString({ value, path }) };
-}
 
 /** Resolve the first non-blank API key in provider-defined precedence order. */
 export function resolveSpeechProviderApiKey(

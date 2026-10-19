@@ -6,7 +6,6 @@ export {
   normalizeSeed,
   requireInRange,
   resolveSpeechProviderApiKey,
-  resolveSpeechTalkApiKeyOverride,
 } from "../tts/tts-provider-helpers.js";
 export { parseSpeechDirectiveNumberOverride } from "../tts/directive-number.js";
 export { createSpeechDirectiveParser } from "../tts/directive-parser.js";

@@ -3,7 +3,6 @@ import { expectDefined } from "@openclaw/normalization-core";
 import { createAmbientNodeProxyAgent, hasAmbientNodeProxyConfigured } from "@openclaw/proxyline";
 import type { z } from "zod";
 import { resolveActiveManagedProxyTlsOptions } from "../infra/net/proxy/managed-proxy-undici.js";
-import type { OpenClawPluginConfigSchema } from "../plugins/types.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { createLoggerBackedRuntime } from "./runtime-logger.internal.js";
 export { safeParseJsonWithSchema, safeParseWithSchema } from "../utils/zod-parse.js";
@@ -191,18 +190,6 @@ export function mapPluginConfigIssues(
     path: normalizePluginConfigIssuePath(issue.path),
     message: formatPluginConfigIssue(issue, options),
   }));
-}
-
-/** Adapts a Zod parser while keeping plugin status issue messages and paths stable. */
-export function createPluginConfigSafeParse<T>(
-  schema: z.ZodType<T>,
-): NonNullable<OpenClawPluginConfigSchema["safeParse"]> {
-  return (value) => {
-    const parsed = schema.safeParse(value);
-    return parsed.success
-      ? { success: true, data: parsed.data }
-      : { success: false, error: { issues: mapPluginConfigIssues(parsed.error.issues) } };
-  };
 }
 
 /** Reads plugin package versions across source, bundled, and test layouts with a fallback. */

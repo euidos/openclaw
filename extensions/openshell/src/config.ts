@@ -1,8 +1,8 @@
 import path from "node:path";
 import { buildPluginConfigSchema, type OpenClawPluginConfigSchema } from "openclaw/plugin-sdk/core";
 import {
-  createPluginConfigSafeParse,
   formatPluginConfigIssue,
+  mapPluginConfigIssues,
 } from "openclaw/plugin-sdk/extension-shared";
 import { MAX_TIMER_TIMEOUT_SECONDS } from "openclaw/plugin-sdk/number-runtime";
 import { z } from "zod";
@@ -147,7 +147,21 @@ function normalizeOpenShellRemotePath(value: string): string {
 
 export function createOpenShellPluginConfigSchema(): OpenClawPluginConfigSchema {
   return buildPluginConfigSchema(OpenShellPluginConfigSchema, {
-    safeParse: createPluginConfigSafeParse(OpenShellPluginConfigSchema.optional()),
+    safeParse(value) {
+      if (value === undefined) {
+        return { success: true, data: undefined };
+      }
+      const parsed = OpenShellPluginConfigSchema.safeParse(value);
+      if (parsed.success) {
+        return { success: true, data: parsed.data };
+      }
+      return {
+        success: false,
+        error: {
+          issues: mapPluginConfigIssues(parsed.error.issues),
+        },
+      };
+    },
   });
 }
 

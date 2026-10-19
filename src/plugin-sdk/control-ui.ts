@@ -18,28 +18,6 @@ export type { AgentsWorkspaceGetResult } from "@openclaw/gateway-protocol";
 export type { MemorySearchResponse } from "../../packages/memory-host-sdk/src/host/types.js";
 export type ControlUiDisposer = () => void;
 
-type ControlUiTranslationMap = { readonly [key: string]: string | ControlUiTranslationMap };
-
-/** Read the live locale for each message, falling back to English for missing keys. */
-export function createControlUiTranslator(
-  messages: Readonly<Record<string, ControlUiTranslationMap>>,
-  locale: () => string,
-) {
-  const lookup = (language: string, key: string): unknown => {
-    let value: string | ControlUiTranslationMap | undefined = messages[language];
-    for (const part of key.split(".")) {
-      value = value && typeof value === "object" ? value[part] : undefined;
-    }
-    return value;
-  };
-  return (key: string, params?: Record<string, string>): string => {
-    const value = lookup(locale(), key) ?? lookup("en", key);
-    return typeof value === "string"
-      ? value.replace(/\{(\w+)\}/g, (_, name: string) => params?.[name] ?? `{${name}}`)
-      : key;
-  };
-}
-
 export type ControlUiConnection = {
   connected: boolean;
   canRead: boolean;
