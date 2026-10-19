@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import { clearRuntimeConfigSnapshot, setRuntimeConfigSnapshot } from "../config/io.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { createOpenClawTools, createOpenClawToolsAsync } from "./openclaw-tools.js";
@@ -49,6 +49,9 @@ vi.mock("../tts/tts.js", () => ({ textToSpeech: mocks.textToSpeech }));
 function createTools(options: OpenClawToolsOptions) {
   return createOpenClawTools({ disableMessageTool: true, disablePluginTools: true, ...options });
 }
+function expectOptions(mock: Mock, options: object, ...rest: unknown[]) {
+  expect(mock).toHaveBeenLastCalledWith(expect.objectContaining(options), ...rest);
+}
 
 const mediaConfig = {
   agents: {
@@ -82,14 +85,12 @@ describe("createOpenClawTools context wiring", () => {
     }).find((candidate) => candidate.name === "tts");
     expect(tool).toBeDefined();
     await tool?.execute("call-1", { text: "hello from reader" });
-    expect(mocks.textToSpeech).toHaveBeenCalledWith(
-      expect.objectContaining({
-        text: "hello from reader",
-        agentId: "reader",
-        channel: "feishu",
-        accountId: "feishu-main",
-      }),
-    );
+    expectOptions(mocks.textToSpeech, {
+      text: "hello from reader",
+      agentId: "reader",
+      channel: "feishu",
+      accountId: "feishu-main",
+    });
     expect(mocks.textToSpeech.mock.calls[0]?.[0].cfg).toBe(config);
   });
 
@@ -99,16 +100,14 @@ describe("createOpenClawTools context wiring", () => {
       agentAccountId: "delivery",
       requesterSenderId: "requester",
     });
-    expect(mocks.transcripts).toHaveBeenLastCalledWith(
-      expect.objectContaining({
-        caller: expect.objectContaining({
-          kind: "channel",
-          channel: "discord",
-          accountId: "delivery",
-          senderId: "requester",
-        }),
+    expectOptions(mocks.transcripts, {
+      caller: expect.objectContaining({
+        kind: "channel",
+        channel: "discord",
+        accountId: "delivery",
+        senderId: "requester",
       }),
-    );
+    });
   });
 
   it("refuses transcripts when caller-channel provenance is unavailable", () => {
@@ -120,14 +119,10 @@ describe("createOpenClawTools context wiring", () => {
     };
     // The definition stays offered; without a caller the tool refuses every call.
     createTools({ ...caller, gatewayCallerChannel: null });
-    expect(mocks.transcripts).toHaveBeenLastCalledWith(
-      expect.objectContaining({ callerUnavailable: true }),
-    );
+    expectOptions(mocks.transcripts, { callerUnavailable: true });
     expect(mocks.transcripts.mock.lastCall?.[0]).not.toHaveProperty("caller");
     createTools({ ...caller, gatewayCallerLocal: true });
-    expect(mocks.transcripts).toHaveBeenLastCalledWith(
-      expect.objectContaining({ callerUnavailable: true }),
-    );
+    expectOptions(mocks.transcripts, { callerUnavailable: true });
   });
 
   it("keeps transcripts channel-less for explicit local scheduled provenance", () => {
@@ -138,11 +133,7 @@ describe("createOpenClawTools context wiring", () => {
       gatewayCallerLocal: true,
       gatewayCallerScheduled: true,
     });
-    expect(mocks.transcripts).toHaveBeenLastCalledWith(
-      expect.objectContaining({
-        caller: { kind: "operator", source: "scheduled" },
-      }),
-    );
+    expectOptions(mocks.transcripts, { caller: { kind: "operator", source: "scheduled" } });
   });
 
   it.each([
@@ -175,14 +166,15 @@ describe("createOpenClawTools context wiring", () => {
         onYield: vi.fn(),
       });
       for (const factory of [mocks.image, mocks.video, mocks.music]) {
-        expect(factory).toHaveBeenCalledWith(
-          expect.objectContaining({
+        expectOptions(
+          factory,
+          {
             agentSessionKey: taskSessionKey,
             requesterRunSessionKey: runSessionKey,
             sandboxSessionKey: agentSessionKey,
             sandboxAgentId: "main",
             requesterAgentId: runSessionKey.startsWith("agent:work:") ? "work" : "main",
-          }),
+          },
           true,
         );
       }
@@ -200,16 +192,14 @@ describe("createOpenClawTools context wiring", () => {
       currentChannelId: "room:!AbCdEf1234567890:example.org",
       currentThreadTs: "$RootEvent:Example.Org",
     });
-    expect(mocks.cron).toHaveBeenCalledWith(
-      expect.objectContaining({
-        currentDeliveryContext: {
-          channel: "matrix",
-          to: "room:!AbCdEf1234567890:example.org",
-          accountId: "bot-a",
-          threadId: "$RootEvent:Example.Org",
-        },
-      }),
-    );
+    expectOptions(mocks.cron, {
+      currentDeliveryContext: {
+        channel: "matrix",
+        to: "room:!AbCdEf1234567890:example.org",
+        accountId: "bot-a",
+        threadId: "$RootEvent:Example.Org",
+      },
+    });
   });
 
   it("passes self-remove scope into cron", () => {
@@ -217,11 +207,9 @@ describe("createOpenClawTools context wiring", () => {
       agentSessionKey: "agent:main:cron:job-current",
       cronSelfRemoveOnlyJobId: "job-current",
     });
-    expect(mocks.cron).toHaveBeenCalledWith(
-      expect.objectContaining({
-        agentSessionKey: "agent:main:cron:job-current",
-        selfRemoveOnlyJobId: "job-current",
-      }),
-    );
+    expectOptions(mocks.cron, {
+      agentSessionKey: "agent:main:cron:job-current",
+      selfRemoveOnlyJobId: "job-current",
+    });
   });
 });

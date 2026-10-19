@@ -33,6 +33,11 @@ vi.mock("../plugins/web-search-providers.runtime.js", () => ({
 }));
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+const factoryOptions = {
+  disableMessageTool: true,
+  disablePluginTools: true,
+  wrapBeforeToolCallHook: false,
+};
 beforeEach(() => {
   resolveProviders.mockReset().mockReturnValue([]);
   vi.spyOn(authStore, "ensureAuthProfileStoreWithoutExternalProfilesAsync").mockImplementation(
@@ -47,58 +52,38 @@ afterEach(() => {
 
 describe("unconfigured web search tool surface", () => {
   it.each([
-    { label: "unconfigured", config: {}, expected: false, fact: false },
-    {
-      label: "configured",
-      config: { tools: { web: { search: { provider: "brave" } } } },
-      expected: true,
-      fact: true,
+    ["unconfigured", undefined, false, false],
+    ["configured", { provider: "brave" }, true, true],
+    ["explicit key-free", { provider: "duckduckgo" }, true, true],
+    ["disabled", { enabled: false }, false, undefined],
+  ] as const)(
+    "prepares %s search in the async runtime factory",
+    async (_label, search, expected, fact) => {
+      const onWebSearchConfiguration = vi.fn();
+      const tools = await createOpenClawToolsAsync({
+        ...factoryOptions,
+        config: search ? { tools: { web: { search } } } : {},
+        onWebSearchConfiguration,
+      });
+      expect(tools.some((tool) => tool.name === "web_search")).toBe(expected);
+      if (fact === undefined) {
+        expect(onWebSearchConfiguration).not.toHaveBeenCalled();
+      } else {
+        expect(onWebSearchConfiguration).toHaveBeenCalledExactlyOnceWith(fact);
+      }
     },
-    {
-      label: "explicit key-free",
-      config: { tools: { web: { search: { provider: "duckduckgo" } } } },
-      expected: true,
-      fact: true,
-    },
-    {
-      label: "disabled",
-      config: { tools: { web: { search: { enabled: false } } } },
-      expected: false,
-      fact: undefined,
-    },
-  ])("prepares $label search in the async runtime factory", async ({ config, expected, fact }) => {
-    const onWebSearchConfiguration = vi.fn();
-    const tools = await createOpenClawToolsAsync({
-      config,
-      disableMessageTool: true,
-      disablePluginTools: true,
-      wrapBeforeToolCallHook: false,
-      onWebSearchConfiguration,
-    });
-    expect(tools.some((tool) => tool.name === "web_search")).toBe(expected);
-    if (fact === undefined) {
-      expect(onWebSearchConfiguration).not.toHaveBeenCalled();
-    } else {
-      expect(onWebSearchConfiguration).toHaveBeenCalledExactlyOnceWith(fact);
-    }
-  });
+  );
 
   it.each([
-    { prepared: true, source: false, provider: "test-search-auth", configured: true },
-    { prepared: true, source: true, provider: "unrelated-provider", configured: false },
-    { prepared: true, source: true, provider: "test-search-auth", configured: true },
-    { prepared: true, source: undefined, provider: "test-search-auth", configured: true },
-    { prepared: false, source: undefined, provider: "test-search-auth", configured: false },
-    {
-      prepared: false,
-      source: undefined,
-      provider: "test-search-auth",
-      configured: false,
-      selectedReader: true,
-    },
-  ])(
-    "uses prepared=$prepared and source=$source for $provider during async construction (selectedReader=$selectedReader)",
-    async ({ prepared, source: authProfileStoreSource, provider, configured, selectedReader }) => {
+    [true, false, "test-search-auth", true, false],
+    [true, true, "unrelated-provider", false, false],
+    [true, true, "test-search-auth", true, false],
+    [true, undefined, "test-search-auth", true, false],
+    [false, undefined, "test-search-auth", false, false],
+    [false, undefined, "test-search-auth", false, true],
+  ] as const)(
+    "uses prepared=%s source=%s provider=%s configured=%s selectedReader=%s",
+    async (prepared, authProfileStoreSource, provider, configured, selectedReader) => {
       const agentDir = tempDirs.make("openclaw-search-source-");
       const reader: SessionEntryCohortReader | undefined = selectedReader
         ? {
@@ -107,12 +92,8 @@ describe("unconfigured web search tool surface", () => {
             logicalAgentId: "main",
             storePaths: [agentDir],
             assertCurrent: () => {},
-            readEntry: async () => {
-              throw new Error("The auth owner is isolated by the source probe");
-            },
-            withRead: async () => {
-              throw new Error("The auth owner is isolated by the source probe");
-            },
+            readEntry: unexpectedRead,
+            withRead: unexpectedRead,
           }
         : undefined;
       replaceRuntimeAuthProfileStoreSnapshots([
@@ -149,14 +130,11 @@ describe("unconfigured web search tool surface", () => {
           config: {},
           agentDir,
           authProfileStoreSource,
-          disableMessageTool: true,
-          disablePluginTools: true,
-          wrapBeforeToolCallHook: false,
+          ...factoryOptions,
           onWebSearchConfiguration,
         },
         { reader },
       );
-      // Prepared credentials are authoritative; source hints cannot override them.
       expect(tools.some((tool) => tool.name === "web_search")).toBe(configured);
       expect(onWebSearchConfiguration).toHaveBeenCalledExactlyOnceWith(configured);
       expect(
@@ -213,3 +191,7 @@ describe("unconfigured web search tool surface", () => {
     expect(tools.map((tool) => tool.name)).toContain("web_fetch");
   });
 });
+
+async function unexpectedRead(): Promise<never> {
+  throw new Error("The auth owner is isolated by the source probe");
+}

@@ -74,12 +74,27 @@ function createMediaTool(name: string, options: Parameters<typeof createOpenClaw
 
 async function expectLoadedImage(tool: ReturnType<typeof createMediaTool>, imagePath: string) {
   const result = await tool.execute("inspect-screenshot", { path: imagePath });
-  expect(result.content).toEqual(
-    expect.arrayContaining([
-      expect.objectContaining({ type: "image", mimeType: "image/png", data: expect.any(String) }),
-    ]),
+  expect(result.content).toContainEqual(
+    expect.objectContaining({ type: "image", mimeType: "image/png", data: expect.any(String) }),
   );
 }
+
+async function sessionFiles(name = "reference.png") {
+  const workspaceDir = tempDirs.make("openclaw-media-canonical-");
+  const sessionRoot = tempDirs.make("openclaw-media-worktree-");
+  const cwd = path.join(sessionRoot, "task");
+  await fs.mkdir(cwd);
+  const imagePath = path.join(sessionRoot, name);
+  const outsidePath = path.join(workspaceDir, name);
+  await Promise.all([imagePath, outsidePath].map((file) => fs.writeFile(file, png)));
+  return {
+    imagePath,
+    outsidePath,
+    options: { workspaceDir, cwd, fsPolicy: { workspaceOnly: true, root: sessionRoot } },
+  };
+}
+const expectOutside = (result: Promise<unknown>) =>
+  expect(result).rejects.toThrow(/not under an allowed directory/i);
 
 describe("media references in task workspaces", () => {
   it("loads Gateway media with workspace-only access while rejecting outside files and symlinks", async () => {
@@ -99,37 +114,19 @@ describe("media references in task workspaces", () => {
     const aliasPath = path.join(getMediaDir(), "escape.png");
     await fs.symlink(outsidePath, aliasPath);
     for (const imagePath of [outsidePath, aliasPath]) {
-      await expect(tool.execute("outside-image", { path: imagePath })).rejects.toThrow(
-        /not under an allowed directory/i,
-      );
+      await expectOutside(tool.execute("outside-image", { path: imagePath }));
     }
   });
 
-  it.each([true])("loads session-worktree images with workspaceOnly=%s", async (workspaceOnly) => {
-    const workspaceDir = tempDirs.make("openclaw-media-canonical-");
-    const sessionRoot = tempDirs.make("openclaw-media-worktree-");
-    const cwd = path.join(sessionRoot, "task");
-    await fs.mkdir(cwd);
-    const imagePath = path.join(cwd, "screenshot.png");
+  it("loads session-worktree images with workspaceOnly=true", async () => {
+    const { outsidePath, options } = await sessionFiles("shared.png");
+    const imagePath = path.join(options.cwd, "screenshot.png");
     await fs.writeFile(imagePath, png);
-    await fs.writeFile(path.join(sessionRoot, "shared.png"), png);
-    const tool = createMediaTool("view_image", {
-      workspaceDir,
-      cwd,
-      fsPolicy: { workspaceOnly, root: sessionRoot },
-    });
-
+    const tool = createMediaTool("view_image", options);
     await expectLoadedImage(tool, imagePath);
     await expectLoadedImage(tool, "screenshot.png");
     await expectLoadedImage(tool, "../shared.png");
-
-    if (workspaceOnly) {
-      const outsideImage = path.join(workspaceDir, "outside.png");
-      await fs.writeFile(outsideImage, png);
-      await expect(tool.execute("outside-image", { path: outsideImage })).rejects.toThrow(
-        /not under an allowed directory/i,
-      );
-    }
+    await expectOutside(tool.execute("outside-image", { path: outsidePath }));
   });
 
   it("keeps sandbox media on its bridge despite a different host session root", async () => {
@@ -180,72 +177,44 @@ describe("media references in task workspaces", () => {
     await rejected;
   });
 
-  it.each([{ name: "reference.png", bytes: png, mime: "image/png" }])(
-    "rejects $mime as a PDF after reading within the session root",
-    async ({ name, bytes, mime }) => {
-      const workspaceDir = tempDirs.make("openclaw-media-canonical-");
-      const sessionRoot = tempDirs.make("openclaw-media-worktree-");
-      const cwd = path.join(sessionRoot, "task");
-      await fs.mkdir(cwd);
-      const imagePath = path.join(sessionRoot, name);
-      const outsidePath = path.join(workspaceDir, name);
-      await fs.writeFile(imagePath, bytes);
-      await fs.writeFile(outsidePath, bytes);
-      const tool = createMediaTool("pdf", {
-        config: {
-          plugins: { allow: [] },
-          tools: { allow: ["pdf"] },
-          agents: { defaults: { pdfModel: { primary: "fixture/pdf-model" } } },
-        },
-        workspaceDir,
-        cwd,
-        fsPolicy: { workspaceOnly: true, root: sessionRoot },
+  it("rejects image/png as a PDF after reading within the session root", async () => {
+    const { imagePath, outsidePath, options } = await sessionFiles();
+    const tool = createMediaTool("pdf", {
+      config: {
+        plugins: { allow: [] },
+        tools: { allow: ["pdf"] },
+        agents: { defaults: { pdfModel: { primary: "fixture/pdf-model" } } },
+      },
+      ...options,
+    });
+
+    // Reaching content validation proves file access without invoking a PDF provider.
+    for (const pdf of [imagePath, "../reference.png"]) {
+      await expect(tool.execute("read-reference", { pdf })).rejects.toThrow(
+        "Expected PDF but got image/png",
+      );
+    }
+    await expectOutside(tool.execute("outside-reference", { pdf: outsidePath }));
+  });
+
+  it("image_generate shared reference loader follows the task cwd and session boundary", async () => {
+    const { imagePath, outsidePath, options } = await sessionFiles();
+    const loadReferences = (inputs: string[]) =>
+      loadMediaToolReferences({
+        inputs,
+        toolName: "image_generate",
+        expectedKind: "image",
+        ...options,
+        sandbox: null,
+        maxBytes: 1024 * 1024,
+        mapMedia: (media) => media.buffer.byteLength,
       });
 
-      // Reaching content validation proves file access without invoking a PDF provider.
-      for (const pdf of [imagePath, `../${name}`]) {
-        await expect(tool.execute("read-reference", { pdf })).rejects.toThrow(
-          `Expected PDF but got ${mime}`,
-        );
-      }
-      await expect(tool.execute("outside-reference", { pdf: outsidePath })).rejects.toThrow(
-        /not under an allowed directory/i,
-      );
-    },
-  );
-
-  it.each(["image_generate"] as const)(
-    "%s shared reference loader follows the task cwd and session boundary",
-    async (toolName) => {
-      const workspaceDir = tempDirs.make("openclaw-media-canonical-");
-      const sessionRoot = tempDirs.make("openclaw-media-worktree-");
-      const cwd = path.join(sessionRoot, "task");
-      await fs.mkdir(cwd);
-      const imagePath = path.join(sessionRoot, "reference.png");
-      const outsidePath = path.join(workspaceDir, "reference.png");
-      await fs.writeFile(imagePath, png);
-      await fs.writeFile(outsidePath, png);
-      const loadReferences = (inputs: string[]) =>
-        loadMediaToolReferences({
-          inputs,
-          toolName,
-          expectedKind: "image",
-          workspaceDir,
-          cwd,
-          fsPolicy: { workspaceOnly: true, root: sessionRoot },
-          sandbox: null,
-          maxBytes: 1024 * 1024,
-          mapMedia: (media) => media.buffer.byteLength,
-        });
-
-      const loaded = await loadReferences([imagePath, "../reference.png"]);
-      expect(loaded).toHaveLength(2);
-      for (const reference of loaded) {
-        expect(reference.source).toBeGreaterThan(0);
-      }
-      await expect(loadReferences([outsidePath])).rejects.toThrow(
-        /not under an allowed directory/i,
-      );
-    },
-  );
+    const loaded = await loadReferences([imagePath, "../reference.png"]);
+    expect(loaded).toHaveLength(2);
+    for (const reference of loaded) {
+      expect(reference.source).toBeGreaterThan(0);
+    }
+    await expectOutside(loadReferences([outsidePath]));
+  });
 });

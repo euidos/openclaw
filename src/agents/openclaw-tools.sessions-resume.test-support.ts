@@ -13,13 +13,24 @@ type SessionsSendResumeFixtures = {
   getSessionTool: (name: "sessions_send", options: { agentSessionKey: string }) => AnyAgentTool;
   callGatewayMock: Mock;
 };
+const parent = "agent:main:main";
+const admitted = <T>(runId: string, execute: () => T) =>
+  withGatewayToolCallerIdentity(
+    {
+      agentId: "main",
+      sessionKey: parent,
+      operationalRunInstance: createOperationalRunInstanceRef(runId),
+      receiptAuthority: () => true,
+    },
+    execute,
+  );
 
 export function registerSessionsSendResumeTests({
   getSessionTool,
   callGatewayMock,
 }: SessionsSendResumeFixtures) {
   it("sessions_send resume rejects a caller without admitted authority instead of sending a message", async () => {
-    const tool = getSessionTool("sessions_send", { agentSessionKey: "agent:main:main" });
+    const tool = getSessionTool("sessions_send", { agentSessionKey: parent });
     const result = await tool.execute("resume", {
       sessionKey: "agent:main:dashboard:paused-child",
       message: "Continue the assigned task",
@@ -33,174 +44,139 @@ export function registerSessionsSendResumeTests({
   });
 
   it.each([
-    {
-      targetKey: "agent:main:subagent:resume-child",
-      scenario: "explicit resume",
-      options: { mode: "resume" as const },
-    },
-    ...[
-      { scenario: "newer completed sibling", options: {} },
-      {
-        scenario: "automatic resume with reply options",
-        options: { timeoutSeconds: 30, watch: true },
-      },
-      { scenario: "explicit separate followup", options: { mode: "followup" as const } },
-      { scenario: "unrelated caller", options: {} },
-      { scenario: "completion unspecified", options: {} },
-    ].map((testCase) =>
-      Object.assign({ targetKey: "agent:main:dashboard:resume-child" }, testCase),
-    ),
-  ])(
-    "sessions_send preserves completion ownership for $targetKey: $scenario",
-    async ({ targetKey, scenario, options }) => {
-      const parent = "agent:main:main";
-      const previousRunId = "tool-resume-paused";
-      const siblingRunId = "tool-resume-independent-sibling";
-      const controller =
-        scenario === "unrelated caller" ? "agent:main:dashboard:other-parent" : parent;
-      const pauseReason = "sessions_yield";
-      const resumes =
-        scenario !== "explicit separate followup" &&
-        scenario !== "unrelated caller" &&
-        scenario !== "completion unspecified";
-      const childSessionIdentity = {
-        sessionId: "tool-resume-session",
-        lifecycleRevision: "tool-resume-revision",
-      };
-      await replaceSessionEntry(
-        { agentId: "main", sessionKey: targetKey },
-        { ...childSessionIdentity, updatedAt: Date.now() },
-      );
+    ["explicit resume", { mode: "resume" }],
+    ["newer completed sibling", {}],
+    ["automatic resume with reply options", { timeoutSeconds: 30, watch: true }],
+    ["explicit separate followup", { mode: "followup" }],
+    ["unrelated caller", {}],
+    ["completion unspecified", {}],
+  ] as const)("sessions_send preserves completion ownership: %s", async (scenario, options) => {
+    const targetKey = `agent:main:${scenario === "explicit resume" ? "subagent" : "dashboard"}:resume-child`;
+    const previousRunId = "tool-resume-paused";
+    const siblingRunId = "tool-resume-independent-sibling";
+    const controller =
+      scenario === "unrelated caller" ? "agent:main:dashboard:other-parent" : parent;
+    const pauseReason = "sessions_yield";
+    const resumes =
+      scenario !== "explicit separate followup" &&
+      scenario !== "unrelated caller" &&
+      scenario !== "completion unspecified";
+    const childSessionIdentity = {
+      sessionId: "tool-resume-session",
+      lifecycleRevision: "tool-resume-revision",
+    };
+    await replaceSessionEntry(
+      { agentId: "main", sessionKey: targetKey },
+      { ...childSessionIdentity, updatedAt: Date.now() },
+    );
+    await addSubagentRunForTests({
+      runId: previousRunId,
+      childSessionKey: targetKey,
+      childSessionIdentity,
+      requesterSessionKey: controller,
+      requesterDisplayKey: controller,
+      controllerSessionKey: controller,
+      task: "Wait",
+      cleanup: "keep",
+      startedAt: Date.now() - 100,
+      endedAt: Date.now(),
+      pauseReason,
+      expectsCompletionMessage: scenario === "completion unspecified" ? undefined : true,
+    });
+    if (scenario === "newer completed sibling") {
       await addSubagentRunForTests({
-        runId: previousRunId,
+        runId: siblingRunId,
         childSessionKey: targetKey,
         childSessionIdentity,
-        requesterSessionKey: controller,
-        requesterDisplayKey: controller,
-        controllerSessionKey: controller,
-        task: "Wait",
+        requesterSessionKey: "agent:main:dashboard:separate-requester",
+        requesterDisplayKey: "separate-requester",
+        controllerSessionKey: parent,
+        task: "Independent follow-up",
         cleanup: "keep",
-        startedAt: Date.now() - 100,
-        endedAt: Date.now(),
-        pauseReason,
-        expectsCompletionMessage: scenario === "completion unspecified" ? undefined : true,
+        generation: 2,
+        createdAt: Date.now() + 1,
+        execution: { status: "terminal", endedAt: Date.now() + 1, outcome: { status: "ok" } },
       });
-      if (scenario === "newer completed sibling") {
-        await addSubagentRunForTests({
-          runId: siblingRunId,
-          childSessionKey: targetKey,
-          childSessionIdentity,
-          requesterSessionKey: "agent:main:dashboard:separate-requester",
-          requesterDisplayKey: "separate-requester",
-          controllerSessionKey: parent,
-          task: "Independent follow-up",
-          cleanup: "keep",
-          generation: 2,
-          createdAt: Date.now() + 1,
-          execution: { status: "terminal", endedAt: Date.now() + 1, outcome: { status: "ok" } },
-        });
+    }
+    callGatewayMock.mockImplementation(async ({ method }) => {
+      if (method === "agent") {
+        return {
+          status: "accepted",
+          runId: "tool-resume-successor",
+          ...(resumes ? { taskRunId: previousRunId } : {}),
+        };
       }
-      callGatewayMock.mockImplementation(async ({ method }) => {
-        if (method === "agent") {
-          return {
-            status: "accepted",
-            runId: "tool-resume-successor",
-            ...(resumes ? { taskRunId: previousRunId } : {}),
-          };
-        }
-        return method === "agent.wait"
-          ? { status: "ok", terminalReply: { disposition: "empty" } }
-          : {};
-      });
-      const tool = getSessionTool("sessions_send", { agentSessionKey: parent });
-      try {
-        const result = await withGatewayToolCallerIdentity(
-          {
-            agentId: "main",
-            sessionKey: parent,
-            operationalRunInstance: createOperationalRunInstanceRef("parent-turn"),
-            receiptAuthority: () => true,
-          },
-          () => tool.execute("resume", { sessionKey: targetKey, message: "Continue", ...options }),
-        );
-        expect(result.details).toEqual(
-          resumes
-            ? {
-                status: "accepted",
-                mode: "resume",
-                runId: "tool-resume-successor",
-                taskRunId: previousRunId,
-                sessionKey: targetKey,
-                completion: "task",
-              }
-            : {
-                status: "no_reply",
-                runId: "tool-resume-successor",
-                sessionKey: targetKey,
-                message: expect.any(String),
-              },
-        );
-        expect(Value.Check(tool.outputSchema!, result.details)).toBe(true);
-        expect(
-          callGatewayMock.mock.calls.filter(([request]) => request.method === "agent"),
-        ).toHaveLength(1);
-        expect(
-          callGatewayMock.mock.calls.filter(([request]) => request.method === "agent.wait"),
-        ).toHaveLength(resumes ? 0 : 1);
-        const request = callGatewayMock.mock.calls.find(
-          ([candidate]) => candidate.method === "agent",
-        )?.[0];
-        if (resumes) {
-          expect(readInProcessSubagentResume(request)).toMatchObject({
-            previousRunId,
-            childSessionKey: targetKey,
-            childSessionId: "tool-resume-session",
-          });
-          expect(request.params).toMatchObject({
-            expectedExistingSessionId: "tool-resume-session",
-          });
-        } else {
-          expect(readInProcessSubagentResume(request)).toBeUndefined();
-          expect(request.params).toMatchObject({ sessionKey: targetKey });
-        }
-        expect(request.params).not.toHaveProperty("subagentResume");
-        expect(subagentRuns.get(previousRunId)).toMatchObject({
-          pauseReason,
-          requesterSessionKey: controller,
-          controllerSessionKey: controller,
-        });
-      } finally {
-        await mutateSubagentRuns([previousRunId, siblingRunId], (rows) => ({
-          value: undefined,
-          postimages: new Map([...rows.keys()].map((runId) => [runId, null])),
-        }));
-      }
-    },
-  );
-
-  it.each([{ timeoutSeconds: 1 }])(
-    "sessions_send resume rejects competing delivery options %j",
-    async (options) => {
-      const parent = "agent:main:main";
-      const tool = getSessionTool("sessions_send", { agentSessionKey: parent });
-      await expect(
-        withGatewayToolCallerIdentity(
-          {
-            agentId: "main",
-            sessionKey: parent,
-            operationalRunInstance: createOperationalRunInstanceRef("parent-options-turn"),
-            receiptAuthority: () => true,
-          },
-          () =>
-            tool.execute("resume-options", {
-              sessionKey: "agent:main:subagent:child",
-              message: "Continue",
+      return method === "agent.wait"
+        ? { status: "ok", terminalReply: { disposition: "empty" } }
+        : {};
+    });
+    const tool = getSessionTool("sessions_send", { agentSessionKey: parent });
+    try {
+      const result = await admitted("parent-turn", () =>
+        tool.execute("resume", { sessionKey: targetKey, message: "Continue", ...options }),
+      );
+      expect(result.details).toEqual(
+        resumes
+          ? {
+              status: "accepted",
               mode: "resume",
-              ...options,
-            }),
-        ),
-      ).rejects.toThrow("admission only");
-      expect(callGatewayMock).not.toHaveBeenCalled();
-    },
-  );
+              runId: "tool-resume-successor",
+              taskRunId: previousRunId,
+              sessionKey: targetKey,
+              completion: "task",
+            }
+          : {
+              status: "no_reply",
+              runId: "tool-resume-successor",
+              sessionKey: targetKey,
+              message: expect.any(String),
+            },
+      );
+      expect(Value.Check(tool.outputSchema!, result.details)).toBe(true);
+      const callsFor = (method: string) =>
+        callGatewayMock.mock.calls.filter(([request]) => request.method === method);
+      expect(callsFor("agent")).toHaveLength(1);
+      expect(callsFor("agent.wait")).toHaveLength(resumes ? 0 : 1);
+      const request = callsFor("agent")[0]?.[0];
+      if (resumes) {
+        expect(readInProcessSubagentResume(request)).toMatchObject({
+          previousRunId,
+          childSessionKey: targetKey,
+          childSessionId: "tool-resume-session",
+        });
+        expect(request.params).toMatchObject({
+          expectedExistingSessionId: "tool-resume-session",
+        });
+      } else {
+        expect(readInProcessSubagentResume(request)).toBeUndefined();
+        expect(request.params).toMatchObject({ sessionKey: targetKey });
+      }
+      expect(request.params).not.toHaveProperty("subagentResume");
+      expect(subagentRuns.get(previousRunId)).toMatchObject({
+        pauseReason,
+        requesterSessionKey: controller,
+        controllerSessionKey: controller,
+      });
+    } finally {
+      await mutateSubagentRuns([previousRunId, siblingRunId], (rows) => ({
+        value: undefined,
+        postimages: new Map([...rows.keys()].map((runId) => [runId, null])),
+      }));
+    }
+  });
+
+  it("sessions_send resume rejects competing delivery options", async () => {
+    const tool = getSessionTool("sessions_send", { agentSessionKey: parent });
+    await expect(
+      admitted("parent-options-turn", () =>
+        tool.execute("resume-options", {
+          sessionKey: "agent:main:subagent:child",
+          message: "Continue",
+          mode: "resume",
+          timeoutSeconds: 1,
+        }),
+      ),
+    ).rejects.toThrow("admission only");
+    expect(callGatewayMock).not.toHaveBeenCalled();
+  });
 }

@@ -60,6 +60,22 @@ const tempDirs = useAutoCleanupTempDirTracker((cleanup) =>
     cleanup();
   }),
 );
+const requesterKey = "agent:re-portal:main";
+function sendTool(testConfig: OpenClawConfig) {
+  return createSessionsSendTool({
+    agentSessionKey: requesterKey,
+    agentChannel: "telegram",
+    callGateway: callGatewayMock,
+    config: testConfig,
+  });
+}
+function userEntries(scope: Parameters<typeof SessionManager.open>[0], dir: string) {
+  return SessionManager.open(scope, dir)
+    .getEntries()
+    .flatMap((entry) =>
+      entry.type === "message" && entry.message.role === "user" ? [entry.message] : [],
+    );
+}
 registerAgentSessionLoopTestLifecycle();
 beforeEach(() => {
   resetGatewayWorkAdmission();
@@ -75,7 +91,6 @@ afterEach(() => {
 it.each(["missing", "different", "different account"] as const)(
   "explicit sessions_send steering refuses %s requester identity without starting other work",
   async (identity) => {
-    const requesterKey = "agent:re-portal:main";
     const targetKey = "agent:leasing-ops:dashboard:active-target";
     const dir = tempDirs.make("openclaw-sessions-requester-refusal-");
     const storePath = path.join(dir, "sessions.json");
@@ -93,12 +108,7 @@ it.each(["missing", "different", "different account"] as const)(
       requesterSessionKey: requesterKey,
     });
     const caller = createSessionsSendTestCaller(requesterKey);
-    const tool = createSessionsSendTool({
-      agentSessionKey: requesterKey,
-      agentChannel: "telegram",
-      callGateway: callGatewayMock,
-      config: testConfig,
-    });
+    const tool = sendTool(testConfig);
     const result = await withGatewayToolCallerIdentity(
       identity === "missing"
         ? undefined
@@ -129,28 +139,17 @@ it.each(["missing", "different", "different account"] as const)(
 );
 
 it.each([
-  {},
-  { mode: "steer" as const, alternateStore: true, refreshedDisplay: true },
-  { mode: "steer" as const, hiddenRun: true },
-])(
-  "sessions_send persists steered provenance with mode $mode, alternate store $alternateStore, hidden run $hiddenRun, refreshed display $refreshedDisplay",
-  async ({
-    mode,
-    alternateStore,
-    hiddenRun,
-    refreshedDisplay,
-  }: {
-    mode?: "steer";
-    alternateStore?: boolean;
-    hiddenRun?: boolean;
-    refreshedDisplay?: boolean;
-  }) => {
+  [undefined, false, false, false],
+  ["steer", true, false, true],
+  ["steer", false, true, false],
+] as const)(
+  "persists steering provenance: mode=%s alternateStore=%s hiddenRun=%s refreshedDisplay=%s",
+  async (mode, alternateStore, hiddenRun, refreshedDisplay) => {
     const runId = "hidden-sessions-send-steering-run";
     const runScopedCallerKey =
       mode === "steer"
         ? "agent:leasing-ops:dashboard:active-target"
         : "agent:leasing-ops:cron:monthly-utility:run:run-fast";
-    const requesterKey = "agent:re-portal:main";
     const dir = tempDirs.make("openclaw-sessions-steered-provenance-");
     const scope = {
       agentId: "leasing-ops",
@@ -250,12 +249,7 @@ it.each([
         return {};
       });
 
-      const tool = createSessionsSendTool({
-        callGateway: callGatewayMock,
-        agentSessionKey: requesterKey,
-        agentChannel: "telegram",
-        config: testConfig,
-      });
+      const tool = sendTool(testConfig);
 
       if (mode === "steer") {
         vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
@@ -286,11 +280,7 @@ it.each([
         vi.useRealTimers();
         expect((await send).details).toMatchObject({ status: "accepted" });
         expect(session.pendingMessageCount).toBe(1);
-        expect(
-          SessionManager.open(scope, dir)
-            .getEntries()
-            .filter((entry) => entry.type === "message" && entry.message.role === "user"),
-        ).toHaveLength(1);
+        expect(userEntries(scope, dir)).toHaveLength(1);
       }
       finishInitialResponse?.();
       const [result] = await Promise.all([send, prompt]);
@@ -304,23 +294,17 @@ it.each([
       expect(queueMessage).toHaveBeenCalledOnce();
       expect(queueMessage.mock.calls[0]?.[1]?.waitForTranscriptCommit).toBe(mode !== "steer");
       expect(queueMessage.mock.calls[0]?.[1]?.isInboundUserMessage).toBeUndefined();
-      const entries = SessionManager.open(scope, dir).getEntries();
-      expect(
-        entries.filter((entry) => entry.type === "message" && entry.message.role === "user"),
-      ).toHaveLength(2);
+      const entries = userEntries(scope, dir);
+      expect(entries).toHaveLength(2);
       expect(session.pendingMessageCount).toBe(0);
       expect(entries).toContainEqual(
         expect.objectContaining({
-          type: "message",
-          message: expect.objectContaining({
-            role: "user",
-            provenance: {
-              kind: "inter_session",
-              sourceSessionKey: requesterKey,
-              sourceChannel: "telegram",
-              sourceTool: "sessions_send",
-            },
-          }),
+          provenance: {
+            kind: "inter_session",
+            sourceSessionKey: requesterKey,
+            sourceChannel: "telegram",
+            sourceTool: "sessions_send",
+          },
         }),
       );
       expect(callGatewayMock.mock.calls.some(([request]) => request.method === "agent")).toBe(
