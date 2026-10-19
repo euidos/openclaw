@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../../test/helpers/promise.js";
 import { GatewayRequestError } from "../../api/gateway.ts";
 import { mountSolid } from "../../test-helpers/mount-solid.ts";
@@ -9,7 +9,9 @@ import {
   createBrowserPanelTestMetrics,
   createBrowserPanelTestTab,
   flushBrowserResponses as flush,
+  setupBrowserPanelTestCleanup,
   stubScreenshotMedia,
+  type BrowserRequestEnvelope,
 } from "./browser-panel-controller-test-support.ts";
 import "./browser-panel.ts";
 
@@ -46,32 +48,18 @@ function button(panel: HTMLElement, label: string) {
   return panel.querySelector<HTMLButtonElement>(`[aria-label="${label}"]`)!;
 }
 
-function setStageSize(panel: HTMLElementTagNameMap["openclaw-browser-panel"], size = 100) {
-  vi.spyOn(panel.querySelector(".bp-stage")!, "getBoundingClientRect").mockReturnValue(
-    new DOMRect(0, 0, size, size),
-  );
-}
-
 describe("Browser panel text and touch input", () => {
+  setupBrowserPanelTestCleanup();
   beforeEach(() => {
     vi.useFakeTimers();
     vi.stubGlobal("localStorage", createStorageMock());
   });
 
-  afterEach(() => {
-    document.body.replaceChildren();
-    vi.useRealTimers();
-    vi.unstubAllGlobals();
-    vi.restoreAllMocks();
-  });
-
-  async function mount(evaluateDisabled = false) {
+  async function mount({ evaluateDisabled = false, clickable = false } = {}) {
     stubScreenshotMedia();
-    // Only input RPCs are deferred by these tests; page setup and refresh still
-    // cross the actual Gateway request adapter and native panel lifecycle.
-    const request = vi.fn(async (_method: string, _params?: unknown): Promise<unknown> => ({
-      ok: true,
-    }));
+    const request = vi.fn(
+      async (_method: string, _params?: BrowserRequestEnvelope): Promise<unknown> => ({ ok: true }),
+    );
     const url = "https://example.test/page";
     const gateway = createBrowserClient(async (envelope) => {
       if (envelope.path === "/tabs") {
@@ -113,43 +101,45 @@ describe("Browser panel text and touch input", () => {
     mountSolid(() => panel);
     await waitForSolid(() => expect(panel.querySelector(".bp-shot")).not.toBeNull());
     const input = panel.querySelector<HTMLTextAreaElement>(".bp-input")!;
-    return { panel, request, input, actions: () => request.mock.calls.map(([, params]) => params) };
+    if (clickable) {
+      vi.spyOn(panel.querySelector(".bp-stage")!, "getBoundingClientRect").mockReturnValue(
+        new DOMRect(0, 0, 100, 100),
+      );
+    }
+    return { panel, request, input, actions: () => request.mock.calls.map(([, p]) => p?.body) };
   }
 
   it.each([
     { outcome: "accepted", text: "  hello 🦞\n世界 <b>text</b>\t  " },
     { outcome: "failed", text: "synthetic password" },
-  ])(
-    "consumes a remote paste and keeps its content out of $outcome errors",
-    async ({ outcome, text }) => {
-      const { panel, request } = await mount(true);
-      expect(button(panel, "Inspect element").disabled).toBe(true);
-      if (outcome === "failed") {
-        request.mockRejectedValueOnce(new Error(`Request failed: ${text}`));
-      }
-      const event = paste(text, ["text/plain", "text/html"]);
-      const bubbled = vi.fn();
-      panel.addEventListener("paste", bubbled);
-      panel.querySelector(".bp-viewport")!.dispatchEvent(event);
-      await flush();
+  ])("consumes paste and redacts $outcome errors", async ({ outcome, text }) => {
+    const { panel, request } = await mount({ evaluateDisabled: true });
+    expect(button(panel, "Inspect element").disabled).toBe(true);
+    if (outcome === "failed") {
+      request.mockRejectedValueOnce(new Error(`Request failed: ${text}`));
+    }
+    const event = paste(text, ["text/plain", "text/html"]);
+    const bubbled = vi.fn();
+    panel.addEventListener("paste", bubbled);
+    panel.querySelector(".bp-viewport")!.dispatchEvent(event);
+    await flush();
 
-      expect(event.defaultPrevented).toBe(true);
-      expect(bubbled).not.toHaveBeenCalled();
-      expect(request).toHaveBeenCalledExactlyOnceWith("browser.request", {
-        method: "POST",
-        path: "/act",
-        target: "node",
-        node: "browser-node",
-        query: { profile: "work" },
-        body: { kind: "insertText", targetId: "form-tab", text },
-      });
-      if (outcome === "failed") {
-        await panel.updateComplete;
-        expect(panel.querySelector('[role="alert"]')?.textContent).toContain("Could not paste");
-        expect(panel.textContent).not.toContain(text);
-      }
-    },
-  );
+    expect(event.defaultPrevented).toBe(true);
+    expect(bubbled).not.toHaveBeenCalled();
+    expect(request).toHaveBeenCalledExactlyOnceWith("browser.request", {
+      method: "POST",
+      path: "/act",
+      target: "node",
+      node: "browser-node",
+      query: { profile: "work" },
+      body: { kind: "insertText", targetId: "form-tab", text },
+    });
+    if (outcome === "failed") {
+      await panel.updateComplete;
+      expect(panel.querySelector('[role="alert"]')?.textContent).toContain("Could not paste");
+      expect(panel.textContent).not.toContain(text);
+    }
+  });
 
   it("forwards soft-keyboard text and editing without printable keydown events", async () => {
     const { input, actions } = await mount();
@@ -163,9 +153,9 @@ describe("Browser panel text and touch input", () => {
       await flush();
     }
     expect(actions()).toMatchObject([
-      { body: { kind: "insertText", targetId: "form-tab", text: "hello 🦞" } },
-      { body: { kind: "press", targetId: "form-tab", key: "Backspace" } },
-      { body: { kind: "press", targetId: "form-tab", key: "Enter" } },
+      { kind: "insertText", targetId: "form-tab", text: "hello 🦞" },
+      { kind: "press", targetId: "form-tab", key: "Backspace" },
+      { kind: "press", targetId: "form-tab", key: "Enter" },
     ]);
     expect(input.value).toBe("");
   });
@@ -184,44 +174,35 @@ describe("Browser panel text and touch input", () => {
     expect(panel.querySelector('[role="status"]')?.textContent).toContain("Edit the text directly");
   });
 
-  it.each(["committed", "route changed", "capture mode"])(
-    "sends composition once only to its original field (%s)",
-    async (outcome) => {
-      const { panel, request, input } = await mount();
-      input.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
-      key(input, { key: "a", isComposing: true });
-      input.value = "に";
-      sendInput(input, "input", "insertCompositionText", "に", { isComposing: true });
-      expect(input.value).toBe("に");
-      expect(request).not.toHaveBeenCalled();
-      if (outcome === "route changed") {
-        panel.sessionKey = "replacement-session";
-        panel.handleToggleRequest(
-          new CustomEvent("openclaw:browser-toggle", { detail: { open: false } }),
-        );
-      } else if (outcome === "capture mode") {
-        button(panel, "Annotate page").click();
-      }
-      input.value = "日本語";
-      input.dispatchEvent(
-        new CompositionEvent("compositionend", { data: "日本語", bubbles: true }),
+  it.each(["committed", "route changed", "capture mode"])("commits IME: %s", async (outcome) => {
+    const { panel, request, input, actions } = await mount();
+    input.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+    key(input, { key: "a", isComposing: true });
+    input.value = "に";
+    sendInput(input, "input", "insertCompositionText", "に", { isComposing: true });
+    expect(input.value).toBe("に");
+    expect(request).not.toHaveBeenCalled();
+    if (outcome === "route changed") {
+      panel.sessionKey = "replacement-session";
+      panel.handleToggleRequest(
+        new CustomEvent("openclaw:browser-toggle", { detail: { open: false } }),
       );
-      sendInput(input, "beforeinput", "insertFromComposition", "日本語");
-      sendInput(input, "input", "insertFromComposition", "日本語");
-      await flush();
-      expect(input.value).toBe("");
-      if (outcome === "committed") {
-        expect(request).toHaveBeenCalledExactlyOnceWith(
-          "browser.request",
-          expect.objectContaining({
-            body: { kind: "insertText", text: "日本語", targetId: "form-tab" },
-          }),
-        );
-      } else {
-        expect(request).not.toHaveBeenCalled();
-      }
-    },
-  );
+    } else if (outcome === "capture mode") {
+      button(panel, "Annotate page").click();
+    }
+    input.value = "日本語";
+    input.dispatchEvent(new CompositionEvent("compositionend", { data: "日本語", bubbles: true }));
+    sendInput(input, "beforeinput", "insertFromComposition", "日本語");
+    sendInput(input, "input", "insertFromComposition", "日本語");
+    await flush();
+    expect(input.value).toBe("");
+    if (outcome === "committed") {
+      expect(request.mock.calls[0]?.[0]).toBe("browser.request");
+      expect(actions()).toEqual([{ kind: "insertText", text: "日本語", targetId: "form-tab" }]);
+    } else {
+      expect(request).not.toHaveBeenCalled();
+    }
+  });
 
   it("uses input for uncancelable commits and preserves text/edit order across async requests", async () => {
     const { request, input, actions } = await mount();
@@ -237,22 +218,21 @@ describe("Browser panel text and touch input", () => {
     insert.resolve({ ok: true });
     await vi.advanceTimersByTimeAsync(0);
     expect(actions()).toMatchObject([
-      { body: { kind: "insertText", text: "hello" } },
-      { body: { kind: "press", key: "Backspace" } },
+      { kind: "insertText", text: "hello" },
+      { kind: "press", key: "Backspace" },
     ]);
   });
 
   it.each(["failure", "route change", "new click"])(
-    "waits for the remote click before pasting (%s)",
+    "paste waits for click: %s",
     async (outcome) => {
-      const { panel, request, input, actions } = await mount();
+      const { panel, request, input, actions } = await mount({ clickable: true });
       const click = createDeferred<unknown>();
       request.mockImplementationOnce(async () => click.promise);
-      setStageSize(panel);
       input.click();
       input.dispatchEvent(paste("for the clicked field"));
       expect(request).toHaveBeenCalledTimes(1);
-      expect(request.mock.calls[0]?.[1]).toMatchObject({ body: { kind: "clickCoords" } });
+      expect(actions()[0]).toMatchObject({ kind: "clickCoords" });
       if (outcome === "route change") {
         panel.sessionKey = "replacement-session";
         await panel.updateComplete;
@@ -266,56 +246,49 @@ describe("Browser panel text and touch input", () => {
         click.resolve({ ok: true });
       }
       await vi.advanceTimersByTimeAsync(0);
-      const insertions = request.mock.calls.filter(
-        ([, params]) => (params as { body?: { kind?: string } }).body?.kind === "insertText",
-      );
+      const insertions = actions().filter((body) => body?.kind === "insertText");
       expect(insertions).toHaveLength(outcome === "new click" ? 1 : 0);
       if (outcome === "new click") {
         expect(actions()).toMatchObject([
-          { body: { kind: "clickCoords" } },
-          { body: { kind: "insertText", text: "for the clicked field" } },
-          { body: { kind: "clickCoords" } },
+          { kind: "clickCoords" },
+          { kind: "insertText", text: "for the clicked field" },
+          { kind: "clickCoords" },
         ]);
       }
     },
   );
 
-  it.each([false, true])(
-    "keeps typing behind queued field clicks (pending text: %s)",
-    async (pendingText) => {
-      const { panel, request, input, actions } = await mount();
-      const precedingText = createDeferred<unknown>();
-      const firstClick = createDeferred<unknown>();
-      if (pendingText) {
-        request.mockImplementationOnce(async () => precedingText.promise);
-      }
-      request.mockImplementationOnce(async () => firstClick.promise);
-      setStageSize(panel);
-      if (pendingText) {
-        input.dispatchEvent(paste("previous field"));
-      }
-      input.click();
-      input.click();
-      key(input, { key: "a", cancelable: true });
-      expect(request).toHaveBeenCalledTimes(1);
-      precedingText.resolve({ ok: true });
-      await vi.advanceTimersByTimeAsync(0);
-      expect(request).toHaveBeenCalledTimes(pendingText ? 2 : 1);
-      firstClick.resolve({ ok: true });
-      await vi.advanceTimersByTimeAsync(0);
-      expect(actions()).toMatchObject([
-        ...(pendingText ? [{ body: { kind: "insertText", text: "previous field" } }] : []),
-        { body: { kind: "clickCoords" } },
-        { body: { kind: "clickCoords" } },
-        { body: { kind: "press", key: "a" } },
-      ]);
-    },
-  );
+  it.each([false, true])("queues clicks before typing (pending text: %s)", async (pendingText) => {
+    const { request, input, actions } = await mount({ clickable: true });
+    const precedingText = createDeferred<unknown>();
+    const firstClick = createDeferred<unknown>();
+    if (pendingText) {
+      request.mockImplementationOnce(async () => precedingText.promise);
+    }
+    request.mockImplementationOnce(async () => firstClick.promise);
+    if (pendingText) {
+      input.dispatchEvent(paste("previous field"));
+    }
+    input.click();
+    input.click();
+    key(input, { key: "a", cancelable: true });
+    expect(request).toHaveBeenCalledTimes(1);
+    precedingText.resolve({ ok: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(request).toHaveBeenCalledTimes(pendingText ? 2 : 1);
+    firstClick.resolve({ ok: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(actions()).toMatchObject([
+      ...(pendingText ? [{ kind: "insertText", text: "previous field" }] : []),
+      { kind: "clickCoords" },
+      { kind: "clickCoords" },
+      { kind: "press", key: "a" },
+    ]);
+  });
 
   it("requires a successful click after a settled focus failure before pasting", async () => {
-    const { panel, request, input } = await mount();
+    const { request, input, actions } = await mount({ clickable: true });
     request.mockRejectedValueOnce(new Error("Click failed"));
-    setStageSize(panel);
     input.click();
     await vi.advanceTimersByTimeAsync(0);
     input.dispatchEvent(paste("do not send to the previous field"));
@@ -327,9 +300,7 @@ describe("Browser panel text and touch input", () => {
     input.dispatchEvent(paste("correct field"));
     await vi.advanceTimersByTimeAsync(0);
     expect(request).toHaveBeenCalledTimes(3);
-    expect(request.mock.calls[2]?.[1]).toMatchObject({
-      body: { kind: "insertText", text: "correct field" },
-    });
+    expect(actions()[2]).toMatchObject({ kind: "insertText", text: "correct field" });
   });
 
   it.each(["empty", "files", "disconnected", "changing tab", "captured view"])(

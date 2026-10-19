@@ -12,17 +12,21 @@ import {
 import { screencastFrame } from "./browser-screencast-test-support.ts";
 
 const { setup: setupStream, sockets } = streamFixture(StartupSocket, true);
-const setup = (mint: Promise<unknown> = Promise.resolve(minted)) =>
-  setupStream(async (request) => (request.path === "/screencast" ? mint : undefined));
+async function setup(mint: Promise<unknown> = Promise.resolve(minted)) {
+  const state = setupStream(async (request) => (request.path === "/screencast" ? mint : undefined));
+  const pending = state.controller.refreshAll();
+  await flush();
+  return { ...state, pending };
+}
 
 describe("Browser panel stream startup lifetime", () => {
   it.each(["mint", "connecting", "progressing"] as const)(
     "waits through slow %s, then retires it before one bounded fallback",
     async (phase) => {
       const mint = createDeferred<unknown>();
-      const { controller, calls } = setup(phase === "connecting" ? undefined : mint.promise);
-      const pending = controller.refreshAll();
-      await flush();
+      const { controller, calls, pending } = await setup(
+        phase === "connecting" ? undefined : mint.promise,
+      );
       const socket = sockets[0];
       await vi.advanceTimersByTimeAsync(1501);
       expect(calls("/screenshot")).toHaveLength(0);
@@ -68,9 +72,7 @@ describe("Browser panel stream startup lifetime", () => {
 
   it("retires a mint immediately when its panel disconnects and ignores its late response", async () => {
     const mint = createDeferred<unknown>();
-    const { controller, calls } = setup(mint.promise);
-    const pending = controller.refreshAll();
-    await flush();
+    const { controller, calls, pending } = await setup(mint.promise);
     const signal = calls("/screencast")[0]?.[2]?.signal;
     controller.suspendView();
     await pending;
@@ -84,9 +86,7 @@ describe("Browser panel stream startup lifetime", () => {
   });
 
   it("retires a first frame whose decode stalls without publishing it over fallback", async () => {
-    const { controller, calls } = setup();
-    const pending = controller.refreshAll();
-    await flush();
+    const { controller, calls, pending } = await setup();
     const images = deferImages();
     sockets[0]!.receive(screencastFrame());
     await vi.advanceTimersByTimeAsync(29_999);
@@ -105,9 +105,7 @@ describe("Browser panel stream startup lifetime", () => {
   });
 
   it("keeps a usable static frame without a recurring frame watchdog", async () => {
-    const { controller, calls } = setup();
-    const pending = controller.refreshAll();
-    await flush();
+    const { controller, calls, pending } = await setup();
     sockets[0]!.open();
     sockets[0]!.receive(ready);
     sockets[0]!.receive(screencastFrame());
