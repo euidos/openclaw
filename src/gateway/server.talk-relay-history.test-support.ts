@@ -112,15 +112,25 @@ export async function runTalkRelayCloseHistory({
     relaySessionId: relay.relaySessionId,
     sessionTarget: target,
   });
-  try {
-    const ack = await rpc("talk.client.toolCall", {
+  const consult = (callId: string, consultArgs: Record<string, unknown>) =>
+    rpc("talk.client.toolCall", {
       sessionKey,
       relaySessionId: relay.relaySessionId,
       voiceSessionId: relay.relaySessionId,
-      callId: "close-held-relay-consult",
+      callId,
       name: REALTIME_VOICE_AGENT_CONSULT_TOOL_NAME,
-      args,
+      args: consultArgs,
     });
+  const writeVoice = async (text: string) => {
+    const owner = expectDefined(relaySessions.get(relay.relaySessionId), "live relay");
+    expect(enqueueRelayVoiceTranscript(owner, "assistant", text)).toBe(true);
+    await flushTalkRealtimeRelayVoiceWrites({
+      relaySessionId: relay.relaySessionId,
+      connId: connectionId,
+    });
+  };
+  try {
+    const ack = await consult("close-held-relay-consult", args);
     await Promise.race([
       modelStarted.promise,
       captureSessionControllerSettlement({
@@ -142,36 +152,19 @@ export async function runTalkRelayCloseHistory({
     if (pendingFollowUp) {
       modelStarted = createDeferred();
       releaseModel = createDeferred();
-      await rpc("talk.client.toolCall", {
-        sessionKey,
-        relaySessionId: relay.relaySessionId,
-        voiceSessionId: relay.relaySessionId,
-        callId: "pending-follow-up-consult",
-        name: REALTIME_VOICE_AGENT_CONSULT_TOOL_NAME,
-        args: { question: "Save the next requested note." },
+      await consult("pending-follow-up-consult", {
+        question: "Save the next requested note.",
       });
       await modelStarted.promise;
       expect(runEmbeddedAgent).toHaveBeenCalledTimes(2);
-      const owner = expectDefined(relaySessions.get(relay.relaySessionId), "live relay");
-      expect(enqueueRelayVoiceTranscript(owner, "assistant", "Let me check the next note.")).toBe(
-        true,
-      );
-      await flushTalkRealtimeRelayVoiceWrites({
-        relaySessionId: relay.relaySessionId,
-        connId: connectionId,
-      });
+      await writeVoice("Let me check the next note.");
       if (spokenReplacement) {
         releaseModel.resolve();
         await waitForDispatchEnd();
       }
     }
     if (spokenReplacement) {
-      const owner = expectDefined(relaySessions.get(relay.relaySessionId), "live relay");
-      expect(enqueueRelayVoiceTranscript(owner, "assistant", spokenAnswer)).toBe(true);
-      await flushTalkRealtimeRelayVoiceWrites({
-        relaySessionId: relay.relaySessionId,
-        connId: connectionId,
-      });
+      await writeVoice(spokenAnswer);
     }
     const transcriptBeforeClose = loadTranscriptEventsSync(scope());
     if (unknownAppendOutcome) {

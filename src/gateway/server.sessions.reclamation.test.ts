@@ -28,9 +28,10 @@ function countRows(
   database: ReturnType<typeof openOpenClawAgentDatabase>,
   table: string,
   sessionId: string,
+  column = "session_id",
 ): number {
   const row = database.db
-    .prepare(`SELECT count(*) AS count FROM ${table} WHERE session_id = ?`)
+    .prepare(`SELECT count(*) AS count FROM ${table} WHERE ${column} = ?`)
     .get(sessionId) as { count: number | bigint };
   return Number(row.count);
 }
@@ -153,25 +154,16 @@ test("sessions.delete reclaims a large session off the Gateway thread", async ()
     }
   };
   diagnostics.subscribe(recordReclamation);
-  let deleted: Awaited<
-    ReturnType<
-      typeof rpcReq<{
-        archived: string[];
-        deleted: boolean;
-        key: string;
-        ok: true;
-      }>
-    >
-  >;
-  try {
-    // The 200k-row fixture can take longer than the generic RPC helper's 10s
-    // wall-clock budget on slower CI hosts. Completed worker facts below
-    // protect the off-thread contract independently of host scheduling delays.
-    deleted = await rpcReq(ws, "sessions.delete", { key: SESSION_KEY }, 60_000);
-  } finally {
+  // Allow slow hosts; worker facts below independently prove off-thread execution.
+  const deleted = await rpcReq<{
+    archived: string[];
+    deleted: boolean;
+    key: string;
+    ok: true;
+  }>(ws, "sessions.delete", { key: SESSION_KEY }, 60_000).finally(() => {
     diagnostics.unsubscribe(recordReclamation);
     ws.close();
-  }
+  });
 
   const database = openDatabase(storePath);
   const archives = database.db
@@ -213,10 +205,9 @@ test("sessions.delete reclaims a large session off the Gateway thread", async ()
       expect(countRows(database, table, sessionId), `${sessionId}: ${table}`).toBe(expected);
     }
     if (sessionId !== HISTORICAL_SESSION_ID) {
-      const node = database.db
-        .prepare("SELECT count(*) AS count FROM session_nodes WHERE current_session_id = ?")
-        .get(sessionId) as { count: number | bigint };
-      expect(Number(node.count), sessionId).toBe(expected);
+      expect(countRows(database, "session_nodes", sessionId, "current_session_id"), sessionId).toBe(
+        expected,
+      );
     }
   }
   expect(archives).toHaveLength(2);

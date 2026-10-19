@@ -1,16 +1,11 @@
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { buildDeviceAuthPayload } from "../../packages/gateway-client/src/device-auth.js";
 import { validateTalkConfigResult } from "../../packages/gateway-protocol/src/index.js";
 import type { TalkConfigResult } from "../../packages/gateway-protocol/src/schema/channels.js";
 import { normalizeResolvedSecretInputString } from "../config/types.secrets.js";
-import {
-  loadOrCreateDeviceIdentity,
-  publicKeyRawBase64UrlFromPem,
-  signDevicePayload,
-} from "../infra/device-identity.js";
 import { withEnvAsync } from "../test-utils/env.js";
+import { createSignedDevice } from "./server.auth.test-helpers.js";
 import { withSpeechProviders } from "./talk/test-helpers.js";
 import {
   connectOk,
@@ -47,34 +42,18 @@ async function withConnection(scopes: string[], run: (ws: GatewaySocket) => Prom
     const nonce = await readConnectChallengeNonce(ws);
     expect(nonce).toBeTypeOf("string");
     expect(String(nonce).length).toBeGreaterThan(0);
-    const identity = loadOrCreateDeviceIdentity({
-      path: path.join(
+    const { device } = await createSignedDevice({
+      identityPath: path.join(
         os.tmpdir(),
         `openclaw-talk-config-device-${process.pid}-${deviceSeq++}.sqlite`,
       ),
-    });
-    const signedAt = Date.now();
-    const payload = buildDeviceAuthPayload({
-      deviceId: identity.deviceId,
       clientId: "test",
       clientMode: "test",
-      role: "operator",
       scopes,
-      signedAtMs: signedAt,
       token: "secret",
       nonce: String(nonce),
     });
-    await connectOk(ws, {
-      token: "secret",
-      scopes,
-      device: {
-        id: identity.deviceId,
-        publicKey: publicKeyRawBase64UrlFromPem(identity.publicKeyPem),
-        signature: signDevicePayload(identity.privateKeyPem, payload),
-        signedAt,
-        nonce: String(nonce),
-      },
-    });
+    await connectOk(ws, { token: "secret", scopes, device });
     await run(ws);
   } finally {
     ws.close();

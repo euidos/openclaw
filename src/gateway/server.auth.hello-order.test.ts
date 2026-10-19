@@ -89,6 +89,13 @@ function presenceReasons(frames: ObservedFrame[], instanceId: string) {
     .map((entry) => entry.reason);
 }
 
+function waitForPresence(socket: WebSocket, matches: (entry: SystemPresence) => boolean) {
+  return onceMessage<ObservedFrame>(
+    socket,
+    (frame) => frame.event === "presence" && frame.payload?.presence?.some(matches) === true,
+  );
+}
+
 describe("Gateway hello publication", () => {
   test("publishes an HTTP node replacing an undelivered WebSocket presence row", async () => {
     await configureAuth();
@@ -105,11 +112,9 @@ describe("Gateway hello publication", () => {
           { connectionId: "undelivered-ws", deviceId: identity.deviceId, reason: "connect" },
           { pending: true },
         );
-        const published = onceMessage<ObservedFrame>(
+        const published = waitForPresence(
           reader.socket,
-          (frame) =>
-            frame.event === "presence" &&
-            frame.payload?.presence?.some((entry) => entry.deviceId === identity.deviceId) === true,
+          (row) => row.deviceId === identity.deviceId,
         );
         const response = await connectWatchNode({
           baseUrl: `http://127.0.0.1:${port}/api/nodes/watch`,
@@ -135,13 +140,9 @@ describe("Gateway hello publication", () => {
       const joining = await openBrowser(port, "joining-browser");
       try {
         expect((await reader.connect()).ok).toBe(true);
-        const notified = onceMessage<ObservedFrame>(
+        const notified = waitForPresence(
           reader.socket,
-          (frame) =>
-            frame.event === "presence" &&
-            frame.payload?.presence?.some(
-              (entry) => entry.instanceId === "joining-browser" && entry.reason === "connect",
-            ) === true,
+          (entry) => entry.instanceId === "joining-browser" && entry.reason === "connect",
         );
         const [result] = await Promise.all([joining.connect(), notified]);
         expect(result.ok, JSON.stringify(result.error)).toBe(true);
@@ -196,13 +197,9 @@ describe("Gateway hello publication", () => {
           });
           try {
             const closed = once(joining.socket, "close");
-            const disconnected = onceMessage<ObservedFrame>(
+            const disconnected = waitForPresence(
               reader.socket,
-              (frame) =>
-                frame.event === "presence" &&
-                frame.payload?.presence?.some(
-                  (entry) => entry.instanceId === failedInstanceId && entry.reason === "disconnect",
-                ) === true,
+              (entry) => entry.instanceId === failedInstanceId && entry.reason === "disconnect",
             );
             await Promise.all([
               expect(joining.connect()).rejects.toThrow(/closed/),
@@ -211,13 +208,9 @@ describe("Gateway hello publication", () => {
               (async () => {
                 const failHello = await pendingHello.promise;
                 try {
-                  const published = onceMessage<ObservedFrame>(
+                  const published = waitForPresence(
                     reader.socket,
-                    (frame) =>
-                      frame.event === "presence" &&
-                      frame.payload?.presence?.some(
-                        (entry) => entry.instanceId === "presence-publisher",
-                      ) === true,
+                    (entry) => entry.instanceId === "presence-publisher",
                   );
                   const [result] = await Promise.all([publisher.connect(), published]);
                   expect(result.ok).toBe(true);
