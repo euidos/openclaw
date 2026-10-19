@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { safeParseJsonRecord } from "@openclaw/normalization-core/json-coercion";
+import { raceWithTimeout } from "@openclaw/retry";
 import {
   getAgentRunContext,
   hasAgentRunContextExecutionOwner,
@@ -30,6 +31,7 @@ import { recordAgentCleanupFailure } from "./run-cleanup-timeout.js";
 // Gateway shutdown preparation and CLI command imports load this before turns.
 // The process-owned sweep must not retain its first requesting turn.
 const runInMcpManagerContext = AsyncLocalStorage.snapshot();
+const CAPACITY_CLEANUP_WAIT_MS = 5_000;
 
 export type SessionMcpConfigPublication = SessionMcpConfigReload & { pluginGeneration: number };
 
@@ -39,6 +41,17 @@ type AdvertisedScopedCatalogEntry = {
   toolsByServer: Map<string, McpCatalogTool[]>;
   signaturesByServer: Map<string, string>;
 };
+
+type StaticCatalogBinding = {
+  sessionId: string;
+  sessionKey?: string;
+  agentId?: string;
+  workspaceDir: string;
+  agentDir?: string;
+  configFingerprint: string;
+};
+
+type StaticCatalogEntry = StaticCatalogBinding & { catalog: McpToolCatalog | null };
 
 type RuntimeDisposalReceipt = {
   pending: Set<Promise<void>>;
@@ -55,6 +68,7 @@ type SessionMcpRuntimeManagerStore = {
   requiredRetirementSessionIds: Set<string>;
   connectionMetaByRuntimeKey: Map<string, { connectionHash: string; resolvedAt: number }>;
   advertisedScopedCatalogBySessionId: Map<string, AdvertisedScopedCatalogEntry>;
+  staticCatalogBySessionId: Map<string, StaticCatalogEntry>;
   runtimeWorkChains: Map<string, Promise<unknown>>;
   disposalInFlight?: Promise<void>;
   pendingDisposals: Map<string, RuntimeDisposalReceipt>;
@@ -121,6 +135,7 @@ export function createSessionMcpRuntimeManagerLifecycle(
      * Codex threads rotate (dynamicToolsFingerprint churn).
      */
     advertisedScopedCatalogBySessionId: new Map(),
+    staticCatalogBySessionId: new Map(),
     /**
      * Per-runtimeKey serialization for acquisition and dispose.
      * Sections never overlap for one key, so a slow resolve cannot clobber a newer install.
@@ -152,6 +167,7 @@ export function createSessionMcpRuntimeManagerLifecycle(
     if (!hasServers || store.liveRuntimeSlots.has(slot)) {
       return slot;
     }
+    const cleanupDeadline = Date.now() + CAPACITY_CLEANUP_WAIT_MS;
     while (store.liveRuntimeSlots.size >= SESSION_MCP_MAX_LIVE_RUNTIMES) {
       const idle = [...store.runtimesBySessionId]
         .filter(([key, runtime]) => {
@@ -163,12 +179,21 @@ export function createSessionMcpRuntimeManagerLifecycle(
           );
         })
         .toSorted(([, a], [, b]) => a.lastUsedAt - b.lastUsedAt)[0];
-      if (!idle) {
+      const remainingMs = cleanupDeadline - Date.now();
+      if (!idle || remainingMs <= 0) {
         throw capacityRefusal();
       }
       // Unpublish before yielding; successors reconnect under their own key queue.
-      // The slot stays occupied until disposal confirms physical closure.
-      await retireIdleRuntimes([{ runtimeKey: idle[0], runtime: idle[1] }]);
+      // Admission bounds waiting; tracked disposal keeps its slot until physical closure.
+      const settled = await raceWithTimeout(
+        retireIdleRuntimes([{ runtimeKey: idle[0], runtime: idle[1] }]).then(() => true),
+        remainingMs,
+        () => false,
+        { ref: false },
+      );
+      if (!settled) {
+        throw capacityRefusal();
+      }
     }
     capacityNoticeActive = false;
     store.liveRuntimeSlots.add(slot);
@@ -262,6 +287,10 @@ export function createSessionMcpRuntimeManagerLifecycle(
     return disposal;
   };
   const forgetSessionKeysForSessionId = (sessionId: string) => {
+    if (store.staticCatalogBySessionId.get(sessionId)?.catalog) {
+      return;
+    }
+    store.staticCatalogBySessionId.delete(sessionId);
     for (const [sessionKey, mappedSessionId] of store.sessionIdBySessionKey.entries()) {
       if (mappedSessionId === sessionId) {
         store.sessionIdBySessionKey.delete(sessionKey);
@@ -427,6 +456,7 @@ export function createSessionMcpRuntimeManagerLifecycle(
       preserveRequiredRetirement?: boolean;
       requireStoppedScheduler?: boolean;
       expectedRuntimes?: ReadonlyMap<string, SessionMcpRuntime>;
+      expectedStaticCatalog?: StaticCatalogEntry;
       preserveActiveLeases?: boolean;
       assertCurrent?: () => void;
       agentDeletion?: {
@@ -458,6 +488,13 @@ export function createSessionMcpRuntimeManagerLifecycle(
       opts?.assertCurrent?.();
       const expectedRuntimes = opts?.expectedRuntimes;
       if (
+        opts?.expectedStaticCatalog &&
+        (sessionId === undefined ||
+          store.staticCatalogBySessionId.get(sessionId) !== opts.expectedStaticCatalog)
+      ) {
+        return;
+      }
+      if (
         expectedRuntimes &&
         ([...expectedRuntimes].some(
           ([key, runtime]) => store.runtimesBySessionId.get(key) !== runtime,
@@ -481,6 +518,10 @@ export function createSessionMcpRuntimeManagerLifecycle(
       const deletion = opts?.agentDeletion;
       if (deletion) {
         deletion.assertCurrent();
+        const staticCatalog = store.staticCatalogBySessionId.get(sessionId ?? "");
+        if (staticCatalog && staticCatalog.agentId !== deletion.agentId) {
+          return;
+        }
         const failed = store.pendingDisposals.get(sessionId ?? "");
         if (failed?.failure && failed.agentId === deletion.agentId) {
           throw failed.failure.reason;
@@ -516,12 +557,14 @@ export function createSessionMcpRuntimeManagerLifecycle(
         store.deferredRetirementSessionIds.clear();
         store.requiredRetirementSessionIds.clear();
         store.advertisedScopedCatalogBySessionId.clear();
+        store.staticCatalogBySessionId.clear();
       } else {
         store.deferredRetirementSessionIds.delete(sessionId);
         if (opts?.preserveRequiredRetirement !== true) {
           store.requiredRetirementSessionIds.delete(sessionId);
         }
         store.advertisedScopedCatalogBySessionId.delete(sessionId);
+        store.staticCatalogBySessionId.delete(sessionId);
       }
       const outcomes = await Promise.allSettled([
         ...previousDisposals,
@@ -563,6 +606,47 @@ export function createSessionMcpRuntimeManagerLifecycle(
         store.disposalInFlight = undefined;
       }
     });
+  };
+
+  const reconcileStaticCatalog = (binding: StaticCatalogBinding): void => {
+    const current = store.staticCatalogBySessionId.get(binding.sessionId);
+    if (
+      current &&
+      (current.configFingerprint !== binding.configFingerprint ||
+        current.workspaceDir !== binding.workspaceDir ||
+        current.agentDir !== binding.agentDir ||
+        current.agentId !== binding.agentId ||
+        current.sessionKey !== binding.sessionKey)
+    ) {
+      store.staticCatalogBySessionId.delete(binding.sessionId);
+    }
+  };
+
+  const observedStaticRuntimes = new WeakSet<SessionMcpRuntime>();
+  const observeStaticCatalog = (runtime: SessionMcpRuntime, binding: StaticCatalogBinding) => {
+    reconcileStaticCatalog(binding);
+    if (!store.staticCatalogBySessionId.has(binding.sessionId)) {
+      store.staticCatalogBySessionId.set(binding.sessionId, { ...binding, catalog: null });
+    }
+    if (observedStaticRuntimes.has(runtime)) {
+      return;
+    }
+    observedStaticRuntimes.add(runtime);
+    const getCatalog = runtime.getCatalog.bind(runtime);
+    runtime.getCatalog = async () => {
+      const publication = store.staticCatalogBySessionId.get(runtime.sessionId);
+      const catalog = await getCatalog();
+      // Retain schemas across eviction, never late results from a replaced/reset owner.
+      if (
+        publication &&
+        store.staticCatalogBySessionId.get(runtime.sessionId) === publication &&
+        store.runtimesBySessionId.get(runtime.sessionId) === runtime &&
+        sessionMcpRuntimeOwners.get(runtime)?.isCurrent() !== false
+      ) {
+        publication.catalog = catalog;
+      }
+      return catalog;
+    };
   };
 
   const rememberAdvertisedScopedCatalog = (
@@ -646,6 +730,8 @@ export function createSessionMcpRuntimeManagerLifecycle(
     ensureIdleSweepTimer,
     disposeRuntimeKeyNow,
     disposeManagedRuntimes,
+    reconcileStaticCatalog,
+    observeStaticCatalog,
     rememberAdvertisedScopedCatalog,
     getAdvertisedScopedCatalog,
     reconcileAdvertisedScopedCatalogConfig,

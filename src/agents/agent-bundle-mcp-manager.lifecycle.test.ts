@@ -30,6 +30,7 @@ import {
 import type {
   RequesterScopedMcpRuntimeHandle,
   SessionMcpRuntime,
+  SessionMcpRuntimeLease,
 } from "./agent-bundle-mcp-types.js";
 import { createMcpProofPluginRegistry } from "./mcp-connection-resolver.test-fixtures.js";
 import { createAgentCleanupScope } from "./run-cleanup-timeout.js";
@@ -291,6 +292,52 @@ describe("MCP manager creation ownership", () => {
       stop();
       releaseAgentRunContext("mcp-overflow", overflowClaim);
       leases.forEach((lease) => lease.releaseLease());
+    }
+  });
+
+  it("bounds capacity cleanup waiting across consecutive idle owners", async () => {
+    const factory = vi.fn<CreateSessionMcpRuntime>(createRuntimeFixture);
+    const manager = createManager(factory);
+    const cfg = { mcp: { servers: { fixture: { command: "true" } } } };
+    const first = await manager.getOrCreate({ ...params, sessionId: "slow-first", cfg });
+    const second = await manager.getOrCreate({ ...params, sessionId: "slow-second", cfg });
+    const firstClosing = holdDisposal(first);
+    const secondClosing = holdDisposal(second);
+    first.joinCleanup = async () => {
+      throw new Error("first cleanup could not confirm closure");
+    };
+    const leases: SessionMcpRuntimeLease[] = [];
+    for (let index = 0; index < 254; index += 1) {
+      leases.push(await manager.acquire({ ...params, sessionId: `busy-${index}`, cfg }));
+    }
+    let fallback: SessionMcpRuntimeLease | undefined;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const admission = manager.acquire({ ...params, sessionId: "overflow", cfg }).then((lease) => {
+      fallback = lease;
+    });
+    try {
+      await firstClosing.started;
+      setTimeout(firstClosing.release, 3_000);
+      await vi.advanceTimersByTimeAsync(3_000);
+      await secondClosing.started;
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(fallback, "admission must not wait for a second full cleanup deadline").toBeDefined();
+      expect((await fallback!.runtime.getCatalog()).diagnostics?.[0]?.message).toContain(
+        "This turn will continue without MCP tools",
+      );
+      expect(factory).toHaveBeenCalledTimes(256);
+
+      secondClosing.release();
+      await manager.disposeSession("slow-second");
+      leases.push(await manager.acquire({ ...params, sessionId: "after-cleanup", cfg }));
+      expect(factory).toHaveBeenCalledTimes(257);
+    } finally {
+      firstClosing.release();
+      secondClosing.release();
+      await Promise.allSettled([admission]);
+      fallback?.releaseLease();
+      leases.forEach((lease) => lease.releaseLease());
+      vi.useRealTimers();
     }
   });
 

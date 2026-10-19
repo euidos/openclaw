@@ -1,4 +1,5 @@
 import type { BundleMcpServerConfig } from "../plugins/bundle-mcp.types.js";
+import { parseAgentSessionKey } from "../routing/session-key.js";
 import type {
   SessionMcpConfigPublication,
   SessionMcpRuntimeManagerLifecycle,
@@ -96,6 +97,20 @@ export function createSessionMcpRuntimeManagerInstall(
     );
     const hasServers = Object.keys(config.loaded.mcpServers).length > 0;
     const { runtimeKey, configReloadAtAdmission, ...runtimeParams } = params;
+    const staticBinding =
+      runtimeKey === params.sessionId && !params.requesterScope
+        ? {
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            agentId: params.agentId ?? parseAgentSessionKey(params.sessionKey ?? "")?.agentId,
+            workspaceDir: params.workspaceDir,
+            agentDir: params.agentDir,
+            configFingerprint: nextFingerprint,
+          }
+        : undefined;
+    if (staticBinding) {
+      lifecycle.reconcileStaticCatalog(staticBinding);
+    }
     const existing = store.runtimesBySessionId.get(runtimeKey);
     const connectionMatches =
       !params.connectionOverrides ||
@@ -103,6 +118,9 @@ export function createSessionMcpRuntimeManagerInstall(
         hashMcpResolvedConnections(params.connectionOverrides);
     if (existing && connectionMatches && matchesRuntime(existing, params, nextFingerprint)) {
       reconcileReusableRetirement(params, existing);
+      if (staticBinding && hasServers) {
+        lifecycle.observeStaticCatalog(existing, staticBinding);
+      }
       existing.markUsed();
       return existing;
     }
@@ -145,6 +163,9 @@ export function createSessionMcpRuntimeManagerInstall(
         await lifecycle.releaseEmptyRuntimeSlot(runtimeKey, runtime);
       }
       reconcileReusableRetirement(params, runtime);
+      if (staticBinding && hasServers) {
+        lifecycle.observeStaticCatalog(runtime, staticBinding);
+      }
       runtime.markUsed();
       return runtime;
     } catch (error) {

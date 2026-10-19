@@ -22,6 +22,7 @@ import {
   type CreateSessionMcpRuntime,
 } from "./agent-bundle-mcp-runtime-shared.js";
 import type {
+  McpToolCatalog,
   SessionMcpRuntime,
   SessionMcpRuntimeLease,
   SessionMcpRuntimeManager,
@@ -125,6 +126,7 @@ export function createSessionMcpRuntimeManager(opts: SessionMcpRuntimeManagerOpt
   const withoutMcp = (
     params: RuntimeAcquisitionParams,
     error: SessionMcpRuntimeCapacityError,
+    rememberedCatalog?: McpToolCatalog | null,
   ): SessionMcpRuntimeLease => {
     if (error.notify && params.sessionKey) {
       for (const run of listAgentRunsForSession({
@@ -143,12 +145,14 @@ export function createSessionMcpRuntimeManager(opts: SessionMcpRuntimeManagerOpt
       }
     }
     const runtime = createCombinedSessionMcpRuntime({ ...params, parts: [] });
-    const catalog = {
+    const catalog: McpToolCatalog = {
       version: 1,
       generatedAt: 0,
       servers: {},
       tools: [],
+      ...rememberedCatalog,
       diagnostics: [
+        ...(rememberedCatalog?.diagnostics ?? []),
         {
           serverName: "Gateway",
           safeServerName: "gateway",
@@ -159,6 +163,19 @@ export function createSessionMcpRuntimeManager(opts: SessionMcpRuntimeManagerOpt
     };
     runtime.getCatalog = async () => catalog;
     runtime.peekCatalog = () => catalog;
+    runtime.callTool = async () => ({
+      isError: true,
+      content: [{ type: "text", text: error.message }],
+    });
+    const unavailable = async () => {
+      throw new Error(error.message);
+    };
+    runtime.listTools = unavailable;
+    runtime.listResources = unavailable;
+    runtime.readResource = unavailable;
+    runtime.listResourceTemplates = unavailable;
+    runtime.listPrompts = unavailable;
+    runtime.getPrompt = unavailable;
     return leaseRuntime(runtime, params.sessionId);
   };
   const prepareAcquisition = (
@@ -247,22 +264,47 @@ export function createSessionMcpRuntimeManager(opts: SessionMcpRuntimeManagerOpt
 
         const leases: SessionMcpRuntimeLease[] = [];
         try {
-          const staticLease = leaseRuntime(
-            await install.getOrCreateRuntimeEntry({
-              ...params,
-              runtimeKey: params.sessionId,
-              configReloadAtAdmission,
-              excludeServerNames: new Set(requesterScopedServerNames),
-              safeServerNamesByServer,
-            }),
-            params.sessionId,
-          );
+          let staticLease: SessionMcpRuntimeLease;
+          try {
+            staticLease = leaseRuntime(
+              await install.getOrCreateRuntimeEntry({
+                ...params,
+                runtimeKey: params.sessionId,
+                configReloadAtAdmission,
+                excludeServerNames: new Set(requesterScopedServerNames),
+                safeServerNamesByServer,
+              }),
+              params.sessionId,
+            );
+          } catch (error) {
+            if (!(error instanceof SessionMcpRuntimeCapacityError)) {
+              throw error;
+            }
+            staticLease = withoutMcp(
+              params,
+              error,
+              store.staticCatalogBySessionId.get(params.sessionId)?.catalog,
+            );
+          }
           leases.push(staticLease);
           if (requesterScopedServerNames.length === 0) {
             return staticLease;
           }
           const parts = Object.keys(staticServers).length > 0 ? [staticLease.runtime] : [];
-          const requesterLease = requester ? await acquireRequester() : undefined;
+          let requesterLease: SessionMcpRuntimeLease | undefined;
+          try {
+            requesterLease = requester ? await acquireRequester() : undefined;
+          } catch (error) {
+            if (!(error instanceof SessionMcpRuntimeCapacityError) || !requester) {
+              throw error;
+            }
+            requesterLease = withoutMcp(params, error);
+            requesterLease.runtime.requesterScope = {
+              requesterSenderId: requester.senderId,
+              ...(params.agentAccountId ? { agentAccountId: params.agentAccountId } : {}),
+              ...(params.messageChannel ? { messageChannel: params.messageChannel } : {}),
+            };
+          }
           if (requesterLease) {
             leases.push(requesterLease);
             parts.push(requesterLease.runtime);
@@ -359,13 +401,14 @@ export function createSessionMcpRuntimeManager(opts: SessionMcpRuntimeManagerOpt
         return undefined;
       }
       const expectedRuntimes = new Map<string, SessionMcpRuntime>();
+      const expectedStaticCatalog = store.staticCatalogBySessionId.get(sessionId);
       for (const key of lifecycle.runtimeKeysForSessionId(sessionId)) {
         const runtime = store.runtimesBySessionId.get(key);
         if (runtime) {
           expectedRuntimes.set(key, runtime);
         }
       }
-      if (expectedRuntimes.size === 0) {
+      if (expectedRuntimes.size === 0 && !expectedStaticCatalog) {
         return undefined;
       }
       return {
@@ -373,6 +416,7 @@ export function createSessionMcpRuntimeManager(opts: SessionMcpRuntimeManagerOpt
         retire: (assertCurrent: () => void) =>
           lifecycle.disposeManagedRuntimes(sessionId, {
             expectedRuntimes,
+            expectedStaticCatalog,
             assertCurrent,
             preserveActiveLeases: true,
             preserveRequiredRetirement: store.requiredRetirementSessionIds.has(sessionId),
@@ -450,6 +494,7 @@ export function createSessionMcpRuntimeManager(opts: SessionMcpRuntimeManagerOpt
           (store.configReload?.pluginGeneration ?? 0) + (reload.reloadPlugins ? 1 : 0),
       };
       store.advertisedScopedCatalogBySessionId.clear();
+      store.staticCatalogBySessionId.clear();
       for (const runtime of store.runtimesBySessionId.values()) {
         const slot = store.runtimeSlots.get(runtime);
         if (slot) {
@@ -503,6 +548,9 @@ export function createSessionMcpRuntimeManager(opts: SessionMcpRuntimeManagerOpt
           ),
           ...[...store.pendingDisposals].flatMap(([sessionId, receipt]) =>
             receipt.agentId === agentId ? [sessionId] : [],
+          ),
+          ...[...store.staticCatalogBySessionId].flatMap(([sessionId, entry]) =>
+            entry.agentId === agentId ? [sessionId] : [],
           ),
         ]),
       ];
