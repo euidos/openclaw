@@ -385,6 +385,7 @@ export function ApplicationShell(props: { host: ShellViewHost }): SolidJSX.Eleme
           prop:homeAvailable={view().homePanelAvailable && !view().nativeEmbed}
           prop:custodianSuppressed={view().activeRoute === "custodian"}
           prop:pageSessionKey={(props.host.shellRevision(), props.host.activeSessionKey)}
+          prop:getPrimaryChatPane={view().callbacks.getPrimaryChatPane}
           prop:pageAgentId={view().selectedAgentId}
           prop:pageRouteId={view().activeRoute}
           prop:pageRouteFailed={
