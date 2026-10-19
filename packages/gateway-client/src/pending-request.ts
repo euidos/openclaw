@@ -39,6 +39,7 @@ type GatewayPendingRequest = {
   startedAtMs: number;
   resend?: () => void;
   retryStartup?: (retryAfterMs?: number) => void;
+  prepareRetry: () => boolean;
   waitingForResume?: boolean;
 };
 
@@ -158,6 +159,7 @@ export class GatewayPendingRequests {
       let timeout: ReturnType<typeof setTimeout> | undefined;
       let startupRetry: ReturnType<typeof setTimeout> | undefined;
       let requestSent = false;
+      let inFlight = false;
       const pending: GatewayPendingRequest = {
         resolve: (value) => resolve(value as T),
         reject,
@@ -167,6 +169,14 @@ export class GatewayPendingRequests {
         unbounded: timeoutMs === undefined,
         method,
         startedAtMs: this.opts.nowMs(),
+        prepareRetry: () => {
+          inFlight = false;
+          if (options?.signal?.aborted) {
+            onAbort();
+            return false;
+          }
+          return true;
+        },
       };
       const cleanup = () => {
         clearTimeout(startupRetry);
@@ -189,6 +199,9 @@ export class GatewayPendingRequests {
         return true;
       };
       const onAbort = () => {
+        if (options?.retainSentResultOnAbort && inFlight) {
+          return;
+        }
         if (!retire("CLIENT_ABORTED")) {
           return;
         }
@@ -242,6 +255,7 @@ export class GatewayPendingRequests {
             return;
           }
           try {
+            inFlight = true;
             sender.send(frame);
             if (this.pending.get(id) !== pending) {
               return;
@@ -304,7 +318,9 @@ export class GatewayPendingRequests {
       "method" in startupDetails &&
       startupDetails.method === pending.method;
     if (startupRefusal && !pending.acceptedNotified) {
-      pending.retryStartup?.(frame.error?.retryAfterMs);
+      if (pending.prepareRetry()) {
+        pending.retryStartup?.(frame.error?.retryAfterMs);
+      }
       return;
     }
     if (
@@ -316,6 +332,9 @@ export class GatewayPendingRequests {
       (isGatewaySuspendUnavailableError(frame.error) ||
         isGatewayRestartUnavailableError(frame.error))
     ) {
+      if (!pending.prepareRetry()) {
+        return;
+      }
       // The admission fence refused execution. Keep the original deadline and cancellation.
       if (this.bootstrapPause?.probe?.pending === pending) {
         this.bootstrapPause.probe = undefined;

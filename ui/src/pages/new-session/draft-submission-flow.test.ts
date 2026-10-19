@@ -40,15 +40,6 @@ async function readyChatRoute() {
 }
 
 describe("DraftSubmissionFlow", () => {
-  it("cancels before loading the creation handoff can start a write", async () => {
-    const { context, flow } = createDraftFixture();
-    flow.setMessage("Start a conversation");
-    const submission = flow.submit();
-    flow.disconnect();
-    await submission;
-    expect(context.sessions.createResult).not.toHaveBeenCalled();
-  });
-
   it.each([
     { waitMs: 45_000, cancel: false },
     { waitMs: 240_000, cancel: false },
@@ -188,7 +179,11 @@ describe("DraftSubmissionFlow", () => {
             model: "openai/gpt-5.6-sol",
             agentRuntime: "codex",
           }),
-          { reconciliation: "background", signal: expect.any(AbortSignal) },
+          {
+            reconciliation: "background",
+            signal: expect.any(AbortSignal),
+            retainSentResultOnAbort: true,
+          },
         );
         if (storage === "available") {
           expect(context.placementStartup.start).toHaveBeenCalledOnce();
@@ -469,7 +464,11 @@ describe("DraftSubmissionFlow", () => {
         message: "@Alex start this in the background",
         mentions: [{ profileId: "profile-alex", start: 0, end: 5 }],
       }),
-      { reconciliation: "background", signal: expect.any(AbortSignal) },
+      {
+        reconciliation: "background",
+        signal: expect.any(AbortSignal),
+        retainSentResultOnAbort: true,
+      },
     );
     expect(context.navigateAndWait).not.toHaveBeenCalled();
     expect(request).toHaveBeenCalledWith(
@@ -581,7 +580,6 @@ describe("DraftSubmissionFlow", () => {
       }
 
       flow.resumeInterruptedSubmission();
-      await vi.dynamicImportSettled();
 
       if (expired) {
         expect(flow.submissionOutcomeUnknown).toBe("gateway-changed");
@@ -788,7 +786,11 @@ describe("DraftSubmissionFlow", () => {
         projectGitUrl: "https://github.com/openclaw/openclaw.git",
         attachments: [expect.objectContaining({ fileName: "note.txt", mimeType: "text/plain" })],
       }),
-      { reconciliation: "background", signal: expect.any(AbortSignal) },
+      {
+        reconciliation: "background",
+        signal: expect.any(AbortSignal),
+        retainSentResultOnAbort: true,
+      },
     );
     expect(request).not.toHaveBeenCalledWith("projects.add", expect.anything(), expect.anything());
     expect(vi.mocked(context.sessions.createResult).mock.calls[0]?.[0]?.worktree).toBe(

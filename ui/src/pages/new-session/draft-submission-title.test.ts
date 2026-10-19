@@ -121,7 +121,11 @@ it("keeps a title handoff on the selected draft account before update", async ()
     expect.objectContaining({
       model: `test/primary@${accounts[1].authProfileId}`,
     }),
-    { reconciliation: "background", signal: expect.any(AbortSignal) },
+    {
+      reconciliation: "background",
+      signal: expect.any(AbortSignal),
+      retainSentResultOnAbort: true,
+    },
   );
   expect(createdParams(context)).not.toHaveProperty("displayName");
 });
@@ -191,7 +195,11 @@ it.each(["explicit worktree", "pending", "incognito", "retry", "stale"] as const
           displayName: "Repair naming",
           worktreeName: "my-explicit-branch",
         }),
-        { reconciliation: "background", signal: expect.any(AbortSignal) },
+        {
+          reconciliation: "background",
+          signal: expect.any(AbortSignal),
+          retainSentResultOnAbort: true,
+        },
       );
     } else if (state === "retry") {
       await flow.submit();

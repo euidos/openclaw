@@ -36,6 +36,7 @@ import type {
   DraftSubmissionSnapshot,
 } from "./draft-submission-contract.ts";
 import { prepareDraftSubmission } from "./draft-submission-input.ts";
+import { completeInitialSessionTurn } from "./initial-session-turn-handoff.ts";
 import {
   type InstantThreadHandoff,
   prepareInstantThreadHandoff,
@@ -431,8 +432,7 @@ export class DraftSubmissionFlow {
     const preparedTitle = this.callbacks.takePreparedTitle?.();
     const requestSignal = this.captureSubmitRequest();
     const submittedDraft = this.draftPersistence.captureSubmission();
-    const { turn } = input;
-    const submittedMessage = this.startedSession.messageForTurn(context, this.place.agentId, turn);
+    const submittedMessage = this.startedSession.messageForTurn(context, input.agentId, input.turn);
     const retainSubmittedSession = this.startedSession.captureSubmission(
       context,
       input.agentId,
@@ -478,10 +478,6 @@ export class DraftSubmissionFlow {
         Boolean(input.apiAttachments?.length),
         !startup && !input.pendingPlacement,
       );
-      const { completeInitialSessionTurn } = await import("./initial-session-turn-handoff.ts");
-      if (requestSignal.aborted || context.gateway.snapshot.client !== input.client) {
-        return;
-      }
       const remoteProject =
         !this.place.hostedEnvironment &&
         !startup &&
@@ -566,7 +562,11 @@ export class DraftSubmissionFlow {
               placementCreateParams ??
                 startup?.params ??
                 this.sessionStartup.start(createParams, background),
-              { reconciliation: "background", signal: requestSignal },
+              {
+                reconciliation: "background",
+                signal: requestSignal,
+                retainSentResultOnAbort: true,
+              },
             );
       instant = beginInstant?.();
       const result = await createRequest;
@@ -600,7 +600,7 @@ export class DraftSubmissionFlow {
           pending,
           submittedRecovery: submissionPlacementRecovery,
           sessionKey: result.key,
-          createdAt: turn.createdAt,
+          createdAt: input.turn.createdAt,
           startupError:
             result.initialRun.status === "rejected" ? result.initialRun.error : undefined,
           isRequestCurrent: () => !requestSignal.aborted,
@@ -652,7 +652,7 @@ export class DraftSubmissionFlow {
         client: input.client,
         agentId: input.agentId,
         result,
-        turn,
+        turn: input.turn,
         instant,
         composer: this.creationComposer,
         navigation: this.startedSession,

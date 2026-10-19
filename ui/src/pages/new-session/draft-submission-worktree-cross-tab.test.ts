@@ -202,6 +202,7 @@ it.each(["explicit", "implicit", "cleared"] as const)(
     expect(retry.context.sessions.createResult).toHaveBeenCalledExactlyOnceWith(original, {
       reconciliation: "background",
       signal: expect.any(AbortSignal),
+      retainSentResultOnAbort: true,
     });
     expect(start).toHaveBeenCalledOnce();
     expect(retry.flow.error).toBeNull();

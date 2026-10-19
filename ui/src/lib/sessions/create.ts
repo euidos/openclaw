@@ -1,3 +1,4 @@
+import type { GatewayProtocolRequestOptions } from "@openclaw/gateway-client/browser";
 import { normalizeOptionalString as stringValue } from "@openclaw/normalization-core/string-coerce";
 import type {
   SessionsCreateParams,
@@ -19,6 +20,11 @@ export type SessionCreateParams = SessionsCreateParams & {
   currentSessionKey?: string;
 };
 
+export type SessionCreateRequestOptions = Pick<
+  GatewayProtocolRequestOptions,
+  "signal" | "retainSentResultOnAbort"
+>;
+
 export function resolveSessionCreateParams(sessionKey = "", agentId?: string) {
   const normalizedSessionKey = sessionKey.trim();
   const normalizedAgentId = agentId?.trim();
@@ -37,11 +43,12 @@ export function resolveSessionCreateParams(sessionKey = "", agentId?: string) {
 export async function requestSessionCreate(
   client: Pick<GatewayBrowserClient, "request">,
   params: Omit<SessionCreateParams, "currentSessionKey"> = {},
-  options?: { signal?: AbortSignal },
+  options?: SessionCreateRequestOptions,
 ): Promise<SessionCreateOutcome> {
   const result = await client.request<SessionsCreateResult>("sessions.create", params, {
     timeoutMs: GATEWAY_STARTUP_ADMISSION_WAIT_MS,
     signal: options?.signal,
+    retainSentResultOnAbort: options?.retainSentResultOnAbort,
   });
   const key = stringValue(result?.key) ?? "";
   if (!key) {

@@ -85,6 +85,132 @@ afterEach(() => {
 });
 
 describe("GatewayProtocolClient requests", () => {
+  it.each([false, true])(
+    "retains a sent write result after owner abort, retry=%s",
+    async (retry) => {
+      const { client, connection } = createRequestHarness();
+      const controller = new AbortController();
+      const onAccepted = vi.fn();
+      const request = client
+        .request(
+          "sessions.create",
+          {},
+          {
+            timeoutMs: 1_000,
+            signal: controller.signal,
+            retainSentResultOnAbort: true,
+            expectFinal: retry,
+            onAccepted,
+          },
+        )
+        .catch((error: unknown) => error);
+      const frame = latestFrame(connection);
+      if (retry) {
+        respond(
+          connection,
+          frame.id,
+          {
+            code: "UNAVAILABLE",
+            message: "agent is preparing",
+            retryable: true,
+            retryAfterMs: 250,
+            details: { reason: "startup-sidecars", method: "sessions.create" },
+          },
+          false,
+        );
+        await vi.advanceTimersByTimeAsync(250);
+        expect(connection.frames).toHaveLength(2);
+      }
+      controller.abort();
+      if (retry) {
+        respond(connection, frame.id, { status: "accepted" });
+        expect(onAccepted).toHaveBeenCalledExactlyOnceWith({ status: "accepted" });
+      }
+      respond(connection, frame.id, { sessionKey: "agent:main:created" });
+      await expect(request).resolves.toEqual({ sessionKey: "agent:main:created" });
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
+
+  it.each(["before refusal", "retry wait", "synchronous refusal"] as const)(
+    "does not retry an owner-aborted write: %s",
+    async (abortAt) => {
+      const refuse = (id: string) =>
+        respond(
+          connection,
+          id,
+          {
+            code: "UNAVAILABLE",
+            message: "agent is preparing",
+            retryable: true,
+            retryAfterMs: 250,
+            details: { reason: "startup-sidecars", method: "sessions.create" },
+          },
+          false,
+        );
+      const { client, connection } = createRequestHarness({
+        send: (frame) => {
+          if (abortAt === "synchronous refusal") {
+            refuse(frame.id);
+          }
+        },
+      });
+      const controller = new AbortController();
+      const request = client
+        .request(
+          "sessions.create",
+          {},
+          {
+            timeoutMs: 1_000,
+            signal: controller.signal,
+            retainSentResultOnAbort: true,
+          },
+        )
+        .catch((error: unknown) => error);
+      if (abortAt === "before refusal") {
+        controller.abort();
+        refuse(latestFrame(connection).id);
+      } else {
+        if (abortAt === "retry wait") {
+          refuse(latestFrame(connection).id);
+        }
+        controller.abort();
+      }
+      expect(await request).toMatchObject({
+        message: "gateway request aborted for sessions.create",
+      });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(connection.frames).toHaveLength(1);
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
+
+  it("keeps the original deadline while observing an owner-aborted write", async () => {
+    const { client, connection } = createRequestHarness();
+    const controller = new AbortController();
+    const request = client
+      .request(
+        "sessions.create",
+        {},
+        {
+          timeoutMs: 1_000,
+          signal: controller.signal,
+          retainSentResultOnAbort: true,
+        },
+      )
+      .catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(250);
+    controller.abort();
+    await vi.advanceTimersByTimeAsync(750);
+    expect(await request).toMatchObject({
+      code: "CLIENT_TIMEOUT",
+      timeoutMs: 1_000,
+      requestSent: true,
+    });
+    expect(connection.frames).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it.each(["abort", "timeout"] as const)(
     "retries startup writes independently and retires a slow request on %s",
     async (retirement) => {

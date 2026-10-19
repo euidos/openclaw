@@ -56,8 +56,8 @@ Worker scripts and other URL assets remain available in the offline cache withou
 being modulepreloaded into the document.
 
 MCP app new-conversation handling loads when the app requests a conversation.
-New Session loads its completion handler before sending the creation request,
-so a failed chunk download cannot strand an accepted creation.
+New Session includes its completion handler in the route bundle, so submission
+does not pause for another chunk before sending the creation request.
 
 After a Gateway update, already-open tabs reload the current build when they encounter a missing old asset. Reloading is automatic when no unsaved-work guard blocks it; otherwise, save or discard the protected work and use the **Reload** banner. The Gateway and service worker keep only the current build's assets.
 

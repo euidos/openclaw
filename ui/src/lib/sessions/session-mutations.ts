@@ -9,6 +9,7 @@ import {
   requestSessionCreate,
   resolveSessionCreateParams,
   type SessionCreateParams,
+  type SessionCreateRequestOptions,
 } from "./create.ts";
 import type { SessionPatch, SessionPatchOptions, SessionPatchResult } from "./patch.ts";
 import { mapSessionResultRows } from "./reconcile.ts";
@@ -90,7 +91,7 @@ export function createSessionMutations(host: SessionMutationsHost) {
 
   const createResult = async (
     params: SessionCreateParams = {},
-    options: { reconciliation?: SessionCreateReconciliation; signal?: AbortSignal } = {},
+    options: SessionCreateRequestOptions & { reconciliation?: SessionCreateReconciliation } = {},
   ) => {
     const scope = host.connection.capture();
     if (!scope) {
@@ -140,7 +141,7 @@ export function createSessionMutations(host: SessionMutationsHost) {
     }
   };
 
-  const create = async (params: SessionCreateParams = {}, options?: { signal?: AbortSignal }) =>
+  const create = async (params: SessionCreateParams = {}, options?: SessionCreateRequestOptions) =>
     (await createResult(params, options))?.key ?? null;
 
   const patch = async (
