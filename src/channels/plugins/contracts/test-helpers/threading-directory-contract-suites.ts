@@ -54,12 +54,8 @@ function expectThreadingToolContextShape(context: ChannelThreadingToolContext) {
 }
 
 function expectReplyTransportShape(transport: ChannelReplyTransport) {
-  if (transport.replyToId !== undefined && transport.replyToId !== null) {
-    expect(typeof transport.replyToId).toBe("string");
-  }
-  if (transport.threadId !== undefined && transport.threadId !== null) {
-    expect(["string", "number"]).toContain(typeof transport.threadId);
-  }
+  expectOptionalType(transport.replyToId ?? undefined, "string");
+  expectOptionalType(transport.threadId ?? undefined, ["string", "number"]);
 }
 
 function expectFocusedBindingShape(binding: ChannelFocusedBindingContext) {
@@ -71,7 +67,6 @@ function expectFocusedBindingShape(binding: ChannelFocusedBindingContext) {
   expect(binding.labelNoun.trim()).not.toBe("");
 }
 
-/** Exercises optional threading hooks and checks normalized return shapes. */
 export function expectChannelThreadingReturnValuesNormalized(
   plugin: Pick<ChannelPlugin, "id" | "threading">,
 ) {
@@ -140,7 +135,6 @@ export function expectChannelThreadingReturnValuesNormalized(
   }
 }
 
-/** Exercises directory lookups and checks normalized entry shapes when possible. */
 export async function expectChannelDirectoryBaseContract(params: {
   plugin: Pick<ChannelPlugin, "id" | "directory">;
   coverage?: "lookups" | "presence";

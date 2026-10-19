@@ -42,17 +42,6 @@ type SessionBindingContractEntry = {
 };
 const contractApiPromises = new Map<string, Promise<Record<string, unknown>>>();
 
-async function createContractChannelConversationBindingManager(params: {
-  channelId: Parameters<typeof getChannelPlugin>[0];
-  cfg: OpenClawConfig;
-  accountId?: string | null;
-}): Promise<{ stop: () => void | Promise<void> } | null> {
-  const createManager = getChannelPlugin(params.channelId)?.conversationBindings?.createManager;
-  return createManager
-    ? await createManager({ cfg: params.cfg, accountId: params.accountId })
-    : null;
-}
-
 const matrixSessionBindingStateDir = fs.mkdtempSync(
   path.join(resolvePreferredOpenClawTmpDir(), "openclaw-matrix-session-binding-contract-"),
 );
@@ -100,17 +89,6 @@ async function unbindAndExpectClearedSessionBinding(binding: SessionBindingRecor
   });
   expect(removed.map((entry) => entry.bindingId)).toContain(binding.bindingId);
   expect(service.resolveByConversation(binding.conversation)).toBeNull();
-}
-
-function expectClearedSessionBinding(params: {
-  channel: string;
-  accountId: string;
-  conversationId: string;
-}) {
-  const { channel, accountId, conversationId } = params;
-  expect(
-    getSessionBindingService().resolveByConversation({ channel, accountId, conversationId }),
-  ).toBeNull();
 }
 
 function resetMatrixSessionBindingStateDir() {
@@ -202,13 +180,11 @@ function registerPlugin(pluginId: string, plugin: ChannelPlugin) {
 }
 
 async function ensureManager(id: "discord" | "imessage" | "telegram") {
-  const manager =
-    managers[id] ??
-    (await createContractChannelConversationBindingManager({
-      channelId: id,
-      cfg: baseSessionBindingCfg,
-      accountId: "default",
-    }));
+  if (managers[id]) {
+    return;
+  }
+  const createManager = getChannelPlugin(id)?.conversationBindings?.createManager;
+  const manager = await createManager?.({ cfg: baseSessionBindingCfg, accountId: "default" });
   if (!manager) {
     throw new Error(`${id} session binding manager is unavailable`);
   }
@@ -216,12 +192,10 @@ async function ensureManager(id: "discord" | "imessage" | "telegram") {
 }
 
 async function prepareMatrixSessionBindingContract() {
-  await stopManager("matrix");
   resetMatrixSessionBindingStateDir();
 }
 
 async function prepareTelegramSessionBindingContract() {
-  await stopManager("telegram");
   const telegramPlugin = await getBindingPlugin("telegram");
   const { setTelegramRuntime } = await loadBundledPluginFacade<{
     setTelegramRuntime: (runtime: PluginRuntime) => void;
@@ -251,7 +225,7 @@ type SessionBindingContractFixture = {
   metadata?: Record<string, unknown>;
   placements: SessionBindingCapabilities["placements"];
   preload: () => Promise<unknown>;
-  beforeEach: () => Promise<void>;
+  beforeEach?: () => Promise<void>;
   ensureManager: () => Promise<void>;
   restartBindingManager?: () => Promise<void>;
 };
@@ -270,7 +244,10 @@ function createSessionBindingContractEntry(
     preload: async () => {
       await fixture.preload();
     },
-    beforeEach: fixture.beforeEach,
+    beforeEach: async () => {
+      await stopManager(fixture.id);
+      await fixture.beforeEach?.();
+    },
     expectedCapabilities: {
       adapterAvailable: true,
       bindSupported: true,
@@ -316,7 +293,10 @@ function createSessionBindingContractEntry(
     unbindAndVerify: unbindAndExpectClearedSessionBinding,
     cleanup: async () => {
       await stopManager(fixture.id);
-      expectClearedSessionBinding(conversation);
+      const { channel, accountId, conversationId } = conversation;
+      expect(
+        getSessionBindingService().resolveByConversation({ channel, accountId, conversationId }),
+      ).toBeNull();
     },
   };
 }
@@ -330,7 +310,6 @@ const sessionBindingContractEntries = {
     placements: ["current", "child"],
     preload: () => getBindingPlugin("discord"),
     beforeEach: async () => {
-      await stopManager("discord");
       registerPlugin("discord", await getBindingPlugin("discord"));
     },
     ensureManager: () => ensureManager("discord"),
@@ -343,7 +322,6 @@ const sessionBindingContractEntries = {
     label: "feishu-child",
     placements: ["current"],
     preload: () => getContractApi<FeishuContractApi>("feishu"),
-    beforeEach: () => stopManager("feishu"),
     ensureManager: async () => {
       const { createFeishuThreadBindingManager } =
         await getContractApi<FeishuContractApi>("feishu");
@@ -364,7 +342,6 @@ const sessionBindingContractEntries = {
     placements: ["current"],
     preload: () => getBindingPlugin("imessage"),
     beforeEach: async () => {
-      await stopManager("imessage");
       registerPlugin("imessage", await getBindingPlugin("imessage"));
     },
     ensureManager: () => ensureManager("imessage"),
