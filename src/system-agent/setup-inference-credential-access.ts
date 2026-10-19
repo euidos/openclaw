@@ -178,8 +178,8 @@ export async function activateSavedSetupCredential(params: {
         }
         owner = currentOwner;
         await publishAuthProfileStoreUpdate(
-          committed,
           currentOwner,
+          committed,
           assertCurrent,
           nativeCommits,
           committedIsCurrent,
