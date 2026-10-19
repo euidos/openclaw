@@ -2,13 +2,14 @@
 
 import {
   buildSystemAgentSessionInvalidatedErrorDetails,
-  type SystemAgentChatResult,
-  type SystemAgentChatHistoryResult,
+  type SystemAgentChatResult as ChatResult,
+  type SystemAgentChatHistoryResult as History,
 } from "@openclaw/gateway-protocol";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { createDeferred as deferred } from "../../../../test/helpers/promise.js";
 import { GatewayRequestError, type GatewayBrowserClient } from "../../api/gateway.ts";
 import { hasSensitiveConfigData } from "../../components/config-form.shared.ts";
+import { QUICK_ACTIONS_QUESTION } from "../../test-helpers/custodian-quick-actions.ts";
 import { installSafeLocalStorageForTesting } from "../../test-helpers/storage.ts";
 import { waitForFast } from "../../test-helpers/wait-for.ts";
 import { createContext } from "./custodian-page.test-harness.ts";
@@ -20,55 +21,53 @@ import {
 } from "./plugin-help.ts";
 
 const plugin = { id: "example", name: "Example" };
+const inferenceDetails = { code: "system_agent_inference_unavailable" };
 const inferenceFailure = (message: string) =>
-  new GatewayRequestError({
-    code: "UNAVAILABLE",
-    message,
-    details: { code: "system_agent_inference_unavailable" },
-  });
+  new GatewayRequestError({ code: "UNAVAILABLE", message, details: inferenceDetails });
 const reloadFailure = { configReload: { hotReloadStatus: "disabled" }, channels: {} };
-const historyMethods = ["openclaw.chat", "openclaw.chat.history"];
-type RequestArgs = [method: string, params: unknown, options?: { signal?: AbortSignal }];
+const historyMethod = "openclaw.chat.history";
+const historyMethods = ["openclaw.chat", historyMethod];
+type ChatParams = { sessionId?: string; message?: string };
+type RequestOptions = { signal?: AbortSignal };
+type RequestArgs = [method: string, params: ChatParams, options?: RequestOptions];
 type Context = ReturnType<typeof createContext>["context"];
-const echoReply = (_method: string, params: { sessionId?: string }) =>
+const echoReply = (_method: string, params: ChatParams) =>
   Promise.resolve(chatReply(params.sessionId));
-const setting = (path: string[], label: string, value: unknown, sensitive = false) => ({
-  path,
-  label,
-  value,
-  sensitive,
-});
-const ask = (context: Context, value: ReturnType<typeof setting>, target = plugin) =>
-  createPluginHelpRequest(context, target)(value);
+const configPath = ["plugins", "entries", "example", "config"];
+const settings = {
+  Names: [...configPath, "names.with.dots"],
+  Limit: ["limit"],
+  "API key": [...configPath, "apiKey"],
+  Accounts: [...configPath, "accounts"],
+};
+const publish = (context: Context, owner: object, current = plugin, overview = true) =>
+  publishPluginHelpContext(context, owner, current, { overview, installed: true });
+type Setting = keyof typeof settings;
+function ask(context: Context, label: Setting, value: unknown, sensitive = false, target = plugin) {
+  const request = createPluginHelpRequest(context, target);
+  return request({ path: settings[label], label, value, sensitive });
+}
 function historyRequest(
-  read: () => Promise<SystemAgentChatHistoryResult>,
-  send: (
-    params: { sessionId?: string; message?: string },
-    options?: { signal?: AbortSignal },
-  ) => unknown = (params) => Promise.resolve(chatReply(params.sessionId)),
+  read: () => Promise<History>,
+  send: (params: ChatParams, options?: RequestOptions) => unknown = (params) =>
+    Promise.resolve(chatReply(params.sessionId)),
 ) {
-  return vi.fn(
-    (
-      method: string,
-      params: { sessionId?: string; message?: string },
-      options?: { signal?: AbortSignal },
-    ) => (method === "openclaw.chat.history" ? read() : send(params, options)),
+  return vi.fn((method: string, params: ChatParams, options?: RequestOptions) =>
+    method === historyMethod ? read() : send(params, options),
   );
+}
+function history(...turns: Array<["user" | "assistant", string, number]>): History {
+  return { turns: turns.map(([role, text, at]) => ({ role, text, at })) };
 }
 const text = (store: CustodianSessionStore) => store.messages.map((message) => message.text);
 function chatReply<T extends string | undefined>(sessionId: T, reply = "Ready.") {
   return { sessionId, reply, action: "none" as const };
 }
-function connectStore(context: Context) {
-  const store = new CustodianSessionStore();
-  store.connect(context, "caretaker");
-  return store;
-}
 function setupStore(
   request = vi.fn().mockResolvedValue(chatReply("plugin-help-session")),
+  variant: Parameters<CustodianSessionStore["connect"]>[1] = "caretaker",
   methods = ["openclaw.chat"],
   options: Parameters<typeof createContext>[2] = {},
-  variant: Parameters<CustodianSessionStore["connect"]>[1] = "caretaker",
 ) {
   const harness = createContext(request, methods, options);
   const store = new CustodianSessionStore();
@@ -76,110 +75,80 @@ function setupStore(
   return { ...harness, store, request };
 }
 function healthFixture(healthRequest: Parameters<typeof createContext>[0], onboarding = false) {
-  return setupStore(
-    vi.fn().mockResolvedValue({ sessionId: "health-session", action: "none" }),
-    ["openclaw.chat"],
-    { healthRequest },
-    onboarding ? "onboarding" : "caretaker",
-  );
+  const request = vi.fn().mockResolvedValue({ sessionId: "health-session", action: "none" });
+  const variant = onboarding ? "onboarding" : "caretaker";
+  return setupStore(request, variant, undefined, { healthRequest });
 }
-const idle = (store: CustodianSessionStore) => waitForFast(() => expect(store.sending).toBe(false));
-const canSend = (store: CustodianSessionStore) =>
-  waitForFast(() => expect(store.canSend).toBe(true));
 
-beforeEach(() => {
-  installSafeLocalStorageForTesting(window).clear();
-});
-
+beforeEach(() => installSafeLocalStorageForTesting(window).clear());
 afterEach(() => {
   localStorage.clear();
   window.history.replaceState({}, "", "/");
   vi.restoreAllMocks();
 });
 
-it.each(["cold", "startup", "metadata"] as const)(
-  "retains setting drafts through %s initialization",
-  async (phase) => {
-    const startup = deferred<never>();
-    const request = vi.fn().mockResolvedValue(chatReply("plugin-help-session"));
-    if (phase !== "cold") {
-      request.mockReturnValueOnce(startup.promise);
-    }
-    const { context, setPathname, setGatewaySnapshot } = createContext(request);
-    setPathname("/settings/plugins/example");
-    publishPluginHelpContext(context, {}, plugin, { overview: false, installed: true });
-    const agentsList = context.agents.state.agentsList;
+it.each(["cold", "startup", "metadata"] as const)("retains %s drafts", async (phase) => {
+  const startup = deferred<never>();
+  const request = vi.fn().mockResolvedValue(chatReply("plugin-help-session"));
+  if (phase !== "cold") {
+    request.mockReturnValueOnce(startup.promise);
+  }
+  const { context, setPathname, setGatewaySnapshot } = createContext(request);
+  setPathname("/settings/plugins/example");
+  publish(context, {}, plugin, false);
+  const agentsList = context.agents.state.agentsList;
+  if (phase === "metadata") {
+    context.agents.state.agentsList = null;
+  }
+  const store = new CustodianSessionStore();
+  if (phase !== "cold") {
+    store.connect(context, "caretaker");
+    store.setInput("Keep this draft.");
+  }
+  const label = phase === "cold" ? "Names" : "Limit";
+  await ask(context, label, phase === "cold" ? ["first"] : 5);
+  if (phase === "cold") {
+    expect(request).not.toHaveBeenCalled();
+    store.connect(context, "caretaker");
+    await waitForFast(() => expect(store.canSend).toBe(true));
+    expect(store.input).toBe('Explain Names\n\nCurrent value: ["first"]');
+  } else {
+    expect(store.input).toBe("Keep this draft.\n\nExplain Limit\n\nCurrent value: 5");
+    expect(store.canSend).toBe(false);
     if (phase === "metadata") {
-      context.agents.state.agentsList = null;
-    }
-    const store = new CustodianSessionStore();
-    if (phase !== "cold") {
-      store.connect(context, "caretaker");
-      store.setInput("Keep this draft.");
-    }
-    const selectedSetting =
-      phase === "cold"
-        ? setting(["plugins", "entries", "example", "config", "names.with.dots"], "Names", [
-            "first",
-          ])
-        : setting(["limit"], "Limit", 5);
-    await ask(context, selectedSetting);
-    if (phase === "cold") {
       expect(request).not.toHaveBeenCalled();
-      store.connect(context, "caretaker");
-      await canSend(store);
-      expect(store.input).toBe('Explain Names\n\nCurrent value: ["first"]');
-    } else {
+      context.agents.state.agentsList = agentsList;
+      setGatewaySnapshot({});
       expect(store.input).toBe("Keep this draft.\n\nExplain Limit\n\nCurrent value: 5");
-      expect(store.canSend).toBe(false);
-      if (phase === "metadata") {
-        expect(request).not.toHaveBeenCalled();
-        context.agents.state.agentsList = agentsList;
-        setGatewaySnapshot({});
-        expect(store.input).toBe("Keep this draft.\n\nExplain Limit\n\nCurrent value: 5");
-      }
-      startup.reject(new Error("Fixture inference unavailable"));
-      await waitForFast(() => expect(store.error).toContain("Fixture inference unavailable"));
-      store.setInput(`${store.input}\nUse a brief answer.`);
-      const edited = store.input;
-      await store.send();
-      expect(request).toHaveBeenCalledOnce();
-      store.retry();
-      await canSend(store);
-      expect(store.input).toBe(edited);
     }
-    expect(request.mock.calls.every((call) => call[1].message === undefined)).toBe(true);
-    const message = store.input;
+    startup.reject(new Error("Fixture inference unavailable"));
+    await waitForFast(() => expect(store.error).toContain("Fixture inference unavailable"));
+    store.setInput(`${store.input}\nUse a brief answer.`);
+    const edited = store.input;
     await store.send();
-    expect(request.mock.calls.at(-1)?.[1]).toMatchObject({
-      sessionId: "plugin-help-session",
-      message,
-      context: {
-        plugin: {
-          ...plugin,
-          setting: { path: selectedSetting.path, label: selectedSetting.label },
-        },
-      },
-    });
-  },
-);
+    expect(request).toHaveBeenCalledOnce();
+    store.retry();
+    await waitForFast(() => expect(store.canSend).toBe(true));
+    expect(store.input).toBe(edited);
+  }
+  expect(request.mock.calls.every((call) => call[1].message === undefined)).toBe(true);
+  const message = store.input;
+  await store.send();
+  expect(request.mock.calls.at(-1)?.[1]).toMatchObject({
+    sessionId: "plugin-help-session",
+    message,
+    context: { plugin: { ...plugin, setting: { path: settings[label], label } } },
+  });
+});
 
 it("keeps setting drafts separate from hosted secret answers", async () => {
   const { request, context, store } = setupStore();
-  await canSend(store);
+  await waitForFast(() => expect(store.canSend).toBe(true));
   store.setInput("Keep this ordinary draft.");
   store.sensitive = true;
   store.wizardInputPending = true;
   store.setInput("synthetic-answer");
-  await ask(
-    context,
-    setting(
-      ["plugins", "entries", "example", "config", "apiKey"],
-      "API key",
-      "synthetic-secret",
-      true,
-    ),
-  );
+  await ask(context, "API key", "synthetic-secret", true);
   expect(store.input).toBe("synthetic-answer");
   expect(request).toHaveBeenCalledOnce();
   store.sensitive = false;
@@ -192,8 +161,8 @@ it("keeps setting drafts separate from hosted secret answers", async () => {
 
 it("redacts nested secrets, references, sentinels and credential URLs", async () => {
   const { context, store } = setupStore();
-  await canSend(store);
-  const path = ["plugins", "entries", "example", "config", "accounts"];
+  await waitForFast(() => expect(store.canSend).toBe(true));
+  const path = settings.Accounts;
   const hints = { "plugins.entries.example.config.accounts.*.opaque": { sensitive: true } };
   const values = [
     { work: { opaque: "nested-secret" } },
@@ -210,75 +179,60 @@ it("redacts nested secrets, references, sentinels and credential URLs", async ()
   for (const value of values) {
     const original = structuredClone(value);
     store.setInput("");
-    await ask(
-      context,
-      setting(path, "Accounts", value, hasSensitiveConfigData(value, path, hints)),
-    );
+    await ask(context, "Accounts", value, hasSensitiveConfigData(value, path, hints));
     expect(store.input).toBe("Explain Accounts\n\nCurrent value: <redacted>");
     expect(value).toEqual(original);
   }
   const value = { endpoints: ["https://example.invalid/?region=eu&discount=100%25"] };
   const original = structuredClone(value);
   store.setInput("");
-  await ask(context, setting(path, "Accounts", value));
+  await ask(context, "Accounts", value);
   expect(store.input).toContain(`Current value: ${JSON.stringify(original)}`);
   expect(value).toEqual(original);
 });
 
-it.each(["operator", "navigation"] as const)(
-  "retires plugin context on %s change",
-  async (change) => {
-    const request = vi.fn().mockResolvedValue(chatReply("plugin-help-session"));
-    const { context, setGatewayToken, setPathname } = createContext(request);
-    setPathname("/settings/plugins/example");
-    const owner = {};
-    const releaseOld = publishPluginHelpContext(
-      context,
-      owner,
-      { id: "first", name: "First" },
-      { overview: true, installed: true },
-    );
-    const currentPlugin = { id: "second", name: "Second" };
-    const releaseCurrent = publishPluginHelpContext(context, owner, currentPlugin, {
-      overview: true,
-      installed: true,
-    });
-    releaseOld();
-    expect(currentPluginHelpReference(context)?.id).toBe("second");
-    const pending = ask(context, setting(["limit"], "Limit", 5), currentPlugin);
-    if (change === "operator") {
-      await pending;
-      setGatewayToken("replacement-operator");
-    } else {
-      setPathname("/agents");
-      await pending;
-    }
-    expect(currentPluginHelpReference(context)).toBeUndefined();
-    releaseCurrent();
-    const store = connectStore(context);
-    await canSend(store);
-    expect(store.input).toBe("");
-  },
-);
+it.each(["operator", "navigation"] as const)("retires %s plugin context", async (change) => {
+  const request = vi.fn().mockResolvedValue(chatReply("plugin-help-session"));
+  const { context, setGatewayToken, setPathname } = createContext(request);
+  setPathname("/settings/plugins/example");
+  const owner = {};
+  const releaseOld = publish(context, owner, { id: "first", name: "First" });
+  const currentPlugin = { id: "second", name: "Second" };
+  const releaseCurrent = publish(context, owner, currentPlugin);
+  releaseOld();
+  expect(currentPluginHelpReference(context)?.id).toBe("second");
+  const pending = ask(context, "Limit", 5, false, currentPlugin);
+  if (change === "operator") {
+    await pending;
+    setGatewayToken("replacement-operator");
+  } else {
+    setPathname("/agents");
+    await pending;
+  }
+  expect(currentPluginHelpReference(context)).toBeUndefined();
+  releaseCurrent();
+  const store = new CustodianSessionStore();
+  store.connect(context, "caretaker");
+  await waitForFast(() => expect(store.canSend).toBe(true));
+  expect(store.input).toBe("");
+});
 
-it("shares one session across repeated surface connections", async () => {
+it("shares and persists one session across surfaces and stores", async () => {
   const request = vi
     .fn()
     .mockResolvedValueOnce(chatReply("shared-session"))
-    .mockResolvedValueOnce(chatReply("shared-session", "Still here."));
+    .mockResolvedValueOnce(chatReply("shared-session", "Still here."))
+    .mockImplementationOnce(echoReply);
   const { context } = createContext(request);
   const store = new CustodianSessionStore();
   const firstSurfaceUpdates = vi.fn();
   const panelSurfaceUpdates = vi.fn();
   store.subscribe(firstSurfaceUpdates);
   store.subscribe(panelSurfaceUpdates);
-
   store.connect(context, "caretaker");
   store.connect(context, "caretaker");
   await waitForFast(() => expect(request).toHaveBeenCalledOnce());
-
   await store.send("Check this system");
-
   expect(request).toHaveBeenCalledTimes(2);
   expect(request.mock.calls[1]?.[1]).toMatchObject({
     sessionId: "shared-session",
@@ -288,21 +242,10 @@ it("shares one session across repeated surface connections", async () => {
   expect(store.hasRealUserTurn()).toBe(true);
   expect(firstSurfaceUpdates).toHaveBeenCalled();
   expect(panelSurfaceUpdates).toHaveBeenCalled();
-});
-
-it("reuses the persisted session id across store instances", async () => {
-  const request = vi.fn(echoReply);
-  const { context } = createContext(request);
-
+  expect(localStorage.getItem("openclaw.custodian.session.v1")).toBe("shared-session");
   new CustodianSessionStore().connect(context, "caretaker");
-  await waitForFast(() => expect(request).toHaveBeenCalledOnce());
-  const firstSessionId = request.mock.calls[0]?.[1].sessionId;
-  expect(localStorage.getItem("openclaw.custodian.session.v1")).toBe(firstSessionId);
-
-  new CustodianSessionStore().connect(context, "caretaker");
-  await waitForFast(() => expect(request).toHaveBeenCalledTimes(2));
-
-  expect(request.mock.calls[1]?.[1].sessionId).toBe(firstSessionId);
+  await waitForFast(() => expect(request).toHaveBeenCalledTimes(3));
+  expect(request.mock.calls[2]?.[1].sessionId).toBe("shared-session");
 });
 
 it.each([false, true])("remints an invalidated session (live=%s)", async (live) => {
@@ -319,7 +262,7 @@ it.each([false, true])("remints an invalidated session (live=%s)", async (live) 
         .mockImplementationOnce(echoReply)
     : vi.fn().mockRejectedValue(error);
   const { store } = setupStore(request);
-  await idle(store);
+  await waitForFast(() => expect(store.sending).toBe(false));
   const staleSessionId = request.mock.calls[0]?.[1].sessionId;
   if (live) {
     expect(store.messages.at(-1)?.text).toBe("Ready.");
@@ -334,30 +277,45 @@ it.each([false, true])("remints an invalidated session (live=%s)", async (live) 
   }
 });
 
-it("coalesces history reads and blocks them during interaction", async () => {
-  const pending = deferred<SystemAgentChatHistoryResult>();
+it.each(["coalesced", "invalidated"] as const)("settles %s history reads", async (mode) => {
+  const pending = deferred<History>();
+  const reply = deferred<ChatResult>();
+  const invalidated = mode === "invalidated";
   let historyCall = 0;
-  const request = historyRequest(() =>
-    ++historyCall === 1 ? Promise.resolve({ turns: [] }) : pending.promise,
+  const request = historyRequest(
+    () =>
+      ++historyCall === 1
+        ? invalidated
+          ? Promise.reject(new Error("history unavailable"))
+          : Promise.resolve({ turns: [] })
+        : pending.promise,
+    (params) =>
+      invalidated && params.message ? reply.promise : Promise.resolve(chatReply(params.sessionId)),
   );
-  const { store } = setupStore(request, historyMethods);
-  await idle(store);
-
-  const firstRefresh = store.refreshTranscriptIfIdle();
-  const secondRefresh = store.refreshTranscriptIfIdle();
+  const { store } = setupStore(request, undefined, historyMethods);
+  await waitForFast(() => expect(store.sending).toBe(false));
+  if (invalidated) {
+    expect(store.transcript.status.error).toContain("history unavailable");
+  }
+  const refresh = store.refreshTranscriptIfIdle();
+  const joined = invalidated ? null : store.refreshTranscriptIfIdle();
+  const send = invalidated ? store.send("Continue") : null;
   expect(historyCall).toBe(2);
-  pending.resolve({
-    turns: [
-      { role: "user", text: "Durable question", at: 10 },
-      { role: "assistant", text: "Durable answer", at: 11 },
-    ],
-  });
-  await Promise.all([firstRefresh, secondRefresh]);
+  pending.resolve(
+    invalidated
+      ? history(["assistant", "Stale history", 2])
+      : history(["user", "Durable question", 10], ["assistant", "Durable answer", 11]),
+  );
+  await Promise.all([refresh, joined]);
+  if (invalidated) {
+    expect(store.transcript.status.error).toContain("history unavailable");
+    expect(text(store)).not.toContain("Stale history");
+    reply.resolve(chatReply("session-after-send", "Continued."));
+    await send;
+    return;
+  }
   expect(text(store)).toEqual(["Durable question", "Durable answer"]);
-  const historyCallCount = request.mock.calls.filter(
-    ([method]) => method === "openclaw.chat.history",
-  ).length;
-
+  const reads = request.mock.calls.filter(([method]) => method === historyMethod).length;
   store.sending = true;
   await store.refreshTranscriptIfIdle();
   store.sending = false;
@@ -367,44 +325,12 @@ it("coalesces history reads and blocks them during interaction", async () => {
   store.messages = [
     {
       ...store.messages[1]!,
-      question: {
-        id: "repair",
-        header: "Repair",
-        question: "What should OpenClaw repair?",
-        options: [{ label: "Gateway" }, { label: "Channel" }],
-        isOther: false,
-      },
+      question: { ...QUICK_ACTIONS_QUESTION, id: "repair", isOther: false },
     },
   ];
   await store.refreshTranscriptIfIdle();
-
-  expect(request.mock.calls.filter(([method]) => method === "openclaw.chat.history")).toHaveLength(
-    historyCallCount,
-  );
+  expect(request.mock.calls.filter(([method]) => method === historyMethod)).toHaveLength(reads);
   expect(store.messages[0]?.question?.id).toBe("repair");
-});
-
-it("keeps transcript errors when a turn invalidates retry", async () => {
-  const retry = deferred<SystemAgentChatHistoryResult>();
-  const reply = deferred<SystemAgentChatResult>();
-  let historyCall = 0;
-  const request = historyRequest(
-    () => (++historyCall === 1 ? Promise.reject(new Error("history unavailable")) : retry.promise),
-    (params) => (params.message ? reply.promise : Promise.resolve(chatReply(params.sessionId))),
-  );
-  const { store } = setupStore(request, historyMethods);
-  await idle(store);
-  expect(store.transcript.status.error).toContain("history unavailable");
-
-  const refresh = store.refreshTranscriptIfIdle();
-  const send = store.send("Continue");
-  retry.resolve({ turns: [{ role: "assistant", text: "Stale history", at: 2 }] });
-  await refresh;
-
-  expect(store.transcript.status.error).toContain("history unavailable");
-  expect(store.messages.some((message) => message.text === "Stale history")).toBe(false);
-  reply.resolve(chatReply("session-after-send", "Continued."));
-  await send;
 });
 
 it("rejoins abandoned turns with authoritative history and controls", async () => {
@@ -417,37 +343,31 @@ it("rejoins abandoned turns with authoritative history and controls", async () =
           })
         : Promise.resolve(chatReply(params.sessionId)),
   );
-  const { store, setGatewaySnapshot } = setupStore(initialRequest, historyMethods);
-  await idle(store);
+  const { store, setGatewaySnapshot } = setupStore(initialRequest, undefined, historyMethods);
+  await waitForFast(() => expect(store.sending).toBe(false));
 
   const interruptedSend = store.send("Finish the repair");
   await waitForFast(() => expect(store.sending).toBe(true));
   setGatewaySnapshot({ phase: "reconnecting", client: null });
   expect(store.abandonedTurnOutcomeUnknown).toBe(true);
-
   const liveStep = { id: "repair-step", type: "text", message: "Which channel?" };
-  const reconnectRequest = vi.fn((method: string, params: { sessionId?: string }) => {
-    if (method === "health") {
-      return Promise.resolve({ channels: {} });
-    }
-    if (method === "openclaw.chat.history") {
-      return Promise.resolve({
-        turns: [
-          { role: "user", text: "Finish the repair", at: 20 },
-          { role: "assistant", text: "Repair complete", at: 21 },
-        ],
-      });
-    }
-    if (method === "openclaw.chat") {
-      return Promise.resolve({
-        sessionId: params.sessionId,
-        reply: "Welcome back.",
-        action: "none",
+  const reconnectRequest = vi.fn((method: string, params: ChatParams) => {
+    const replies: Record<string, unknown> = {
+      health: { channels: {} },
+      [historyMethod]: history(
+        ["user", "Finish the repair", 20],
+        ["assistant", "Repair complete", 21],
+      ),
+      "openclaw.chat": {
+        ...chatReply(params.sessionId, "Welcome back."),
         wizardInputPending: true,
         step: liveStep,
-      });
+      },
+    };
+    if (!Object.hasOwn(replies, method)) {
+      throw new Error(`Unexpected reconnect method: ${method}`);
     }
-    throw new Error(`Unexpected reconnect method: ${method}`);
+    return Promise.resolve(replies[method]);
   });
   setGatewaySnapshot({
     phase: "connected",
@@ -456,61 +376,53 @@ it("rejoins abandoned turns with authoritative history and controls", async () =
   await interruptedSend;
   await waitForFast(() => expect(store.messages.at(-1)?.step).toMatchObject({ id: "repair-step" }));
   expect(store).toMatchObject({ abandonedTurnOutcomeUnknown: false, wizardInputPending: true });
-  expect(store.messages.some((message) => message.text === "Repair complete")).toBe(true);
+  expect(text(store)).toContain("Repair complete");
   expect(reconnectRequest.mock.calls.some(([method]) => method === "openclaw.chat")).toBe(true);
 });
 
 it.each([
-  [
-    inferenceFailure("The configured runtime could not start. Repair the launcher and retry."),
-    false,
-  ],
-  [new Error("The greeting could not start. Retry after repairing the runtime."), false],
+  [inferenceFailure("The runtime could not start."), false],
+  [new Error("The greeting could not start."), false],
   [new Error("OPENAI_API_KEY=sk-1234567890abcdef"), false],
   [inferenceFailure("Runtime verification failed."), true],
-] as const)(
-  "re-verifies inference without replaying user turns: %s (live=%s)",
-  async (error, live) => {
-    const displayed = error.message.startsWith("OPENAI_API_KEY=")
-      ? "OPENAI_API_KEY=sk-123...cdef"
-      : error.message;
-    const request = vi.fn();
-    if (live) {
-      request.mockResolvedValueOnce(chatReply("shared-session"));
-    }
-    request
-      .mockImplementationOnce((_method, _params, options?: { onSent?: () => void }) => {
-        if (live) {
-          options?.onSent?.();
-        }
-        return Promise.reject(error);
-      })
-      .mockResolvedValueOnce(chatReply("shared-session", live ? "Recovered." : "Ready."));
-    const { store } = setupStore(request);
-    if (live) {
-      await idle(store);
-      await store.send("Check this system");
-      expect(text(store)).toContain("Check this system");
-    } else {
-      await waitForFast(() => expect(store.error).toBe(displayed));
-    }
-    expect(store).toMatchObject({ error: displayed, setupRequired: false });
-    await expect(store.send("should not send")).resolves.toBe("rejected");
-    expect(request).toHaveBeenCalledTimes(live ? 2 : 1);
-    const draft = live ? "Next question" : "Keep my draft";
-    store.setInput(draft);
-    store.retry();
-    await waitForFast(() =>
-      expect(store.messages.at(-1)?.text).toBe(live ? "Recovered." : "Ready."),
-    );
-    expect(store).toMatchObject({ input: draft, error: null });
-    expect(request).toHaveBeenCalledTimes(live ? 3 : 2);
-    expect(request.mock.calls.at(-1)?.[1]).not.toHaveProperty("message");
-    if (live) {
-      expect(text(store)).toContain("Check this system");
-    }
-  },
-);
+] as const)("verifies inference: %s (live=%s)", async (error, live) => {
+  const displayed = error.message.startsWith("OPENAI_API_KEY=")
+    ? "OPENAI_API_KEY=sk-123...cdef"
+    : error.message;
+  const request = vi.fn();
+  if (live) {
+    request.mockResolvedValueOnce(chatReply("shared-session"));
+  }
+  request
+    .mockImplementationOnce((_method, _params, options?: { onSent?: () => void }) => {
+      if (live) {
+        options?.onSent?.();
+      }
+      return Promise.reject(error);
+    })
+    .mockResolvedValueOnce(chatReply("shared-session", live ? "Recovered." : "Ready."));
+  const { store } = setupStore(request);
+  if (live) {
+    await waitForFast(() => expect(store.sending).toBe(false));
+    await store.send("Check this system");
+    expect(text(store)).toContain("Check this system");
+  } else {
+    await waitForFast(() => expect(store.error).toBe(displayed));
+  }
+  expect(store).toMatchObject({ error: displayed, setupRequired: false });
+  await expect(store.send("should not send")).resolves.toBe("rejected");
+  expect(request).toHaveBeenCalledTimes(live ? 2 : 1);
+  const draft = live ? "Next question" : "Keep my draft";
+  store.setInput(draft);
+  store.retry();
+  await waitForFast(() => expect(store.messages.at(-1)?.text).toBe(live ? "Recovered." : "Ready."));
+  expect(store).toMatchObject({ input: draft, error: null });
+  expect(request).toHaveBeenCalledTimes(live ? 3 : 2);
+  expect(request.mock.calls.at(-1)?.[1]).not.toHaveProperty("message");
+  if (live) {
+    expect(text(store)).toContain("Check this system");
+  }
+});
 
 it.each([
   { edits: [], expected: "Original question" },
@@ -527,7 +439,7 @@ it.each([
       }),
     );
   const { store } = setupStore(request);
-  await canSend(store);
+  await waitForFast(() => expect(store.canSend).toBe(true));
   store.setInput("Original question");
   const sending = store.send();
   expect(store.input).toBe("");
@@ -549,19 +461,14 @@ it.each([false, true])("allows only configured models or setup utilities (%s)", 
       chatReply("utility-setup-session", "Choose a primary model for your agent."),
     );
   }
-  const { context } = createContext(request, ["openclaw.chat"], {
-    agentsList: {
-      defaultId: "main",
-      mainKey: "main",
-      scope: "per-sender",
-      agents: [{ id: "main", ...(utility ? { utilityModel: "local/setup" } : {}) }],
-    },
-  });
+  const { context } = createContext(request);
+  context.agents.state.agentsList!.agents = [
+    { id: "main", ...(utility ? { utilityModel: "local/setup" } : {}) },
+  ];
   const store = new CustodianSessionStore();
   store.connect(context, utility ? "onboarding" : "caretaker");
   if (!utility) {
-    expect(store.setupRequired).toBe(true);
-    expect(store.sending).toBe(false);
+    expect(store).toMatchObject({ setupRequired: true, sending: false });
     expect(request).not.toHaveBeenCalled();
     await expect(store.send("should not send")).resolves.toBe("rejected");
     return;
@@ -574,60 +481,53 @@ it.each([false, true])("allows only configured models or setup utilities (%s)", 
   expect(context.navigate).toHaveBeenCalledWith("model-setup", { search: "?firstRun=1" });
 });
 
-it.each(["chat", "channels", "model-setup"] as const)(
-  "prevents late replies from navigating away from %s",
-  async (destination) => {
-    const reply = deferred<unknown>();
-    const request = vi.fn((..._args: RequestArgs) => reply.promise);
-    if (destination === "chat") {
-      request.mockReturnValueOnce(reply.promise).mockReturnValue(new Promise(() => {}));
-    }
-    const { context, store } = setupStore(
-      request,
-      undefined,
-      undefined,
-      destination === "model-setup" ? "caretaker" : "onboarding",
-    );
-    await waitForFast(() => expect(request).toHaveBeenCalledOnce());
-    if (destination === "channels") {
-      store.openChannelsFromOnboarding();
-    } else {
-      store.exitSetup(destination);
-    }
-    expect(request.mock.calls[0]?.[2]?.signal?.aborted).toBe(true);
-    expect(store.sending).toBe(false);
-    if (destination === "chat") {
-      store.connect(context, "caretaker");
-      await waitForFast(() => expect(request).toHaveBeenCalledTimes(2));
-    }
-    reply.resolve({
-      sessionId: "late-session",
-      reply: "Your agent is ready.",
-      action: "open-agent",
-      agentId: "main",
-      agentDraft: "hatch",
-    });
-    await Promise.resolve();
-    expect(context.navigate).toHaveBeenCalledTimes(1);
-    expect(context.navigate).toHaveBeenCalledWith(destination);
-    expect(context.agents.refreshList).not.toHaveBeenCalled();
-    if (destination === "chat") {
-      expect(store.messages).toEqual([]);
-    }
-    if (destination === "channels") {
-      expect(store.canRetry()).toBe(false);
-    }
-  },
-);
+it.each(["chat", "channels", "model-setup"] as const)("leaves for %s", async (destination) => {
+  const reply = deferred<unknown>();
+  const request = vi.fn((..._args: RequestArgs) => reply.promise);
+  if (destination === "chat") {
+    request.mockReturnValueOnce(reply.promise).mockReturnValue(new Promise(() => {}));
+  }
+  const variant = destination === "model-setup" ? "caretaker" : "onboarding";
+  const { context, store } = setupStore(request, variant);
+  await waitForFast(() => expect(request).toHaveBeenCalledOnce());
+  if (destination === "channels") {
+    store.openChannelsFromOnboarding();
+  } else {
+    store.exitSetup(destination);
+  }
+  expect(request.mock.calls[0]?.[2]?.signal?.aborted).toBe(true);
+  expect(store.sending).toBe(false);
+  if (destination === "chat") {
+    store.connect(context, "caretaker");
+    await waitForFast(() => expect(request).toHaveBeenCalledTimes(2));
+  }
+  reply.resolve({
+    sessionId: "late-session",
+    reply: "Your agent is ready.",
+    action: "open-agent",
+    agentId: "main",
+    agentDraft: "hatch",
+  });
+  await Promise.resolve();
+  expect(context.navigate).toHaveBeenCalledTimes(1);
+  expect(context.navigate).toHaveBeenCalledWith(destination);
+  expect(context.agents.refreshList).not.toHaveBeenCalled();
+  if (destination === "chat") {
+    expect(store.messages).toEqual([]);
+  }
+  if (destination === "channels") {
+    expect(store.canRetry()).toBe(false);
+  }
+});
 
-it("loads health on caretaker activation and reconnect", async () => {
+it("refreshes health across activation, reconnect and variant changes", async () => {
   const healthRequest = vi.fn().mockResolvedValue(reloadFailure);
-  const { context, store, setGatewaySnapshot } = healthFixture(healthRequest, true);
+  const fixture = healthFixture(healthRequest, true);
+  const { context, store, request, setGatewaySnapshot, emitGatewayEvent } = fixture;
   const client = context.gateway.snapshot.client;
   expect(healthRequest).not.toHaveBeenCalled();
   store.connect(context, "caretaker");
   await waitForFast(() => expect(store.eventNudge?.kind).toBe("config-reload"));
-
   store.connect(context, "caretaker");
   setGatewaySnapshot({});
   expect(healthRequest).toHaveBeenCalledOnce();
@@ -636,6 +536,17 @@ it("loads health on caretaker activation and reconnect", async () => {
   setGatewaySnapshot({ phase: "connected", client });
   await waitForFast(() => expect(store.eventNudge).toBeNull());
   expect(healthRequest).toHaveBeenCalledTimes(2);
+  const before = request.mock.calls.length;
+  emitGatewayEvent({ event: "health", payload: reloadFailure });
+  expect(store.eventNudge).not.toBeNull();
+  store.dismissEventNudge();
+  expect(store.eventNudge).toBeNull();
+  store.connect(context, "onboarding");
+  await waitForFast(() => expect(request).toHaveBeenCalledTimes(before + 1));
+  store.connect(context, "caretaker");
+  await waitForFast(() => expect(request).toHaveBeenCalledTimes(before + 2));
+  emitGatewayEvent({ event: "health", payload: reloadFailure });
+  expect(store.eventNudge).not.toBeNull();
 });
 
 it("retries failed health on tick, then stops polling", async () => {
@@ -659,7 +570,7 @@ it("retries failed health on tick, then stops polling", async () => {
 });
 
 it.each(["event", "reconnect", "variant", "operator"] as const)(
-  "rejects stale health after %s changes",
+  "rejects %s stale health",
   async (change) => {
     const pending = deferred<unknown>();
     const healthRequest = vi
@@ -686,28 +597,3 @@ it.each(["event", "reconnect", "variant", "operator"] as const)(
     expect(store.eventNudge).toBeNull();
   },
 );
-
-it("accepts new event nudges after a conversation variant rotates", async () => {
-  const request = vi.fn().mockResolvedValue(chatReply("shared-session"));
-  const { context, store, emitGatewayEvent } = setupStore(request);
-  await waitForFast(() => expect(request).toHaveBeenCalledOnce());
-
-  emitGatewayEvent({
-    event: "health",
-    payload: reloadFailure,
-  });
-  expect(store.eventNudge).not.toBeNull();
-  store.dismissEventNudge();
-  expect(store.eventNudge).toBeNull();
-
-  store.connect(context, "onboarding");
-  await waitForFast(() => expect(request).toHaveBeenCalledTimes(2));
-  store.connect(context, "caretaker");
-  await waitForFast(() => expect(request).toHaveBeenCalledTimes(3));
-  emitGatewayEvent({
-    event: "health",
-    payload: reloadFailure,
-  });
-
-  expect(store.eventNudge).not.toBeNull();
-});

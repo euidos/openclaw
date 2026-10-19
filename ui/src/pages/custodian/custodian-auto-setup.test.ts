@@ -11,39 +11,30 @@ import type { SetupAutoResult } from "./custodian-auto-setup.ts";
 import { createContext, mountPage } from "./custodian-page.test-harness.ts";
 import { CustodianSessionStore } from "./custodian-session-store.ts";
 
-const selected = {
-  kind: "codex",
-  label: "ChatGPT",
-  detail: "Saved sign-in",
-  modelRef: "openai/gpt-5.5",
-};
-const alternative = {
-  kind: "ollama",
-  label: "Local model",
-  detail: "Running locally",
-  modelRef: "ollama/qwen3",
-};
+function candidate(kind: string, label: string, modelRef: string) {
+  return { kind, label, modelRef, detail: "Available" };
+}
+const selected = candidate("codex", "ChatGPT", "openai/gpt-5.5");
+const alternative = candidate("ollama", "Local model", "ollama/qwen3");
 function result(status: SetupAutoResult["status"] = "activated"): SetupAutoResult {
   return { status, selected, alternatives: [alternative], attempts: [], installedPlugins: [] };
 }
-const methods = [
-  "openclaw.chat",
-  "openclaw.setup.auto",
-  "openclaw.setup.activate",
-  "openclaw.setup.auth.start",
-];
+const methods = ["chat", "setup.auto", "setup.activate", "setup.auth.start"].map(
+  (method) => "openclaw." + method,
+);
 const agentsList: AgentsListResult = {
   defaultId: "main",
   mainKey: "main",
   scope: "global",
   agents: [{ id: "main" }],
 };
-const reply = {
-  sessionId: "setup-session",
-  reply: "Welcome. What would you like to set up?",
-  action: "none",
-};
+const reply = { sessionId: "setup-session", reply: "Welcome.", action: "none" };
 type Page = Awaited<ReturnType<typeof mountPage>>["page"];
+type Request = Parameters<typeof createContext>[0];
+const text = (page: Page) => expect(page.textContent);
+const alertText = (page: Page) => expect(page.querySelector('[role="alert"]')?.textContent);
+const expectRpc = (request: Request, method: string, params: unknown) =>
+  expect(request).toHaveBeenCalledWith("openclaw.setup." + method, params, { timeoutMs: null });
 function setupRequest(
   auto: () => unknown = () => result(),
   handlers: Record<string, (params?: { answer?: unknown }) => unknown> = {},
@@ -55,9 +46,8 @@ function setupRequest(
 function unavailable(attempts: SetupAutoResult["attempts"] = []): SetupAutoResult {
   return { status: "unavailable", alternatives: [], attempts, installedPlugins: [] };
 }
-const setupContext = (request: Parameters<typeof createContext>[0]) =>
-  createContext(request, methods, { agentsList });
-async function mountSetup(request: Parameters<typeof createContext>[0]) {
+const setupContext = (request: Request) => createContext(request, methods, { agentsList });
+async function mountSetup(request: Request) {
   const harness = setupContext(request);
   const mounted = await mountPage(harness.context);
   await settled(mounted.page);
@@ -68,16 +58,15 @@ async function settled(page: Page, expected = () => true) {
     const ready = () => {
       const setup = page.store.autoSetup;
       if (
-        !expected() ||
-        setup.pending ||
-        page.store.sending ||
-        setup.wizard.state.phase === "starting" ||
-        (setup.wizard.state.phase === "step" && setup.wizard.state.busy)
+        expected() &&
+        !setup.pending &&
+        !page.store.sending &&
+        setup.wizard.state.phase !== "starting" &&
+        !(setup.wizard.state.phase === "step" && setup.wizard.state.busy)
       ) {
-        return;
+        unsubscribe();
+        resolve();
       }
-      unsubscribe();
-      resolve();
     };
     const unsubscribe = page.store.subscribe(ready);
     ready();
@@ -85,12 +74,12 @@ async function settled(page: Page, expected = () => true) {
   flush();
   await page.updateComplete;
 }
-function click(page: Page, text: string) {
-  const button = [...page.querySelectorAll("button")].find(
-    (entry) => entry.textContent?.trim() === text,
-  );
+async function click(page: Page, label: string, expected?: () => boolean) {
+  const buttons = [...page.querySelectorAll("button")];
+  const button = buttons.find((entry) => entry.textContent?.trim() === label);
   expect(button).toBeDefined();
   button!.click();
+  await settled(page, expected);
 }
 
 beforeEach(() => {
@@ -105,42 +94,29 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-it.each([true, false])(
-  "selects an alternative only after successful activation (%s)",
-  async (ok) => {
-    const setup = createDeferred<SetupAutoResult>();
-    const request = setupRequest(() => setup.promise, {
-      "openclaw.setup.activate": () =>
-        ok ? { ok, modelRef: alternative.modelRef } : { ok, error: "Local model is offline" },
-    });
-    const { context } = setupContext(request);
-    const { page } = await mountPage(context);
-    expect(page.textContent).toContain("Connecting your AI");
-    expect(request.mock.calls.map(([method]) => method)).toEqual(["openclaw.setup.auto"]);
-    expect(request).toHaveBeenCalledWith("openclaw.setup.auto", {}, { timeoutMs: null });
-    setup.resolve(result(ok ? "configured" : "activated"));
-    await setup.promise;
-    await settled(page);
-    expect(page.textContent).toContain("Using ChatGPT (openai/gpt-5.5) on gateway.test");
-    expect(page.textContent).toContain(reply.reply);
-    click(page, "Local model");
-    await settled(page);
-    expect(request).toHaveBeenCalledWith(
-      "openclaw.setup.activate",
-      { kind: "ollama" },
-      { timeoutMs: null },
-    );
-    expect(page.textContent).toContain(
-      ok ? "Using Local model (ollama/qwen3) on gateway.test" : "Using ChatGPT",
-    );
-    if (!ok) {
-      expect(page.querySelector('[role="alert"]')?.textContent).toContain("Local model is offline");
-    }
-    expect(request.mock.calls.filter(([method]) => method === "openclaw.setup.auto")).toHaveLength(
-      1,
-    );
-  },
-);
+it.each([true, false])("activates alternatives only on success (%s)", async (ok) => {
+  const setup = createDeferred<SetupAutoResult>();
+  const request = setupRequest(() => setup.promise, {
+    "openclaw.setup.activate": () =>
+      ok ? { ok, modelRef: alternative.modelRef } : { ok, error: "Local model is offline" },
+  });
+  const { context } = setupContext(request);
+  const { page } = await mountPage(context);
+  text(page).toContain("Connecting your AI");
+  expect(request.mock.calls.map(([method]) => method)).toEqual(["openclaw.setup.auto"]);
+  expectRpc(request, "auto", {});
+  setup.resolve(result(ok ? "configured" : "activated"));
+  await settled(page);
+  text(page).toContain("Using ChatGPT (openai/gpt-5.5) on gateway.test");
+  text(page).toContain(reply.reply);
+  await click(page, "Local model");
+  expectRpc(request, "activate", { kind: "ollama" });
+  text(page).toContain(ok ? "Using Local model (ollama/qwen3) on gateway.test" : "Using ChatGPT");
+  if (!ok) {
+    alertText(page).toContain("Local model is offline");
+  }
+  expect(request.mock.calls.filter(([method]) => method === "openclaw.setup.auto")).toHaveLength(1);
+});
 
 it("follows a replacement store without accepting the old store's dismissal", async () => {
   let autoCalls = 0;
@@ -152,91 +128,49 @@ it("follows a replacement store without accepting the old store's dismissal", as
   const previous = page.store;
   page.store = new CustodianSessionStore();
   await settled(page, () => page.store.autoSetup.ready);
-  expect(page.textContent).toContain("Using Local model (ollama/qwen3)");
+  text(page).toContain("Using Local model (ollama/qwen3)");
   previous.autoSetup.dismiss();
   flush();
   await page.updateComplete;
   expect(page.querySelector(".custodian-setup")).not.toBeNull();
-  expect(page.textContent).toContain("Using Local model (ollama/qwen3)");
-  expect(page.textContent).not.toContain("Using ChatGPT");
+  text(page).toContain("Using Local model (ollama/qwen3)");
+  text(page).not.toContain("Using ChatGPT");
 });
 
-it.each(["needs-sign-in", "configured"] as const)(
-  "uses the existing sign-in wizard from %s and refreshes the card after success",
-  async (status) => {
-    let autoCalls = 0;
-    const request = setupRequest(
-      () => {
-        if (autoCalls++) {
-          return result();
-        }
-        return status === "needs-sign-in"
-          ? {
-              ...unavailable(),
-              status,
-              installedPlugins: ["codex"],
-              signIn: { authOptionId: "codex-sign-in", label: "ChatGPT" },
-            }
-          : {
-              ...result(status),
-              selected: { ...selected, shared: true },
-              separateSignIn: { authOptionId: "codex-separate-sign-in", label: "ChatGPT" },
-            };
-      },
-      {
-        "openclaw.setup.auth.start": () => ({ sessionId: "auth-session", done: false }),
-        "wizard.next": (params) =>
-          params?.answer
-            ? { done: true, status: "done" }
-            : {
-                done: false,
-                step: { id: "confirm", type: "confirm", message: "Finish signing in?" },
-              },
-      },
-    );
-    const { page } = await mountSetup(request);
-    if (status === "needs-sign-in") {
-      expect(request.mock.calls.filter(([method]) => method === "openclaw.chat")).toHaveLength(0);
-    } else {
-      expect(page.textContent).toContain(
-        "Using your existing Codex login · sessions shared with Codex",
-      );
-    }
-    click(page, status === "needs-sign-in" ? "Sign in with ChatGPT" : "Use a separate login");
-    await settled(page);
-    expect(request).toHaveBeenCalledWith(
-      "openclaw.setup.auth.start",
-      expect.objectContaining({
-        authChoice: status === "needs-sign-in" ? "codex-sign-in" : "codex-separate-sign-in",
-      }),
-      { timeoutMs: null },
-    );
-    expect(page.textContent).toContain("Finish signing in?");
-    click(page, "Yes");
-    await settled(
-      page,
-      () =>
-        autoCalls === 2 &&
-        page.store.autoSetup.ready &&
-        !page.store.autoSetup.result?.selected?.shared,
-    );
-    expect(autoCalls).toBe(2);
-    expect(page.textContent).toContain("Using ChatGPT");
-    expect(page.textContent).toContain(reply.reply);
-    expect(page.textContent).not.toContain("sessions shared with Codex");
-    expect(page.textContent).not.toContain("Use a separate login");
-  },
-);
-
-it("shows unavailable attempts and the terminal fallback", async () => {
-  const request = vi.fn(async () =>
-    unavailable([{ kind: "codex", label: "ChatGPT", error: "Could not prepare the plugin" }]),
-  );
+it.each(["needs-sign-in", "configured"] as const)("refreshes sign-in from %s", async (status) => {
+  let autoCalls = 0;
+  const shared = status === "configured";
+  const authChoice = shared ? "codex-separate-sign-in" : "codex-sign-in";
+  const signIn = { authOptionId: authChoice, label: "ChatGPT" };
+  const initial = shared
+    ? { ...result(status), selected: { ...selected, shared: true }, separateSignIn: signIn }
+    : { ...unavailable(), status, installedPlugins: ["codex"], signIn };
+  const request = setupRequest(() => (autoCalls++ ? result() : initial), {
+    "openclaw.setup.auth.start": () => ({ sessionId: "auth-session", done: false }),
+    "wizard.next": (params) =>
+      params?.answer
+        ? { done: true, status: "done" }
+        : {
+            done: false,
+            step: { id: "confirm", type: "confirm", message: "Finish signing in?" },
+          },
+  });
   const { page } = await mountSetup(request);
-  expect(page.textContent).toContain("Could not prepare the plugin");
-  expect(page.textContent).toContain("openclaw onboard");
-  expect(page.textContent).toContain("only connect tools you trust");
-  expect(request).toHaveBeenCalledTimes(1);
+  const setup = page.store.autoSetup;
+  if (!shared) {
+    expect(request.mock.calls.filter(([method]) => method === "openclaw.chat")).toHaveLength(0);
+  } else {
+    text(page).toContain("Using your existing Codex login · sessions shared with Codex");
+  }
+  await click(page, shared ? "Use a separate login" : "Sign in with ChatGPT");
+  expectRpc(request, "auth.start", expect.objectContaining({ authChoice }));
+  text(page).toContain("Finish signing in?");
+  await click(page, "Yes", () => autoCalls === 2 && setup.ready && !setup.result?.selected?.shared);
+  expect(autoCalls).toBe(2);
+  text(page).toContain("Using ChatGPT");
+  text(page).toContain(reply.reply);
+  text(page).not.toContain("sessions shared with Codex");
+  text(page).not.toContain("Use a separate login");
 });
 
 it("uses shell-neutral native capabilities for fallback, Gateway selection, and permissions", async () => {
@@ -246,13 +180,13 @@ it("uses shell-neutral native capabilities for fallback, Gateway selection, and 
   window["__OPENCLAW_NATIVE_SETUP__"] = { openAiSetup, openGateways, reviewPermissions };
   const request = vi.fn(async () => unavailable());
   const { page } = await mountSetup(request);
-  click(page, "Open AI setup");
-  click(page, "Use a different Gateway");
-  click(page, "Review permissions");
+  await click(page, "Open AI setup");
+  await click(page, "Use a different Gateway");
+  await click(page, "Review permissions");
   expect(openAiSetup).toHaveBeenCalledOnce();
   expect(openGateways).toHaveBeenCalledOnce();
   expect(reviewPermissions).toHaveBeenCalledOnce();
-  expect(page.textContent).not.toContain("openclaw onboard");
+  text(page).not.toContain("openclaw onboard");
 });
 
 it("updates native recovery when its capability snapshot arrives", async () => {
@@ -261,12 +195,17 @@ it("updates native recovery when its capability snapshot arrives", async () => {
   vi.stubGlobal("webkit", { messageHandlers: { openclawDeviceSettings: { postMessage: post } } });
   vi.stubGlobal("__OPENCLAW_NATIVE_DEVICE_SETTINGS__", snapshot);
   const nativeDeviceSettings = createNativeDeviceSettingsCapability()!;
-  const request = vi.fn(async () => unavailable());
+  const request = vi.fn(async () =>
+    unavailable([{ kind: "codex", label: "ChatGPT", error: "Could not prepare the plugin" }]),
+  );
   const { context } = setupContext(request);
   try {
     const { page } = await mountPage({ ...context, nativeDeviceSettings });
     await settled(page);
-    expect(page.textContent).toContain("openclaw onboard");
+    text(page).toContain("openclaw onboard");
+    text(page).toContain("Could not prepare the plugin");
+    text(page).toContain("only connect tools you trust");
+    expect(request).toHaveBeenCalledTimes(1);
     window.dispatchEvent(
       new CustomEvent("openclaw:native-device-settings-changed", {
         detail: {
@@ -276,9 +215,9 @@ it("updates native recovery when its capability snapshot arrives", async () => {
       }),
     );
     await settled(page);
-    click(page, "Open AI setup");
+    await click(page, "Open AI setup");
     expect(post).toHaveBeenCalledWith({ type: "open", panel: "ai-setup" });
-    expect(page.textContent).not.toContain("openclaw onboard");
+    text(page).not.toContain("openclaw onboard");
   } finally {
     nativeDeviceSettings.dispose();
   }
@@ -289,12 +228,9 @@ it("shows RPC failures and retries without a premature greeting", async () => {
     throw new Error("Gateway lost its connection");
   });
   const { page } = await mountSetup(request);
-  expect(page.querySelector('[role="alert"]')?.textContent).toContain(
-    "Gateway lost its connection",
-  );
+  alertText(page).toContain("Gateway lost its connection");
   expect(request).toHaveBeenCalledTimes(1);
-  click(page, "Retry");
-  await settled(page);
+  await click(page, "Retry");
   expect(request).toHaveBeenCalledTimes(2);
 });
 
@@ -332,8 +268,8 @@ it("ignores an old Gateway result after connection ownership changes", async () 
   pending.resolve(result());
   await pending.promise;
   await settled(page);
-  expect(page.textContent).toContain("Using Local model");
-  expect(page.textContent).not.toContain("Using ChatGPT");
+  text(page).toContain("Using Local model");
+  text(page).not.toContain("Using ChatGPT");
 });
 
 it("preserves the existing caretaker flow without the advertised method", async () => {
