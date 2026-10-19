@@ -14,20 +14,16 @@ async function writeSkill(
   params: { name?: string; description?: string; skillKey?: string } = {},
 ) {
   await fs.mkdir(dir, { recursive: true });
+  const metadata = params.skillKey
+    ? `metadata: ${JSON.stringify({ openclaw: { skillKey: params.skillKey } })}\n`
+    : "";
   await fs.writeFile(
     path.join(dir, "SKILL.md"),
-    [
-      "---",
-      `name: ${params.name ?? path.basename(dir)}`,
-      `description: ${params.description ?? "A local skill"}`,
-      ...(params.skillKey
-        ? [`metadata: ${JSON.stringify({ openclaw: { skillKey: params.skillKey } })}`]
-        : []),
-      "---",
-      "",
-      "# Skill",
-      "",
-    ].join("\n"),
+    `---
+name: ${params.name ?? path.basename(dir)}
+description: ${params.description ?? "A local skill"}
+${metadata}---
+`,
   );
 }
 
@@ -39,29 +35,21 @@ async function initGitSkillRepo(repoDir: string, name = "git-skill") {
 
 async function commitGitSkill(repoDir: string, message: string) {
   await runGitOk(repoDir, ["add", "SKILL.md"]);
-  await runGitOk(repoDir, [
-    "-c",
-    "user.email=test@example.com",
-    "-c",
-    "user.name=Test User",
-    "commit",
-    "-m",
-    message,
-  ]);
+  await runGitOk(repoDir, ["commit", "-m", message]);
 }
 
 async function runGitOk(repoDir: string, args: string[]) {
-  const result = await runCommandWithTimeout(["git", ...args], {
-    cwd: repoDir,
-    timeoutMs: 30_000,
-  });
+  const result = await runCommandWithTimeout(
+    ["git", "-c", "user.email=test@example.com", "-c", "user.name=Test User", ...args],
+    { cwd: repoDir, timeoutMs: 30_000 },
+  );
   if (result.code !== 0) {
     throw new Error(result.stderr || result.stdout || `git ${args.join(" ")} failed`);
   }
   return result.stdout.trim();
 }
 
-async function writeCapturePolicyScript(root: string) {
+async function capturePolicyConfig(capturePath: string) {
   await fs.chmod(root, 0o700);
   const scriptPath = path.join(root, "capture-policy.cjs");
   await fs.writeFile(
@@ -79,19 +67,15 @@ async function writeCapturePolicyScript(root: string) {
     ].join("\n"),
     { mode: 0o700 },
   );
-  return scriptPath;
-}
-
-function capturePolicyConfig(params: { scriptPath: string; capturePath: string }) {
   return {
     security: {
       installPolicy: {
         enabled: true,
         exec: {
           source: "exec" as const,
-          command: params.scriptPath,
-          env: { CAPTURE_PATH: params.capturePath },
-          trustedDirs: [path.dirname(params.scriptPath)],
+          command: scriptPath,
+          env: { CAPTURE_PATH: capturePath },
+          trustedDirs: [root],
         },
       },
     },
@@ -229,18 +213,17 @@ describe("installSkillFromSource", () => {
 
   it("installs a valid SKILL.md that is hardlinked to another file", async () => {
     await writeSkill(sourceDir, { name: "linked-skill" });
-    const sourceSkill = path.join(sourceDir, "SKILL.md");
     const alias = path.join(root, "linked-alias.md");
-    await fs.link(sourceSkill, alias);
+    await fs.link(path.join(sourceDir, "SKILL.md"), alias);
 
     const result = await install();
 
+    const installed = path.join(workspaceDir, "skills", "linked-skill", "SKILL.md");
     expect(result).toMatchObject({
       slug: "linked-skill",
       source: "path",
-      targetDir: path.join(workspaceDir, "skills", "linked-skill"),
+      targetDir: path.dirname(installed),
     });
-    const installed = path.join(workspaceDir, "skills", "linked-skill", "SKILL.md");
     const [installedStat, aliasStat] = await Promise.all([fs.lstat(installed), fs.lstat(alias)]);
     expect(installedStat.nlink).toBe(1);
     expect(installedStat.ino).not.toBe(aliasStat.ino);
@@ -259,10 +242,11 @@ describe("installSkillFromSource", () => {
       } else if (kind === "frontmatter") {
         await writeSkill(skillDir, { name: "frontmatter-skill", skillKey: "declared-key" });
       }
-      const status = skillStatus();
       const skillKey = kind === "frontmatter" ? "declared-key" : "custom-name";
-      const skill = status.skills.find((entry) => entry.skillKey === skillKey);
-      expect(skill).toMatchObject({ name: "frontmatter-skill", skillKey });
+      expect(skillStatus().skills.find((entry) => entry.skillKey === skillKey)).toMatchObject({
+        name: "frontmatter-skill",
+        skillKey,
+      });
     },
   );
 
@@ -344,12 +328,12 @@ describe("installSkillFromSource", () => {
         );
       }
       vi.stubEnv(variable, poisonPath);
-      const result = await installSkillFromSource({
-        workspaceDir,
-        spec: `git:file://${repoDir}`,
+      const result = await install({ spec: `git:file://${repoDir}` });
+      expect(result).toMatchObject({
+        slug: "good-skill",
+        source: "git",
+        git: { commit: expectedCommit },
       });
-      expect(result).toMatchObject({ slug: "good-skill", source: "git" });
-      expect(result.git?.commit).toBe(expectedCommit);
     },
   );
 
@@ -370,14 +354,12 @@ describe("installSkillFromSource", () => {
         await runGitOk(repoDir, ["checkout", "main"]);
       }
       const commit = await runGitOk(repoDir, ["rev-parse", "HEAD"]);
-      const scriptPath = await writeCapturePolicyScript(root);
       const capturePath = path.join(root, "policy-stdin.json");
       const ref = sourceRef === "commit" ? commit : sourceRef;
 
-      const result = await installSkillFromSource({
-        workspaceDir,
+      const result = await install({
         spec: `git:file://${repoDir}${ref ? `@${ref}` : ""}`,
-        config: capturePolicyConfig({ scriptPath, capturePath }),
+        config: await capturePolicyConfig(capturePath),
       });
 
       const slug = sourceRef === "feature/skill" ? "feature-skill" : "git-skill";
@@ -417,9 +399,7 @@ describe("installSkillFromSource", () => {
       }),
     );
 
-    const result = await install();
-
-    expect(result).toMatchObject({ slug: "frontmatter-skill" });
+    expect(await install()).toMatchObject({ slug: "frontmatter-skill" });
     const lock = JSON.parse(
       await fs.readFile(path.join(workspaceDir, ".clawhub", "lock.json"), "utf8"),
     ) as { skills: Record<string, unknown> };

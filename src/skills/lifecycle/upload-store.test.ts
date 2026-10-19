@@ -1,4 +1,3 @@
-// Upload store tests cover SQLite staging, integrity, concurrency, and cleanup.
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -36,16 +35,6 @@ async function makeStore() {
   return { root, databasePath, store: defaultSkillUploadStore };
 }
 
-async function commitUploadFixture(
-  store: typeof defaultSkillUploadStore,
-  databasePath: string,
-  slug: string,
-) {
-  const upload = await stageUpload(store, slug);
-  commitStagedFixture(databasePath, upload.uploadId);
-  return upload;
-}
-
 function beginUpload(store: typeof defaultSkillUploadStore, slug: string, sizeBytes = 3) {
   return store.begin({ kind: "skill-archive", slug, sizeBytes });
 }
@@ -58,15 +47,18 @@ function sendChunk(
   return store.chunk({ uploadId, offset, dataBase64: bytes.toString("base64") });
 }
 
-async function stageUpload(store: typeof defaultSkillUploadStore, slug: string) {
+async function committedUpload(
+  store: typeof defaultSkillUploadStore,
+  slug: string,
+  databasePath?: string,
+) {
   const upload = await store.begin({ kind: "skill-archive", slug, sizeBytes: 3 });
   await store.chunk({ uploadId: upload.uploadId, offset: 0, dataBase64: "YWJj" });
-  return upload;
-}
-
-async function committedUpload(store: typeof defaultSkillUploadStore, slug: string) {
-  const upload = await stageUpload(store, slug);
-  await store.commit({ uploadId: upload.uploadId });
+  if (databasePath) {
+    commitStagedFixture(databasePath, upload.uploadId);
+  } else {
+    await store.commit({ uploadId: upload.uploadId });
+  }
   return upload;
 }
 
@@ -124,14 +116,10 @@ function observeExpiredUploadInventory(): Promise<void> {
   return observed.promise;
 }
 
-function chunkCount(databasePath: string, uploadId?: string): number {
-  const row = uploadId
-    ? stateDatabase(databasePath)
-        .prepare("SELECT count(*) AS count FROM skill_upload_chunks WHERE upload_id = ?")
-        .get(uploadId)
-    : stateDatabase(databasePath)
-        .prepare("SELECT count(*) AS count FROM skill_upload_chunks")
-        .get();
+function chunkCount(databasePath: string, uploadId: string): number {
+  const row = stateDatabase(databasePath)
+    .prepare("SELECT count(*) AS count FROM skill_upload_chunks WHERE upload_id = ?")
+    .get(uploadId);
   return (row as { count: number }).count;
 }
 
@@ -162,6 +150,17 @@ function deferred() {
   return { promise, resolve };
 }
 
+function holdUpload(store: typeof defaultSkillUploadStore, uploadId: string) {
+  const entered = deferred();
+  const release = deferred();
+  const pinned = store.withCommittedUpload(uploadId, async () => {
+    entered.resolve();
+    await release.promise;
+    return true;
+  });
+  return { entered, release, pinned };
+}
+
 async function expectUploadError(
   promise: Promise<unknown>,
   message: string | RegExp,
@@ -187,20 +186,15 @@ describe("skill upload store", () => {
     const { root, databasePath, store } = await makeStore();
     const archive = Buffer.from("zip-bytes");
     const digest = sha256(archive);
-    const begin = await store.begin({
-      kind: "skill-archive",
+    const request = {
+      kind: "skill-archive" as const,
       slug: "demo-skill",
       sizeBytes: archive.length,
       sha256: digest,
       idempotencyKey: "same-upload",
-    });
-    const repeated = await store.begin({
-      kind: "skill-archive",
-      slug: "demo-skill",
-      sizeBytes: archive.length,
-      sha256: digest,
-      idempotencyKey: "same-upload",
-    });
+    };
+    const begin = await store.begin(request);
+    const repeated = await store.begin(request);
     expect(repeated.uploadId).toBe(begin.uploadId);
 
     await sendChunk(store, begin.uploadId, archive.subarray(0, 3));
@@ -369,7 +363,7 @@ describe("skill upload store", () => {
     await expectUploadError(sendChunk(store, begin.uploadId, archive), "upload has expired");
     expect(uploadCount(databasePath)).toBe(0);
 
-    const committed = await commitUploadFixture(store, databasePath, "committed-skill");
+    const committed = await committedUpload(store, "committed-skill", databasePath);
     expireUpload(databasePath, committed.uploadId);
     await expectUploadError(
       store.withCommittedUpload(committed.uploadId, async (record) => record),
@@ -380,15 +374,9 @@ describe("skill upload store", () => {
 
   it("does not sweep an upload while an install holds its lease", async () => {
     const { databasePath, store } = await makeStore();
-    const committed = await commitUploadFixture(store, databasePath, "pinned-skill");
+    const committed = await committedUpload(store, "pinned-skill", databasePath);
 
-    const entered = deferred();
-    const release = deferred();
-    const pinned = store.withCommittedUpload(committed.uploadId, async () => {
-      entered.resolve();
-      await release.promise;
-      return true;
-    });
+    const { entered, release, pinned } = holdUpload(store, committed.uploadId);
     await entered.promise;
     expireUpload(databasePath, committed.uploadId);
     const inventoryRead = observeExpiredUploadInventory();
@@ -410,15 +398,10 @@ describe("skill upload store", () => {
   it("rechecks chunk expiry after cleanup waits on another install", async () => {
     const { databasePath, store } = await makeStore();
     const archive = Buffer.from("abc");
-    const pinnedUpload = await commitUploadFixture(store, databasePath, "blocking-skill");
+    const pinnedUpload = await committedUpload(store, "blocking-skill", databasePath);
     const pending = await beginUpload(store, "waiting-skill", archive.length);
 
-    const entered = deferred();
-    const release = deferred();
-    const pinned = store.withCommittedUpload(pinnedUpload.uploadId, async () => {
-      entered.resolve();
-      await release.promise;
-    });
+    const { entered, release, pinned } = holdUpload(store, pinnedUpload.uploadId);
     await entered.promise;
     expireUpload(databasePath, pinnedUpload.uploadId);
     const inventoryRead = observeExpiredUploadInventory();
@@ -438,17 +421,12 @@ describe("skill upload store", () => {
 
   it("renews the install lease and preserves an expired leased upload", async () => {
     const { databasePath, store } = await makeStore();
-    const committed = await commitUploadFixture(store, databasePath, "heartbeat-skill");
+    const committed = await committedUpload(store, "heartbeat-skill", databasePath);
 
-    const entered = deferred();
-    const release = deferred();
     vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
     const intervals = vi.spyOn(globalThis, "setInterval");
     const renewalSettled = observeSkillUploadRenewal();
-    const pinned = store.withCommittedUpload(committed.uploadId, async () => {
-      entered.resolve();
-      await release.promise;
-    });
+    const { entered, release, pinned } = holdUpload(store, committed.uploadId);
     try {
       await entered.promise;
       const db = stateDatabase(databasePath);
@@ -532,43 +510,34 @@ describe("skill upload store", () => {
     expect(installLeaseCount(databasePath, committed.uploadId)).toBe(0);
   });
 
-  it("does not remove an upload after the callback loses lease ownership", async () => {
+  it.each(["replaced", "expired"])("does not remove an upload with a %s lease", async (kind) => {
     const { databasePath, store } = await makeStore();
-    const committed = await committedUpload(store, "replacement-owner-skill");
+    const committed = await committedUpload(store, "lost-lease-skill");
 
     await store.withCommittedUpload(committed.uploadId, async (_record, controls) => {
-      const replacementAt = Date.now();
-      stateDatabase(databasePath)
-        .prepare(
+      const db = stateDatabase(databasePath);
+      const now = Date.now();
+      if (kind === "replaced") {
+        db.prepare(
           "UPDATE state_leases SET owner = ?, expires_at = ?, updated_at = ? WHERE scope = 'skill-upload-install' AND lease_key = ?",
-        )
-        .run("replacement-owner", replacementAt + 60_000, replacementAt, committed.uploadId);
-      await expectUploadError(controls.remove(), "upload install lease is no longer active");
-    });
-
-    expect(uploadCount(databasePath)).toBe(1);
-    expect(
-      stateDatabase(databasePath)
-        .prepare(
-          "SELECT owner FROM state_leases WHERE scope = 'skill-upload-install' AND lease_key = ?",
-        )
-        .get(committed.uploadId),
-    ).toMatchObject({ owner: "replacement-owner" });
-  });
-
-  it("does not remove an upload after its install lease expires", async () => {
-    const { databasePath, store } = await makeStore();
-    const committed = await committedUpload(store, "expired-owner-skill");
-
-    await store.withCommittedUpload(committed.uploadId, async (_record, controls) => {
-      stateDatabase(databasePath)
-        .prepare(
+        ).run("replacement-owner", now + 60_000, now, committed.uploadId);
+      } else {
+        db.prepare(
           "UPDATE state_leases SET expires_at = ? WHERE scope = 'skill-upload-install' AND lease_key = ?",
-        )
-        .run(Date.now() - 1, committed.uploadId);
+        ).run(now - 1, committed.uploadId);
+      }
       await expectUploadError(controls.remove(), "upload install lease is no longer active");
     });
 
     expect(uploadCount(databasePath)).toBe(1);
+    if (kind === "replaced") {
+      expect(
+        stateDatabase(databasePath)
+          .prepare(
+            "SELECT owner FROM state_leases WHERE scope = 'skill-upload-install' AND lease_key = ?",
+          )
+          .get(committed.uploadId),
+      ).toMatchObject({ owner: "replacement-owner" });
+    }
   });
 });
