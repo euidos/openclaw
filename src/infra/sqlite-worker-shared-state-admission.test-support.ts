@@ -178,57 +178,71 @@ export function registerSharedStateWorkerAdmissionTests(
     }
   });
 
-  it.each([false, true])("services direct broker commit admission while a native writer waits, single statement=%s", async (singleStatement) => {
-    const captured = createContext();
-    const { store, run } = await preparedStore(captured);
-    const stages: string[] = [];
-    let nativeFailure: unknown;
-    let nativeWrites = 0;
-    const auditOptions = { scope: "shared-state-broker", maxEntries: 20 };
-    const workerRecord = prepareSqliteAuditRecord(auditOptions.scope, {
-      key: "synthetic-broker-worker",
-      value: "synthetic-worker-value",
-      createdAt: 1,
-    });
-    const nativeRecord = { ...workerRecord, event_key: "synthetic-broker-native" };
-    try {
-      await run(
-        { type: "diagnostic.register", input: { ...auditOptions, record: workerRecord } },
-        (request, grant) => {
-          stages.push(request.stage);
-          expect(grant()).toBe(true);
-          if (request.stage === "transaction") {
-            // The worker holds BEGIN IMMEDIATE and next needs its commit grant.
-            try {
-              runOpenClawStateWriteTransaction(
-                ({ db }) => {
-                  nativeWrites += 1;
-                  return createSqliteAuditRecordKernel(db, auditOptions).register(nativeRecord);
-                },
-                { path: captured.admission.databasePath, env: captured.environment },
-                singleStatement ? { singleStatement: true } : {},
-              );
-            } catch (error) {
-              nativeFailure = error;
-            }
-          }
-        },
-      );
-      expect(nativeFailure).toBeUndefined();
-      expect(nativeWrites).toBe(1);
-      expect(stages).toEqual(["transaction", "commit"]);
-      const database = openOpenClawStateDatabase({
-        path: captured.admission.databasePath,
-        env: captured.environment,
+  it.each([false, true])(
+    "services direct broker commit admission while a native writer waits, single statement=%s",
+    async (singleStatement) => {
+      const captured = createContext();
+      const { store, run } = await preparedStore(captured);
+      const stages: string[] = [];
+      let nativeFailure: unknown;
+      let nativeWrites = 0;
+      const auditOptions = { scope: "shared-state-broker", maxEntries: 20 };
+      const workerRecord = prepareSqliteAuditRecord(auditOptions.scope, {
+        key: "synthetic-broker-worker",
+        value: "synthetic-worker-value",
+        createdAt: 1,
       });
-      expect(createSqliteAuditRecordKernel(database.db, auditOptions).entries()).toEqual([
-        { key: workerRecord.event_key, value: "synthetic-worker-value", createdAt: 1 },
-        { key: nativeRecord.event_key, value: "synthetic-worker-value", createdAt: 1 },
-      ]);
-    } finally {
-      await store.close();
-    }
-  });
+      const nativeRecord = { ...workerRecord, event_key: "synthetic-broker-native" };
+      try {
+        await run(
+          { type: "diagnostic.register", input: { ...auditOptions, record: workerRecord } },
+          (request, grant) => {
+            stages.push(request.stage);
+            expect(grant()).toBe(true);
+            if (request.stage === "transaction") {
+              // The worker holds BEGIN IMMEDIATE and next needs its commit grant.
+              try {
+                runOpenClawStateWriteTransaction(
+                  ({ db }) => {
+                    nativeWrites += 1;
+                    // Both variants perform one write, including the autocommit path.
+                    return db
+                      .prepare(
+                        "INSERT INTO diagnostic_events(scope,event_key,payload_json,created_at,sequence) VALUES (?,?,?,?,?)",
+                      )
+                      .run(
+                        auditOptions.scope,
+                        nativeRecord.event_key,
+                        nativeRecord.payload_json,
+                        nativeRecord.created_at,
+                        2,
+                      );
+                  },
+                  { path: captured.admission.databasePath, env: captured.environment },
+                  singleStatement ? { singleStatement: true } : {},
+                );
+              } catch (error) {
+                nativeFailure = error;
+              }
+            }
+          },
+        );
+        expect(nativeFailure).toBeUndefined();
+        expect(nativeWrites).toBe(1);
+        expect(stages).toEqual(["transaction", "commit"]);
+        const database = openOpenClawStateDatabase({
+          path: captured.admission.databasePath,
+          env: captured.environment,
+        });
+        expect(createSqliteAuditRecordKernel(database.db, auditOptions).entries()).toEqual([
+          { key: workerRecord.event_key, value: "synthetic-worker-value", createdAt: 1 },
+          { key: nativeRecord.event_key, value: "synthetic-worker-value", createdAt: 1 },
+        ]);
+      } finally {
+        await store.close();
+      }
+    },
+  );
 
   it.each(["abort", "revoke", "exit"] as const)(
     "settles a queued %s without mutating its rows behind a native writer",
