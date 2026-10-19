@@ -50,18 +50,18 @@ it("keeps unrelated legacy content and planner maintenance outside a version mig
   openOpenClawStateDatabase({ env });
   const pathname = resolveOpenClawAgentSqlitePath({ agentId: "main", env });
   fs.mkdirSync(path.dirname(pathname), { recursive: true });
-  const message = (text: string) => ({
-    role: "assistant",
-    content: [{ type: "text", text: `[[reply_to_current]] ${text}` }],
-  });
-  const event = JSON.stringify(
+  const makeEvent = (id: string, extra: Record<string, unknown> = {}) =>
     createEvent({
-      id: "retained",
+      id,
       parentId: null,
       timestamp: 1,
-      message: { ...message("retained"), MediaPath: "/media/retained.png" },
-    }),
-  );
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: `[[reply_to_current]] ${id}` }],
+        ...extra,
+      },
+    });
+  const event = JSON.stringify(makeEvent("retained", { MediaPath: "/media/retained.png" }));
   const trajectory = JSON.stringify({
     data: { messagesSnapshot: [{ role: "user", MediaPath: "/media/retained.png" }] },
   });
@@ -111,11 +111,7 @@ it("keeps unrelated legacy content and planner maintenance outside a version mig
     agentId: "current",
     env,
     schemaVersion: OPENCLAW_AGENT_SCHEMA_VERSION,
-    eventsBySession: {
-      current: [
-        createEvent({ id: "current", parentId: null, timestamp: 1, message: message("current") }),
-      ],
-    },
+    eventsBySession: { current: [makeEvent("current")] },
   });
   const runPrelude = () =>
     withDoctorSqliteMaintenanceLock({
