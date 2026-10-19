@@ -367,10 +367,11 @@ export function createChatInputRecovery(params: {
   source: ReturnType<typeof createOperatorInputRecoverySource>;
 }) {
   const { request, source } = params;
-  // Attached-client capabilities cannot be re-created after the connection ends.
+  // Process-local capabilities cannot be re-created after restart.
   if (
     !source ||
     request.toolBindings ||
+    request.providerReviewAcknowledgment ||
     request.goalOperation ||
     request.turnKind !== "main" ||
     (request.systemInputProvenance && request.systemInputProvenance.kind !== "external_user")

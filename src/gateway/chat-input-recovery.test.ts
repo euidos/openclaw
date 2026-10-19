@@ -7,6 +7,11 @@ import {
 import { replaceSessionEntry } from "../config/sessions/session-accessor.js";
 import { stageSessionPendingInput } from "../config/sessions/session-accessor.pending-inputs.js";
 import { loadOrCreateDeviceIdentityAsync } from "../infra/device-identity-async.js";
+import {
+  issueProviderReviewAcknowledgment,
+  recordSessionProviderReview,
+  retireProviderReviewAcknowledgment,
+} from "../sessions/provider-review.js";
 import type { PersistedUserTurnMessage } from "../sessions/user-turn-transcript.types.js";
 import { setUserProfileRole } from "../state/user-profile-writes.worker.js";
 import { ensureProfileForEmail } from "../state/user-profiles.js";
@@ -120,6 +125,60 @@ async function prepareInput(stateDir: string, approvedText: string, withProvenan
 }
 
 describe("interrupted chat input recovery", () => {
+  it("leaves provider-review continuations with their process-bound acknowledgment owner", () =>
+    withInput(async ({ fixture }) => {
+      const reviewTarget = {
+        ...fixture.target,
+        lifecycleRevision: fixture.entry.lifecycleRevision,
+      };
+      const review = await recordSessionProviderReview({
+        target: reviewTarget,
+        refusal: {
+          runId: "refused-run",
+          provider: "openai",
+          model: "gpt-5.6-sol",
+          runtimeId: "codex",
+          api: "openai-chatgpt-responses",
+          nativeThreadId: "review-thread",
+          nativeTurnId: "refused-turn",
+          review: {
+            explanation: "Review the proposed operation.",
+            continuation: { message: "Continue the reviewed input" },
+          },
+        },
+        assertCurrent() {},
+      });
+      const acknowledgment = await issueProviderReviewAcknowledgment({
+        target: reviewTarget,
+        reviewId: review.id,
+        nextRunId: "review-continuation",
+        assertCurrent() {},
+      });
+      try {
+        const normalized = await normalizeChatSendRequest({
+          client: fixture.client,
+          params: {
+            sessionKey: fixture.target.sessionKey,
+            sessionId: fixture.target.sessionId,
+            idempotencyKey: "review-continuation",
+            message: "Continue the reviewed input",
+          },
+          providerReviewAcknowledgment: acknowledgment,
+        });
+        if (!normalized.ok) {
+          throw new Error(normalized.error);
+        }
+        expect(
+          createChatInputRecovery({
+            request: normalized.value,
+            source: fixture.entry.restartRecoveryOperatorSource,
+          }),
+        ).toBeUndefined();
+      } finally {
+        retireProviderReviewAcknowledgment(acknowledgment);
+      }
+    }));
+
   it("retains approved input, media, identity, provenance and chat options under the original operator", () =>
     withInput(
       async ({ fixture, target, message, options }) => {

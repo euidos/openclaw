@@ -80,7 +80,9 @@ Automatic chat-input recovery is limited to inputs accepted in the past 24 hours
 Cancelled inputs and reset, archived, or replaced sessions do not resume. Inputs
 whose operator access was revoked, or whose attached client capabilities cannot
 be restored, remain interrupted with the existing recovery notice. Incognito
-inputs do not survive a process restart.
+inputs do not survive a process restart. Provider-review continuations require
+their process-local acknowledgment and are not replayed automatically; refresh
+the findings and acknowledge them again after restart.
 
 The Control UI retains accepted text and attachments in its outbox until the
 Gateway confirms transcript consumption. Reconnect and manual retries reconcile
