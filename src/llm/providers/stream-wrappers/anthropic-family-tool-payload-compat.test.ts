@@ -13,8 +13,14 @@ function querySchema() {
 function lookupTool() {
   return { name: "lookup", parameters: querySchema() };
 }
-function lookupFunction() {
-  return { type: "function", function: lookupTool() };
+function functionTool(definition: Record<string, unknown>) {
+  return { type: "function", function: definition };
+}
+function customTool(input_schema = emptySchema()) {
+  return { type: "custom", custom: { name: "shell", input_schema } };
+}
+function allowedTools(mode: string, tools: unknown[]) {
+  return { type: "allowed_tools", allowed_tools: { mode, tools } };
 }
 
 function invalidTool(name = "bad_schema") {
@@ -84,21 +90,14 @@ describe("createOpenAIAnthropicToolPayloadCompatibilityWrapper", () => {
       definition: { name: "lookup", parameters: querySchema() },
     },
   ])("preserves $label projection", ({ tool, definition }) => {
-    expect(runWrapper({ tools: [tool] })?.tools).toEqual([
-      { type: "function", function: definition },
-    ]);
+    expect(runWrapper({ tools: [tool] })?.tools).toEqual([functionTool(definition)]);
   });
 
   it("disables GPT-5.6 reasoning when projecting function tools", () => {
     const payload = runWrapper(
       {
         reasoning_effort: "low",
-        tools: [
-          {
-            name: "lookup",
-            parameters: emptySchema(),
-          },
-        ],
+        tools: [{ name: "lookup", parameters: emptySchema() }],
       },
       { ...model, id: "gpt-5.6-luna" },
     );
@@ -120,14 +119,7 @@ describe("createOpenAIAnthropicToolPayloadCompatibilityWrapper", () => {
     });
 
     expect(payload?.tools).toEqual([
-      {
-        type: "function",
-        function: {
-          name: "lookup",
-          description: "Lookup",
-          parameters: querySchema(),
-        },
-      },
+      functionTool({ name: "lookup", description: "Lookup", parameters: querySchema() }),
     ]);
     expect(payload?.tool_choice).toEqual({ type: "function", function: { name: "lookup" } });
   });
@@ -156,10 +148,7 @@ describe("createOpenAIAnthropicToolPayloadCompatibilityWrapper", () => {
     circularSchema.self = circularSchema;
     const payload = runWrapper({
       tools: [
-        {
-          name: "circular_schema",
-          parameters: circularSchema,
-        },
+        { name: "circular_schema", parameters: circularSchema },
         {
           type: "function",
           function: {
@@ -174,29 +163,14 @@ describe("createOpenAIAnthropicToolPayloadCompatibilityWrapper", () => {
             },
           },
         },
-        {
-          name: "invalid_properties",
-          parameters: {
-            type: "object",
-            properties: false,
-          },
-        },
-        {
-          name: "invalid_required",
-          parameters: {
-            type: "object",
-            required: "query",
-          },
-        },
-        {
-          name: "invalid_root",
-          input_schema: [],
-        },
+        { name: "invalid_properties", parameters: { type: "object", properties: false } },
+        invalidTool("invalid_required"),
+        { name: "invalid_root", input_schema: [] },
         lookupTool(),
       ],
     });
 
-    expect(payload?.tools).toEqual([lookupFunction()]);
+    expect(payload?.tools).toEqual([functionTool(lookupTool())]);
   });
 
   it("preserves JSON-serializable dynamic schema references", () => {
@@ -245,15 +219,7 @@ describe("createOpenAIAnthropicToolPayloadCompatibilityWrapper", () => {
     });
 
     expect(payload?.tools).toEqual([
-      {
-        type: "function",
-        function: {
-          name: "lookup",
-          parameters: {
-            type: "object",
-          },
-        },
-      },
+      functionTool({ name: "lookup", parameters: { type: "object" } }),
     ]);
   });
 
@@ -290,6 +256,11 @@ describe("createOpenAIAnthropicToolPayloadCompatibilityWrapper", () => {
   });
 
   it("projects custom tools and named custom choices as OpenAI functions", () => {
+    const schema = {
+      type: "object",
+      properties: { command: { type: "string" } },
+      required: ["command"],
+    };
     const payload = runWrapper({
       tools: [
         {
@@ -297,11 +268,7 @@ describe("createOpenAIAnthropicToolPayloadCompatibilityWrapper", () => {
           custom: {
             name: "shell",
             description: "Run a shell command.",
-            input_schema: {
-              type: "object",
-              properties: { command: { type: "string" } },
-              required: ["command"],
-            },
+            input_schema: schema,
           },
         },
       ],
@@ -313,18 +280,7 @@ describe("createOpenAIAnthropicToolPayloadCompatibilityWrapper", () => {
 
     expect(payload).toEqual({
       tools: [
-        {
-          type: "function",
-          function: {
-            name: "shell",
-            description: "Run a shell command.",
-            parameters: {
-              type: "object",
-              properties: { command: { type: "string" } },
-              required: ["command"],
-            },
-          },
-        },
+        functionTool({ name: "shell", description: "Run a shell command.", parameters: schema }),
       ],
       tool_choice: {
         type: "function",
@@ -355,35 +311,16 @@ describe("createOpenAIAnthropicToolPayloadCompatibilityWrapper", () => {
 
   it("projects allowed custom tool choices against surviving functions", () => {
     const payload = runWrapper({
-      tools: [
-        invalidTool("broken"),
-        {
-          type: "custom",
-          custom: {
-            name: "shell",
-            input_schema: emptySchema(),
-          },
-        },
-      ],
-      tool_choice: {
-        type: "allowed_tools",
-        allowed_tools: {
-          mode: "required",
-          tools: [
-            { type: "function", function: { name: "broken" } },
-            { type: "custom", custom: { name: "shell" } },
-          ],
-        },
-      },
+      tools: [invalidTool("broken"), customTool()],
+      tool_choice: allowedTools("required", [
+        functionTool({ name: "broken" }),
+        { type: "custom", custom: { name: "shell" } },
+      ]),
     });
 
-    expect(payload?.tool_choice).toEqual({
-      type: "allowed_tools",
-      allowed_tools: {
-        mode: "required",
-        tools: [{ type: "function", function: { name: "shell" } }],
-      },
-    });
+    expect(payload?.tool_choice).toEqual(
+      allowedTools("required", [functionTool({ name: "shell" })]),
+    );
   });
 
   it("does not match allowed tools across tool kinds", () => {
@@ -411,20 +348,8 @@ describe("createOpenAIAnthropicToolPayloadCompatibilityWrapper", () => {
 
   it("disables tool calls when no auto-allowed tools survive", () => {
     const payload = runWrapper({
-      tools: [
-        invalidTool("broken"),
-        {
-          type: "custom",
-          custom: { name: "shell" },
-        },
-      ],
-      tool_choice: {
-        type: "allowed_tools",
-        allowed_tools: {
-          mode: "auto",
-          tools: [{ type: "function", function: { name: "broken" } }],
-        },
-      },
+      tools: [invalidTool("broken"), { type: "custom", custom: { name: "shell" } }],
+      tool_choice: allowedTools("auto", [functionTool({ name: "broken" })]),
     });
 
     expect(payload?.tool_choice).toBe("none");
@@ -436,13 +361,7 @@ describe("createOpenAIAnthropicToolPayloadCompatibilityWrapper", () => {
     ["normalized required", "required", "requires a tool, but no tools survived"],
     [
       "required allowed tools",
-      {
-        type: "allowed_tools",
-        allowed_tools: {
-          mode: "required",
-          tools: [{ type: "function", function: { name: "bad_schema" } }],
-        },
-      },
+      allowedTools("required", [functionTool({ name: "bad_schema" })]),
       "no allowed tools survived",
     ],
   ] as const)("rejects %s choices for invalid tools", (name, tool_choice, error) => {
