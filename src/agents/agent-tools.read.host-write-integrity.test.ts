@@ -24,6 +24,27 @@ describe("unrestricted host tool writes", () => {
     return createHostWorkspaceWriteTool(tempDir).execute("write", { path: filePath, content });
   }
 
+  function mutate(
+    kind: "write" | "edit",
+    filePath: string,
+    content: string,
+    options?: Parameters<typeof createHostWorkspaceWriteTool>[1],
+  ) {
+    const tool = (kind === "write" ? createHostWorkspaceWriteTool : createHostWorkspaceEditTool)(
+      tempDir,
+      options,
+    );
+    return tool.execute(
+      "mutation",
+      kind === "write"
+        ? { path: filePath, content }
+        : {
+            path: filePath,
+            edits: [{ oldText: "original", newText: "replacement" }],
+          },
+    );
+  }
+
   it.each([
     { kind: "write", authority: "aborted" },
     { kind: "edit", authority: "revoked" },
@@ -65,15 +86,7 @@ describe("unrestricted host tool writes", () => {
             input: `*** Begin Patch\n*** Update File: ${filePath}\n@@\n-original content\n+replacement content\n*** End Patch`,
           });
         }
-        const tool =
-          kind === "write"
-            ? createHostWorkspaceWriteTool(tempDir, options)
-            : createHostWorkspaceEditTool(tempDir, options);
-        const input =
-          kind === "write"
-            ? { path: filePath, content: "replacement content\n" }
-            : { path: filePath, edits: [{ oldText: "original", newText: "replacement" }] };
-        return tool.execute("permission-write", input);
+        return mutate(kind, filePath, "replacement content\n", options);
       };
 
       const pending = budget.run(() =>
@@ -107,41 +120,34 @@ describe("unrestricted host tool writes", () => {
     },
   );
 
-  function interceptUpdate(filePath: string, mutate: (handle: FileHandle) => void) {
+  function interceptUpdate(filePath: string, intercept: (handle: FileHandle) => void) {
     const realOpen = fs.open.bind(fs);
     vi.spyOn(fs, "open").mockImplementation(async (...args) => {
       const handle = await realOpen(...args);
       if (String(args[0]) === filePath && args[1] === "r+") {
-        mutate(handle);
+        intercept(handle);
       }
       return handle;
     });
   }
 
-  function failExtensionWrites(filePath: string, originalByteLength: number) {
-    interceptUpdate(filePath, (handle) => {
-      const realWrite = handle.write.bind(handle);
-      handle.write = (async (buffer: Buffer, offset: number, length: number, position: number) => {
-        const result = await realWrite(buffer, offset, length, position);
-        if (position >= originalByteLength) {
-          throw Object.assign(new Error("disk full"), { code: "ENOSPC" });
-        }
-        return result;
-      }) as typeof handle.write;
-    });
-  }
-
-  function failPrefixWrites(filePath: string, originalByteLength: number) {
+  function failWrites(filePath: string, originalByteLength: number, prefix = false) {
     interceptUpdate(filePath, (handle) => {
       const realWrite = handle.write.bind(handle);
       let failed = false;
       handle.write = (async (buffer: Buffer, offset: number, length: number, position: number) => {
         if (!failed && position < originalByteLength) {
-          failed = true;
-          await realWrite(buffer, offset, Math.max(1, Math.floor(length / 2)), position);
+          if (prefix) {
+            failed = true;
+            await realWrite(buffer, offset, Math.max(1, Math.floor(length / 2)), position);
+            throw Object.assign(new Error("disk full"), { code: "ENOSPC" });
+          }
+        }
+        const result = await realWrite(buffer, offset, length, position);
+        if (!prefix && position >= originalByteLength) {
           throw Object.assign(new Error("disk full"), { code: "ENOSPC" });
         }
-        return realWrite(buffer, offset, length, position);
+        return result;
       }) as typeof handle.write;
     });
   }
@@ -175,35 +181,23 @@ describe("unrestricted host tool writes", () => {
   }
 
   it.each([
-    { failure: "extension", kind: "write", inject: failExtensionWrites, message: "disk full" },
-    { failure: "prefix", kind: "edit", inject: failPrefixWrites, message: "disk full" },
-    { failure: "truncate", kind: "write", inject: failShrinkTruncate, message: "truncate failed" },
-    {
-      failure: "inspection",
-      kind: "edit",
-      inject: failTargetInspection,
-      message: "inspect failed",
-    },
+    ["extension", "write", failWrites, "disk full"],
+    ["prefix", "edit", (file: string, size: number) => failWrites(file, size, true), "disk full"],
+    ["truncate", "write", failShrinkTruncate, "truncate failed"],
+    ["inspection", "edit", failTargetInspection, "inspect failed"],
   ] as const)(
-    "preserves the original after a $failure failure through $kind",
-    async ({ failure, kind, inject, message }) => {
+    "preserves the original after a %s failure through %s",
+    async (failure, kind, inject, message) => {
       const original = `original\n${"important content\n".repeat(64)}`;
       const filePath = await createFile(original);
       inject(filePath, Buffer.byteLength(original));
       const fallback = vi.spyOn(fs, "writeFile");
-      const tool =
-        kind === "write"
-          ? createHostWorkspaceWriteTool(tempDir)
-          : createHostWorkspaceEditTool(tempDir);
-      const input =
-        kind === "edit"
-          ? { path: filePath, edits: [{ oldText: "original", newText: "replacement" }] }
-          : {
-              path: filePath,
-              content: failure === "truncate" ? "short\n" : "replacement content\n".repeat(64),
-            };
-
-      await expect(tool.execute("failure", input)).rejects.toMatchObject({
+      const pending = mutate(
+        kind,
+        filePath,
+        failure === "truncate" ? "short\n" : "replacement content\n".repeat(64),
+      );
+      await expect(pending).rejects.toMatchObject({
         message,
         code: failure === "extension" || failure === "prefix" ? "ENOSPC" : "EIO",
       });
@@ -254,12 +248,14 @@ describe("unrestricted host tool writes", () => {
     await write(filePath, content);
 
     const after = await fs.stat(filePath);
-    expect(after.ino).toBe(before.ino);
-    expect(after.nlink).toBe(2);
-    expect(after.dev).toBe(before.dev);
+    expect(after).toMatchObject({
+      ino: before.ino,
+      nlink: 2,
+      dev: before.dev,
+      uid: before.uid,
+      gid: before.gid,
+    });
     expect(after.mode & 0o777).toBe(0o640);
-    expect(after.uid).toBe(before.uid);
-    expect(after.gid).toBe(before.gid);
     await expect(fs.readFile(filePath, "utf8")).resolves.toBe(content);
     await expect(fs.readFile(aliasPath, "utf8")).resolves.toBe(content);
   });

@@ -26,6 +26,13 @@ function editor(root: string, options?: Parameters<typeof createHostWorkspaceEdi
     tool.execute("edit", { path: filePath, edits: [{ oldText, newText }] });
 }
 
+function asSource<T>(session: string, receiptAuthority: () => boolean, run: () => T) {
+  return withGatewayToolCallerIdentity(
+    { agentId: "main", sessionKey: `agent:main:${session}`, receiptAuthority },
+    run,
+  );
+}
+
 describe("workspace mutation authority", () => {
   afterEach(() => {
     __setFsSafeTestHooksForTest();
@@ -104,14 +111,7 @@ describe("workspace mutation authority", () => {
         return writer(root, options)("memory.md", "replacement\n");
       };
 
-      const pending = withGatewayToolCallerIdentity(
-        {
-          agentId: "main",
-          sessionKey: "agent:main:workspace-mutations",
-          receiptAuthority: () => current,
-        },
-        execute,
-      );
+      const pending = asSource("workspace-mutations", () => current, execute);
       if (authority === "active") {
         await expect(pending).resolves.toBeDefined();
       } else {
@@ -148,12 +148,9 @@ describe("workspace mutation authority", () => {
         },
       });
       const write = writer(root, { workspaceOnly: true });
-      const pending = withGatewayToolCallerIdentity(
-        {
-          agentId: "main",
-          sessionKey: "agent:main:workspace-mkdir",
-          receiptAuthority: () => current,
-        },
+      const pending = asSource(
+        "workspace-mkdir",
+        () => current,
         () => write("nested/file.txt", "new"),
       );
 

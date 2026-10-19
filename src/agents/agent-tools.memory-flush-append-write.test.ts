@@ -14,13 +14,13 @@ import { withGatewayToolCallerIdentity } from "./tools/gateway-caller-context.js
 const RELATIVE_PATH = "memory/2026-08-08.md";
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
-let declaredWriteTool: ReturnType<typeof createWriteTool>;
 let declaredWriteOutputSchema: JsonSchemaObject;
 
 describe("wrapToolMemoryFlushAppendOnlyWrite output contract", () => {
   let root: string;
   let baseTool: AnyAgentTool;
   const absolute = () => path.join(root, RELATIVE_PATH);
+  const read = () => fs.readFile(absolute(), "utf8");
   async function seed(content: string) {
     await fs.mkdir(path.dirname(absolute()), { recursive: true });
     await fs.writeFile(absolute(), content);
@@ -32,25 +32,22 @@ describe("wrapToolMemoryFlushAppendOnlyWrite output contract", () => {
       ...options,
     });
   }
+  const write = (tool: AnyAgentTool, content: string, filePath = RELATIVE_PATH) =>
+    tool.execute("write", { path: filePath, content });
 
   beforeEach(() => {
     root = tempDirs.make("memory-flush-write-");
-    // Mirror the catalog path: declared schemas are JSON-serialized before the
-    // bridge validates results against them. Read the schema from the public
-    // tool factory so production internals do not need a test-only export.
-    declaredWriteTool = createWriteTool(root);
+    // Mirror the catalog's serialized public schema, not a private test export.
+    const declaredWriteTool = createWriteTool(root);
     const outputSchema = declaredWriteTool.outputSchema;
     if (!isRecord(outputSchema)) {
       throw new Error("The public write tool must declare an object output schema");
     }
     declaredWriteOutputSchema = structuredClone(outputSchema);
-    baseTool = {
-      ...declaredWriteTool,
-      outputSchema: declaredWriteOutputSchema,
-      execute: vi.fn(async () => {
-        throw new Error("append-only wrapper should not delegate for append params");
-      }),
-    };
+    baseTool = { ...declaredWriteTool, outputSchema: declaredWriteOutputSchema };
+    vi.spyOn(baseTool, "execute").mockRejectedValue(
+      new Error("append-only wrapper must not delegate"),
+    );
   });
 
   describe.each(["host", "sandbox"] as const)("%s append", (backend) => {
@@ -80,23 +77,19 @@ describe("wrapToolMemoryFlushAppendOnlyWrite output contract", () => {
       async (_name, existing, content) => {
         await seed(existing);
         const tool = backendTool();
-        await expect(tool.execute("replay", { path: RELATIVE_PATH, content })).rejects.toThrow(
-          "Retry with only new content",
-        );
-        expect(await fs.readFile(absolute(), "utf8")).toBe(existing);
-        await tool.execute("delta", { path: RELATIVE_PATH, content: added });
-        expect(await fs.readFile(absolute(), "utf8")).toBe(
-          existing + (existing.endsWith("\n") ? "" : "\n") + added,
-        );
+        await expect(write(tool, content)).rejects.toThrow("Retry with only new content");
+        expect(await read()).toBe(existing);
+        await write(tool, added);
+        expect(await read()).toBe(existing + (existing.endsWith("\n") ? "" : "\n") + added);
       },
     );
 
     it("creates a note and permits repeated headings with new facts", async () => {
       const tool = backendTool();
-      await tool.execute("create", { path: RELATIVE_PATH, content: saved });
+      await write(tool, saved);
       const content = "# Daily notes\n\n---\n\n## Deployment\nUse port 8421 for Birch.\n";
-      await tool.execute("new-facts", { path: RELATIVE_PATH, content });
-      expect(await fs.readFile(absolute(), "utf8")).toBe(saved + content);
+      await write(tool, content);
+      expect(await read()).toBe(saved + content);
     });
   });
 
@@ -122,39 +115,30 @@ describe("wrapToolMemoryFlushAppendOnlyWrite output contract", () => {
         sessionKey: "agent:main:memory-flush-authority",
         receiptAuthority: () => claim === originalClaim,
       },
-      () => wrapped.execute("source-append", { path: RELATIVE_PATH, content: "hello" }),
+      () => write(wrapped, "hello"),
     );
     await expect(pending).rejects.toThrow("authority is no longer active");
     expect(reachedCommit).toBe(true);
-    expect(await fs.readFile(absolute(), "utf8")).toBe("seed\n");
+    expect(await read()).toBe("seed\n");
   });
 
   it("appends schema-conforming results only to the allowed memory file", async () => {
     await seed("seed");
     const wrapped = wrap();
-    const result = await wrapped.execute("call-append", {
-      path: RELATIVE_PATH,
-      content: "hello",
-    });
+    const result = await write(wrapped, "hello");
     expect(result).toEqual({
       content: [{ type: "text", text: `Appended content to ${RELATIVE_PATH}.` }],
       details: { changed: true },
     });
-    expect(
-      validateJsonSchemaValue({
-        schema: declaredWriteOutputSchema,
-        cacheKey: "test:memory-flush-write-output",
-        value: result.details,
-        cache: false,
-      }).ok,
-    ).toBe(true);
-    expect(await fs.readFile(absolute(), "utf-8")).toBe("seed\nhello");
-    await expect(
-      wrapped.execute("call-sibling", {
-        path: "memory/other-day.md",
-        content: "wrong target",
-      }),
-    ).rejects.toThrow(
+    const validation = validateJsonSchemaValue({
+      schema: declaredWriteOutputSchema,
+      cacheKey: "test:memory-flush-write-output",
+      value: result.details,
+      cache: false,
+    });
+    expect(validation.ok).toBe(true);
+    expect(await read()).toBe("seed\nhello");
+    await expect(write(wrapped, "wrong target", "memory/other-day.md")).rejects.toThrow(
       `Memory flush writes are restricted to ${RELATIVE_PATH}; use that path only.`,
     );
     expect(baseTool.execute).not.toHaveBeenCalled();
@@ -171,13 +155,10 @@ describe("wrapToolMemoryFlushAppendOnlyWrite output contract", () => {
       }
       const wrapped = wrap();
 
-      await expect(
-        wrapped.execute("at-memory-flush", {
-          path: `@${RELATIVE_PATH}`,
-          content: "wrong journal",
-        }),
-      ).rejects.toThrow(/Memory flush writes are restricted/);
-      await expect(fs.readFile(absolute(), "utf8")).resolves.toBe("allowed");
+      await expect(write(wrapped, "wrong journal", `@${RELATIVE_PATH}`)).rejects.toThrow(
+        /Memory flush writes are restricted/,
+      );
+      await expect(read()).resolves.toBe("allowed");
       if (literalState === "file") {
         await expect(fs.readFile(literalPath, "utf8")).resolves.toBe("literal");
       }

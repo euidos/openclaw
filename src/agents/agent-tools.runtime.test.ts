@@ -1,5 +1,5 @@
 import { expectDefined } from "@openclaw/normalization-core";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred as deferred } from "../../test/helpers/promise.js";
 import "./test-helpers/fast-coding-tools.js";
 import "./test-helpers/fast-openclaw-tools.js";
@@ -20,6 +20,10 @@ import { createSessionsYieldTool } from "./tools/sessions-yield-tool.js";
 const abortError = { name: "AbortError", message: "Aborted" };
 const handoffReason = { code: "sessions_yield", turnHandoff: true } as const;
 const emptyResult = () => ({ content: [], details: {} });
+let runAbort: AbortController;
+beforeEach(() => {
+  runAbort = new AbortController();
+});
 
 function tool(execute: AnyAgentTool["execute"], name = "tool"): AnyAgentTool {
   return { ...stubTool(name), label: name, execute };
@@ -30,7 +34,14 @@ async function flushMicrotasks() {
   await Promise.resolve();
 }
 
-function yieldTool(runAbort: AbortController, onYield = () => runAbort.abort(handoffReason)) {
+function wrap(source: AnyAgentTool | AnyAgentTool["execute"], name = "tool") {
+  return wrapToolWithAbortSignal(
+    typeof source === "function" ? tool(source, name) : source,
+    runAbort.signal,
+  );
+}
+
+function yieldTool(onYield = () => runAbort.abort(handoffReason)) {
   return wrapToolWithAbortSignal(
     createSessionsYieldTool({ sessionId: "requester", claimYield: () => true, onYield }),
     runAbort.signal,
@@ -38,55 +49,43 @@ function yieldTool(runAbort: AbortController, onYield = () => runAbort.abort(han
 }
 
 function prepareWithAbort(
-  runAbort: AbortController,
   source: NonNullable<ReturnType<typeof getInternalToolExecutionPreparer>>,
 ) {
-  return expectDefined(
-    getInternalToolExecutionPreparer(
-      wrapToolWithAbortSignal(
-        attachInternalToolExecutionPreparer(tool(vi.fn()), source),
-        runAbort.signal,
-      ),
-    ),
+  const adapted = wrap(attachInternalToolExecutionPreparer(tool(vi.fn()), source));
+  const prepare = expectDefined(
+    getInternalToolExecutionPreparer(adapted),
     "abort-adapted preparer",
-  )({ toolCallId: "aborted", args: {} });
+  );
+  return prepare({ toolCallId: "aborted", args: {} });
 }
 
 describe("wrapToolWithAbortSignal", () => {
-  it("handles a tool rejection when execute aborts the run synchronously", async () => {
-    const runAbort = new AbortController();
+  it("handles rejection after synchronous abort", async () => {
     const pending = deferred<never>();
-    const wrapped = wrapToolWithAbortSignal(
-      tool(() => {
-        runAbort.abort();
-        return pending.promise;
-      }),
-      runAbort.signal,
-    );
+    const wrapped = wrap(() => {
+      runAbort.abort();
+      return pending.promise;
+    });
     await expect(wrapped.execute("call", {})).rejects.toMatchObject(abortError);
     // Vitest reports an unhandled late rejection if the losing promise is detached incorrectly.
     pending.reject(new Error("tool observed the abort"));
     await flushMicrotasks();
   });
 
-  it("still aborts a concurrent sibling when sessions_yield hands off the run", async () => {
-    const runAbort = new AbortController();
-    const sibling = wrapToolWithAbortSignal(
-      tool(() => new Promise<never>(() => {})),
-      runAbort.signal,
-    );
+  it("aborts siblings during yield handoff", async () => {
+    const sibling = wrap(() => new Promise<never>(() => {}));
     const aborted = expect(sibling.execute("sibling", {})).rejects.toMatchObject(abortError);
-    const result = await yieldTool(runAbort).execute("yield", {});
+    const result = await yieldTool().execute("yield", {});
     expect(result).toMatchObject({ details: { status: "yielded" } });
     expect(result).not.toHaveProperty("details.message");
     await aborted;
   });
 
   it.each(["direct", "prepared"] as const)(
-    "only preserves an explicit plugin reload handoff through %s execution",
+    "permits only reloadAndResume handoff (%s)",
     async (mode) => {
       for (const action of ["reloadAndResume", "reload", "list"]) {
-        const runAbort = new AbortController();
+        runAbort = new AbortController();
         const result = emptyResult();
         const execute = async () => {
           runAbort.abort(handoffReason);
@@ -101,7 +100,7 @@ describe("wrapToolWithAbortSignal", () => {
             dispose: () => undefined,
           }));
         }
-        const wrapped = wrapToolWithAbortSignal(source, runAbort.signal);
+        const wrapped = wrap(source);
         let execution: Promise<unknown>;
         if (mode === "prepared") {
           const prepare = expectDefined(getInternalToolExecutionPreparer(wrapped), "preparer");
@@ -122,10 +121,9 @@ describe("wrapToolWithAbortSignal", () => {
     },
   );
 
-  it("preserves the handoff when distinct run and per-call signals both yield", async () => {
-    const runAbort = new AbortController();
+  it("preserves handoff with both signals aborted", async () => {
     const callAbort = new AbortController();
-    const wrapped = yieldTool(runAbort, () => {
+    const wrapped = yieldTool(() => {
       runAbort.abort(handoffReason);
       callAbort.abort(handoffReason);
     });
@@ -136,67 +134,40 @@ describe("wrapToolWithAbortSignal", () => {
     expect(callAbort.signal.reason).toBe(handoffReason);
   });
 
-  it("rejects a caller-authored lookalike handoff without an owner-authored handoff", async () => {
-    const runAbort = new AbortController();
+  it("rejects caller-authored handoff", async () => {
     const callAbort = new AbortController();
-    const wrapped = wrapToolWithAbortSignal(
-      tool(() => new Promise<never>(() => {}), "sessions_yield"),
-      runAbort.signal,
-    );
+    const wrapped = wrap(() => new Promise<never>(() => {}), "sessions_yield");
     const execution = wrapped.execute("yield", {}, callAbort.signal);
     callAbort.abort(handoffReason);
     await expect(execution).rejects.toMatchObject(abortError);
     expect(runAbort.signal.aborted).toBe(false);
   });
 
-  it("rejects sessions_yield when its run owner aborts with a disabled handoff flag", async () => {
-    const runAbort = new AbortController();
-    const wrapped = wrapToolWithAbortSignal(
-      tool(async () => {
-        runAbort.abort({ code: "sessions_yield", turnHandoff: false });
-        return emptyResult();
-      }, "sessions_yield"),
-      runAbort.signal,
-    );
+  it("rejects disabled owner handoff", async () => {
+    const wrapped = wrap(async () => {
+      runAbort.abort({ code: "sessions_yield", turnHandoff: false });
+      return emptyResult();
+    }, "sessions_yield");
     await expect(wrapped.execute("yield", {})).rejects.toMatchObject(abortError);
   });
 
-  it("does not start sessions_yield when the run was already handed off", async () => {
-    const runAbort = new AbortController();
+  it("never starts after handoff", async () => {
     runAbort.abort(handoffReason);
     const onYield = vi.fn();
-    await expect(yieldTool(runAbort, onYield).execute("yield", {})).rejects.toMatchObject(
-      abortError,
-    );
+    await expect(yieldTool(onYield).execute("yield", {})).rejects.toMatchObject(abortError);
     expect(onYield).not.toHaveBeenCalled();
   });
 
-  it("preserves an actual sessions_yield failure after its owner starts the handoff", async () => {
-    const runAbort = new AbortController();
+  it("preserves yield failure during handoff", async () => {
     const yieldError = new Error("yield bookkeeping failed");
-    const wrapped = yieldTool(runAbort, () => {
+    const wrapped = yieldTool(() => {
       runAbort.abort(handoffReason);
       throw yieldError;
     });
     await expect(wrapped.execute("yield", {})).rejects.toBe(yieldError);
   });
 
-  it("does not enter private preparation when the run is already aborted", async () => {
-    const source = vi.fn(async () => ({
-      kind: "ready" as const,
-      args: {},
-      execute: vi.fn(async () => emptyResult()),
-      dispose: vi.fn(),
-    }));
-    const runAbort = new AbortController();
-    runAbort.abort();
-    await expect(prepareWithAbort(runAbort, source)).rejects.toMatchObject({
-      name: "AbortError",
-    });
-    expect(source).not.toHaveBeenCalled();
-  });
-
-  it("disposes cancellation-ignoring private preparation after a later abort", async () => {
+  it.each(["before", "during"])("cancels %s private preparation", async (when) => {
     const started = deferred();
     const blocked = deferred();
     const dispose = vi.fn();
@@ -206,11 +177,19 @@ describe("wrapToolWithAbortSignal", () => {
       await blocked.promise;
       return { kind: "ready" as const, args: {}, execute: body, dispose };
     });
-    const runAbort = new AbortController();
-    const preparing = prepareWithAbort(runAbort, source);
-    await started.promise;
-    runAbort.abort();
+    if (when === "before") {
+      runAbort.abort();
+    }
+    const preparing = prepareWithAbort(source);
+    if (when === "during") {
+      await started.promise;
+      runAbort.abort();
+    }
     await expect(preparing).rejects.toMatchObject({ name: "AbortError" });
+    if (when === "before") {
+      expect(source).not.toHaveBeenCalled();
+      return;
+    }
     blocked.resolve();
     await flushMicrotasks();
     expect(dispose).toHaveBeenCalledOnce();
@@ -233,7 +212,7 @@ it("restricts node-originated runs to the node-safe tool subset", () => {
 });
 
 describe("agent ring-zero tool context", () => {
-  it("isolates concurrent async runs and clears the scope after settlement", async () => {
+  it("isolates concurrent runs and clears scope", async () => {
     const firstReady = deferred();
     const secondReady = deferred();
     const release = deferred();
@@ -253,7 +232,7 @@ describe("agent ring-zero tool context", () => {
     expect(getActiveAgentRingZeroTools()).toEqual([]);
   });
 
-  it("lets nested normal runs explicitly clear inherited authority", () => {
+  it("clears inherited authority in nested runs", () => {
     runWithAgentRingZeroTools([tool(async () => emptyResult(), "ring-zero")], () => {
       expect(getActiveAgentRingZeroTools().map((entry) => entry.name)).toEqual(["ring-zero"]);
       runWithAgentRingZeroTools([], () => expect(getActiveAgentRingZeroTools()).toEqual([]));
@@ -262,7 +241,7 @@ describe("agent ring-zero tool context", () => {
     expect(getActiveAgentRingZeroTools()).toEqual([]);
   });
 
-  it("revokes authority from detached callbacks after the run settles", async () => {
+  it("revokes detached callbacks after settlement", async () => {
     const release = deferred();
     const detachedResult = deferred<readonly AnyAgentTool[]>();
     await runWithAgentRingZeroTools([tool(async () => emptyResult(), "ring-zero")], async () => {
@@ -274,7 +253,7 @@ describe("agent ring-zero tool context", () => {
     expect(await detachedResult.promise).toEqual([]);
   });
 
-  it("revokes retained executable handles after the run settles", async () => {
+  it("revokes retained tools after settlement", async () => {
     const execute = vi.fn(async () => emptyResult());
     let retained: AnyAgentTool | undefined;
     await runWithAgentRingZeroTools([tool(execute, "ring-zero")], async () => {

@@ -28,29 +28,40 @@ function tool(name: string, description = "available"): AnyAgentTool {
   };
 }
 
-function describeTools(...tools: AnyAgentTool[]) {
-  return applyToolAvailabilityDescriptions(tools);
+function describeTools(...tools: (AnyAgentTool | string)[]) {
+  return applyToolAvailabilityDescriptions(
+    tools.map((entry) => (typeof entry === "string" ? tool(entry) : entry)),
+  );
+}
+
+function describeFirst(source: AnyAgentTool, ...siblings: (AnyAgentTool | string)[]) {
+  return expectDefined(describeTools(source, ...siblings)[0], "described tool").description;
+}
+
+function expectGuidance(text: string, included: string[], excluded: string[] = []) {
+  for (const fragment of included) {
+    expect(text).toContain(fragment);
+  }
+  for (const fragment of excluded) {
+    expect(text).not.toContain(fragment);
+  }
 }
 
 describe("createOpenClawCodingTools availability guidance", () => {
-  it.each([false, true])(
-    "directs inter-session messages only to an available sessions_send (available=%s)",
-    (hasSessionsSend) => {
-      const [described] = describeTools(
-        createSessionsYieldTool(),
-        ...(hasSessionsSend ? [tool("sessions_send")] : []),
-      );
-
-      expect(described?.description).toContain("Does not message other sessions");
-      expect(described?.description.includes("use sessions_send")).toBe(hasSessionsSend);
-    },
-  );
+  it.each([false, true])("gates sessions_send guidance (%s)", (hasSessionsSend) => {
+    const text = describeFirst(
+      createSessionsYieldTool(),
+      ...(hasSessionsSend ? ["sessions_send"] : []),
+    );
+    expect(text).toContain("Does not message other sessions");
+    expect(text.includes("use sessions_send")).toBe(hasSessionsSend);
+  });
 
   it.each([
     { available: [], mode: "suggest", deferred: false },
     { available: ["sessions_yield", "agents_wait"], mode: "prefer", deferred: true },
   ] as const)(
-    "separates collector waits from announcing yields: $available $mode deferred=$deferred",
+    "separates collector wait and yield ($mode, deferred=$deferred)",
     ({ available, mode, deferred }) => {
       const availableNames = new Set<string>(available);
       const toolOptions = {
@@ -85,25 +96,23 @@ describe("createOpenClawCodingTools availability guidance", () => {
       for (const name of ["agents_wait", "sessions_yield"] as const) {
         expect(guidance.includes(name)).toBe(availableNames.has(name));
       }
+      for (const field of ["collect", "outputSchema", "groupId"]) {
+        const assertion = availableNames.has("agents_wait")
+          ? expect(spawn.parameters)
+          : expect(spawn.parameters).not;
+        assertion.toHaveProperty(`properties.${field}`);
+      }
       if (availableNames.has("agents_wait")) {
         expect.soft(guidance).toMatch(/collector[^.\n]*no completion notification/i);
         expect(guidance).toMatch(/await with agents_wait/);
-        for (const field of ["collect", "outputSchema", "groupId"]) {
-          expect(spawn.parameters).toHaveProperty(`properties.${field}`);
-        }
       } else {
-        for (const field of ["collect", "outputSchema", "groupId"]) {
-          expect(spawn.parameters).not.toHaveProperty(`properties.${field}`);
-        }
         expect(guidance).not.toContain("collect=true");
       }
     },
   );
 
-  it("uses canonical automation guidance for the retained cron alias", () => {
-    const tools = withMockedPlatform("linux", () =>
-      describeTools(...["exec", "process", "cron"].map((name) => tool(name))),
-    );
+  it("uses canonical guidance for the cron alias", () => {
+    const tools = withMockedPlatform("linux", () => describeTools("exec", "process", "cron"));
     const [exec, process] = tools;
 
     expect(tools.map((entry) => entry.name)).toEqual(["exec", "process", "cron"]);
@@ -115,7 +124,7 @@ describe("createOpenClawCodingTools availability guidance", () => {
     );
   });
 
-  it("preserves plugin and channel ownership when replacing descriptions", () => {
+  it("preserves plugin and channel metadata", () => {
     const originalTool = tool("process", "plugin process");
     setPluginToolMeta(originalTool, { pluginId: "example", optional: false });
     setChannelAgentToolMeta(originalTool as never, { channelId: "example-channel" });
@@ -132,9 +141,9 @@ describe("createOpenClawCodingTools availability guidance", () => {
     });
   });
 
-  it("mentions sessions_spawn only when it survives tool filtering", () => {
-    const withoutSpawn = describeTools(tool("agents_list"), tool("agents_wait"));
-    const withSpawn = describeTools(...withoutSpawn, tool("sessions_spawn"));
+  it("gates sessions_spawn guidance", () => {
+    const withoutSpawn = describeTools("agents_list", "agents_wait");
+    const withSpawn = describeTools(...withoutSpawn, "sessions_spawn");
 
     for (const entry of withoutSpawn) {
       expect(entry.description).not.toContain("sessions_spawn");
@@ -144,98 +153,81 @@ describe("createOpenClawCodingTools availability guidance", () => {
     }
   });
 
-  it.each([false, true])(
-    "describes only executable conversation routes (allowThreadTargets=%s)",
-    (allowThreadTargets) => {
-      const [described] = describeTools(
-        tool("sessions_send", describeSessionsSendTool({ allowThreadTargets })),
-        tool("conversations_list"),
-        tool("conversations_send"),
-      );
-
-      expect(described?.description).toContain("conversations_list");
-      expect(described?.description).toContain("conversations_send");
-      expect(described?.description).not.toContain("conversations_turn");
-    },
-  );
-
-  it("keeps authorized history guidance and the prepared session URL", () => {
-    const sessionLinkBase = "https://gateway.example/control";
-    const [described] = describeTools(
-      tool("sessions_search", describeSessionsSearchTool({ sessionLinkBase })),
-      tool("sessions_history"),
+  it.each([false, true])("names only executable conversation routes (%s)", (allowThreadTargets) => {
+    const text = describeFirst(
+      tool("sessions_send", describeSessionsSendTool({ allowThreadTargets })),
+      "conversations_list",
+      "conversations_send",
     );
 
-    expect(described?.description).toContain("Search visible past sessions");
-    expect(described?.description).toContain("sessions_history");
-    expect(described?.description).toContain(`${sessionLinkBase}/chat/<agentId>`);
-    expect(described?.description.indexOf("Follow up with sessions_history")).toBeLessThan(
-      described?.description.indexOf("When pointing the user at a session") ?? Infinity,
+    expectGuidance(text, ["conversations_list", "conversations_send"], ["conversations_turn"]);
+  });
+
+  it("keeps history guidance and session URL", () => {
+    const sessionLinkBase = "https://gateway.example/control";
+    const text = describeFirst(
+      tool("sessions_search", describeSessionsSearchTool({ sessionLinkBase })),
+      "sessions_history",
+    );
+
+    expect(text).toContain("Search visible past sessions");
+    expect(text).toContain("sessions_history");
+    expect(text).toContain(`${sessionLinkBase}/chat/<agentId>`);
+    expect(text.indexOf("Follow up with sessions_history")).toBeLessThan(
+      text.indexOf("When pointing the user at a session"),
     );
   });
 
-  it("restores conversation lookup guidance only when lookup is authorized", () => {
-    const [described] = describeTools(createConversationsSendTool(), tool("conversations_list"));
-
-    expect(described?.description).toBe(
+  it("names authorized conversation lookup", () => {
+    expect(describeFirst(createConversationsSendTool(), "conversations_list")).toBe(
       "Send directly through a conversationRef from conversations_list. This performs channel delivery; it does not run the local agent in the backing session.",
     );
   });
 
-  it("keeps only authorized spawn follow-ups without losing prepared runtime facts", () => {
-    const [described] = describeTools(
-      tool(
-        "sessions_spawn",
-        describeSessionsSpawnTool({
-          acpAvailable: false,
-          threadAvailable: true,
-          sessionToolsVisibility: "self",
-          swarmEnabled: true,
-        }),
-      ),
-      tool("agents_list"),
-      tool("sessions_history"),
+  it.each([false, true])("preserves spawn facts with full follow-ups=%s", (full) => {
+    const source = full
+      ? createSessionsSpawnTool({ config: { tools: { swarm: true } } })
+      : tool(
+          "sessions_spawn",
+          describeSessionsSpawnTool({
+            acpAvailable: false,
+            threadAvailable: true,
+            sessionToolsVisibility: "self",
+            swarmEnabled: true,
+          }),
+        );
+    const text = describeFirst(
+      source,
+      "agents_list",
+      "sessions_history",
+      ...(full ? [createAgentsWaitTool({}), "subagents"] : []),
     );
-
-    expect(described?.description).toContain("configured agent (see agents_list);");
-    expect(described?.description).toContain("sessions_history");
-    expect(described?.description).not.toContain("agents_wait");
-    expect(described?.description).not.toContain("`subagents`");
-    expect(described?.description).toContain("persistent/thread-bound");
-    expect(described?.description).toContain("(self: current session only)");
-    expect(described?.description).not.toContain('runtime="acp"');
-    // Transcript access alone does not expose execution/delivery diagnostics.
-    expect(described?.description).not.toContain("When diagnosing a missing result");
-  });
-
-  it("preserves original inline spawn guidance when every follow-up remains available", () => {
-    const [described] = describeTools(
-      createSessionsSpawnTool({ config: { tools: { swarm: true } } }),
-      createAgentsWaitTool({}),
-      ...["agents_list", "subagents", "sessions_history"].map((name) => tool(name)),
-    );
-
-    expect(described?.description).toContain(
-      "Execute work directly by default. Delegate a bounded, independent task only when parallel execution or an independent review provides a concrete benefit. Keep dependent steps with the same owner. Once delegation is appropriate, use a hidden subagent unless the user needs to revisit or steer deliberately supervised child work. This includes substantial, bounded API/service investigations that can be handed off with the needed context and capabilities. For hidden subagents, omit `visible` or set it false, and report results through the parent.",
-    );
-    expect(described?.description).not.toContain("trial-and-error");
-    expect(described?.description).toContain("configured agent (see agents_list);");
-    expect(described?.description).toContain("`groupId` groups a batch; await with agents_wait.");
-    expect(described?.description).toContain(
-      "(all: all sessions, cross-agent per tools.agentToAgent)",
-    );
-    expect(described?.description).toContain(
-      "No spawn for quick lookup/single read. Check spawns via `subagents`/`sessions_history`. After spawn,",
-    );
-    expect(described?.description).toContain(
-      "When diagnosing a missing result from an announcing child, use `subagents` to inspect execution and delivery status. Recover existing results or follow up within the still-authorized task; respect intentional cancellation and never loop-poll.",
+    expect(text).toContain("configured agent (see agents_list);");
+    if (!full) {
+      expectGuidance(
+        text,
+        ["sessions_history", "persistent/thread-bound", "(self: current session only)"],
+        ["agents_wait", "`subagents`", 'runtime="acp"', "When diagnosing a missing result"],
+      );
+      return;
+    }
+    expectGuidance(
+      text,
+      [
+        "Execute work directly by default. Delegate a bounded, independent task only when parallel execution or an independent review provides a concrete benefit. Keep dependent steps with the same owner. Once delegation is appropriate, use a hidden subagent unless the user needs to revisit or steer deliberately supervised child work. This includes substantial, bounded API/service investigations that can be handed off with the needed context and capabilities. For hidden subagents, omit `visible` or set it false, and report results through the parent.",
+        "`groupId` groups a batch; await with agents_wait.",
+        "(all: all sessions, cross-agent per tools.agentToAgent)",
+        "No spawn for quick lookup/single read. Check spawns via `subagents`/`sessions_history`. After spawn,",
+        "When diagnosing a missing result from an announcing child, use `subagents` to inspect execution and delivery status. Recover existing results or follow up within the still-authorized task; respect intentional cancellation and never loop-poll.",
+      ],
+      ["trial-and-error"],
     );
   });
 
-  it("names exec for file listing only when exec survives tool filtering", () => {
+  it("gates exec file-listing guidance", () => {
     const nodes = createNodesTool();
     const [withoutExec] = describeTools(nodes);
-    const [withExec] = describeTools(nodes, tool("exec"));
+    const [withExec] = describeTools(nodes, "exec");
 
     expect(withoutExec?.description).toContain("fs.listDir returns sub-directories only");
     expect(withoutExec?.description).not.toContain("use the exec tool with host=node");

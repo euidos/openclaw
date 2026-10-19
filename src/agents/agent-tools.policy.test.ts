@@ -37,12 +37,7 @@ async function storedPolicy(
   entry: Partial<SessionEntry>,
   config: OpenClawConfig = {},
   sessionKey = "agent:main:subagent:limited",
-  resolve: (
-    config: OpenClawConfig,
-    sessionKey: string,
-  ) => ReturnType<
-    typeof resolveInheritedToolPolicyForSession
-  > = resolveSubagentToolPolicyForSession,
+  kind: "subagent" | "inherited" = "subagent",
 ) {
   const store = path.join(
     os.tmpdir(),
@@ -54,7 +49,9 @@ async function storedPolicy(
     { sessionId: "limited", updatedAt: Date.now(), ...entry },
   );
   return withPreparedSessionCapabilityRead(() =>
-    resolve({ ...config, session: { store } }, sessionKey),
+    (kind === "subagent"
+      ? resolveSubagentToolPolicyForSession
+      : resolveInheritedToolPolicyForSession)({ ...config, session: { store } }, sessionKey),
   );
 }
 
@@ -74,6 +71,8 @@ function expectAllowed(
 }
 
 describe("resolveGroupToolPolicy group context validation", () => {
+  const main = "agent:main:main";
+  const groupKey = (id: string) => `agent:main:whatsapp:group:${id}`;
   const config: OpenClawConfig = {
     channels: {
       whatsapp: {
@@ -172,26 +171,26 @@ describe("resolveGroupToolPolicy group context validation", () => {
 });
 
 describe("stored subagent tool policies", () => {
-  it("recomputes a persisted leaf as an orchestrator under the recursive default", async () => {
-    const policy = await storedPolicy({
-      spawnDepth: 1,
-      subagentRole: "leaf",
-      subagentControlScope: "none",
-    });
-    expectAllowed(policy, ["sessions_spawn", "subagents"]);
-  });
-
-  it("keeps flat depth-1 sessions as leaves under an explicit finite cap", async () => {
-    const policy = await storedPolicy(
-      { spawnDepth: 1, subagentRole: "leaf", subagentControlScope: "none" },
-      { agents: { defaults: { subagents: { maxSpawnDepth: 1 } } } },
-    );
-    expectAllowed(
-      policy,
-      ["memory_search", "memory_get"],
-      ["gateway", "sessions_spawn", "subagents", "sessions_search"],
-    );
-  });
+  it.each([undefined, 1])(
+    "recomputes a persisted leaf with depth cap %s",
+    async (maxSpawnDepth) => {
+      const policy = await storedPolicy(
+        { spawnDepth: 1, subagentRole: "leaf", subagentControlScope: "none" },
+        maxSpawnDepth === undefined
+          ? {}
+          : { agents: { defaults: { subagents: { maxSpawnDepth } } } },
+      );
+      if (maxSpawnDepth === undefined) {
+        expectAllowed(policy, ["sessions_spawn", "subagents"]);
+      } else {
+        expectAllowed(
+          policy,
+          ["memory_search", "memory_get"],
+          ["gateway", "sessions_spawn", "subagents", "sessions_search"],
+        );
+      }
+    },
+  );
 
   it("does not let configured allow entries re-enable hard-denied tools", async () => {
     const denied = [
@@ -220,7 +219,7 @@ describe("stored subagent tool policies", () => {
       { inheritedToolAllow: ["custom_plugin_tool"], inheritedToolDeny: ["custom_denied_tool"] },
       {},
       "agent:main:acp:limited",
-      resolveInheritedToolPolicyForSession,
+      "inherited",
     );
     expectAllowed(policy, ["custom_plugin_tool"], ["custom_denied_tool", "read"]);
   });

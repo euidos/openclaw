@@ -202,51 +202,39 @@ describe("memory flush writer availability", () => {
     expect(context.memoryFlush).toStrictEqual({ flushId: "same-compaction-cycle" });
   });
 
-  it("refuses inference when transport policy removes every persistence tool", () => {
+  it.each(["transport", "empty declaration"])("rejects a missing writer: %s", (reason) => {
+    const empty = reason === "empty declaration";
     expect(() =>
-      assembleProviderFlush([persistenceTool("memory-provider")], { messageProvider: "node" }),
+      assembleProviderFlush(
+        empty ? [] : [persistenceTool("memory-provider")],
+        empty
+          ? { memoryFlushTools: flushContext({ persistenceToolNames: [] }) }
+          : { messageProvider: "node" },
+      ),
     ).toThrow(MemoryFlushToolsUnavailableError);
   });
 
-  it("rejects an empty declaration without an owned writer", () => {
-    expect(() =>
-      assembleProviderFlush([], {
-        memoryFlushTools: flushContext({ persistenceToolNames: [] }),
-      }),
-    ).toThrow(MemoryFlushToolsUnavailableError);
-  });
-
-  it("records persistence only after an owned tool completes successfully", async () => {
-    const result = { content: [{ type: "text" as const, text: "saved" }], details: {} };
-    const completion = createDeferred<typeof result>();
-    const owned = persistenceTool("memory-provider");
-    vi.mocked(owned.execute).mockReturnValue(completion.promise);
-    const { assembled, recordPersistenceToolSuccess } = assembleProviderFlush([owned]);
-    const writer = assembled.find((tool) => tool.name === "save_memory")!;
-    const pending = writer.execute("save-call", {});
-    expect(recordPersistenceToolSuccess).not.toHaveBeenCalled();
-    completion.resolve(result);
-    await expect(pending).resolves.toEqual(result);
-    expect(recordPersistenceToolSuccess).toHaveBeenCalledOnce();
-  });
-
-  it.each(["returns an error", "returns isError"])(
-    "does not record persistence when a tool %s",
-    async (failure) => {
+  it.each([
+    ["success", {}, false, 1],
+    ["error status", { status: "error", error: "provider write failed" }, false, 0],
+    ["isError", {}, true, 0],
+  ] as const)(
+    "records only completed successful persistence (%s)",
+    async (_name, details, isError, expectedCalls) => {
       const owned = persistenceTool("memory-provider");
       const result = {
-        content: [{ type: "text" as const, text: "provider write failed" }],
-        ...(failure === "returns isError"
-          ? { isError: true, details: {} }
-          : { details: { status: "error", error: "provider write failed" } }),
+        content: [{ type: "text" as const, text: "saved" }],
+        details,
+        ...(isError ? { isError } : {}),
       };
-      vi.mocked(owned.execute).mockResolvedValue(result);
+      const completion = createDeferred<typeof result>();
+      vi.mocked(owned.execute).mockReturnValue(completion.promise);
       const { assembled, recordPersistenceToolSuccess } = assembleProviderFlush([owned]);
       const call = assembled.find((tool) => tool.name === "save_memory")!.execute("save-call", {});
-      await expect(call).resolves.toMatchObject(
-        failure === "returns isError" ? { isError: true } : { details: { status: "error" } },
-      );
       expect(recordPersistenceToolSuccess).not.toHaveBeenCalled();
+      completion.resolve(result);
+      await expect(call).resolves.toEqual(result);
+      expect(recordPersistenceToolSuccess).toHaveBeenCalledTimes(expectedCalls);
     },
   );
 
