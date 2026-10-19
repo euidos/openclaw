@@ -44,6 +44,17 @@ const reply = {
   action: "none",
 };
 type Page = Awaited<ReturnType<typeof mountPage>>["page"];
+function unavailable(attempts: SetupAutoResult["attempts"] = []): SetupAutoResult {
+  return { status: "unavailable", alternatives: [], attempts, installedPlugins: [] };
+}
+const setupContext = (request: Parameters<typeof createContext>[0]) =>
+  createContext(request, methods, { agentsList });
+async function mountSetup(request: Parameters<typeof createContext>[0]) {
+  const harness = setupContext(request);
+  const mounted = await mountPage(harness.context);
+  await settled(mounted.page);
+  return { ...harness, ...mounted };
+}
 async function settled(page: Page, expected = () => true) {
   await new Promise<void>((resolve) => {
     const ready = () => {
@@ -98,7 +109,7 @@ describe("custodian automatic setup", () => {
       }
       return reply;
     });
-    const { context } = createContext(request, methods, { agentsList });
+    const { context } = setupContext(request);
     const { page } = await mountPage(context);
     expect(page.textContent).toContain("Connecting your AI");
     expect(request.mock.calls.map(([method]) => method)).toEqual(["openclaw.setup.auto"]);
@@ -129,9 +140,7 @@ describe("custodian automatic setup", () => {
           ? { ok: false, error: "Local model is offline" }
           : reply,
     );
-    const { context } = createContext(request, methods, { agentsList });
-    const { page } = await mountPage(context);
-    await settled(page);
+    const { page } = await mountSetup(request);
     click(page, "Local model");
     await settled(page);
     expect(page.textContent).toContain("Using ChatGPT");
@@ -145,9 +154,7 @@ describe("custodian automatic setup", () => {
         ? { ...result(), selected: autoCalls++ === 0 ? selected : alternative }
         : reply,
     );
-    const { context } = createContext(request, methods, { agentsList });
-    const { page } = await mountPage(context);
-    await settled(page);
+    const { page } = await mountSetup(request);
     const previous = page.store;
     page.store = new CustodianSessionStore();
     await settled(page, () => page.store.autoSetup.ready);
@@ -196,9 +203,7 @@ describe("custodian automatic setup", () => {
         }
         return reply;
       });
-      const { context } = createContext(request, methods, { agentsList });
-      const { page } = await mountPage(context);
-      await settled(page);
+      const { page } = await mountSetup(request);
       if (status === "needs-sign-in") {
         expect(request.mock.calls.filter(([method]) => method === "openclaw.chat")).toHaveLength(0);
       } else {
@@ -233,15 +238,10 @@ describe("custodian automatic setup", () => {
   );
 
   it("shows unavailable attempts and the terminal fallback", async () => {
-    const request = vi.fn(async () => ({
-      status: "unavailable",
-      alternatives: [],
-      attempts: [{ kind: "codex", label: "ChatGPT", error: "Could not prepare the plugin" }],
-      installedPlugins: [],
-    }));
-    const { context } = createContext(request, methods, { agentsList });
-    const { page } = await mountPage(context);
-    await settled(page);
+    const request = vi.fn(async () =>
+      unavailable([{ kind: "codex", label: "ChatGPT", error: "Could not prepare the plugin" }]),
+    );
+    const { page } = await mountSetup(request);
     expect(page.textContent).toContain("Could not prepare the plugin");
     expect(page.textContent).toContain("openclaw onboard");
     expect(page.textContent).toContain("only connect tools you trust");
@@ -253,15 +253,8 @@ describe("custodian automatic setup", () => {
     const openGateways = vi.fn();
     const reviewPermissions = vi.fn();
     window["__OPENCLAW_NATIVE_SETUP__"] = { openAiSetup, openGateways, reviewPermissions };
-    const request = vi.fn(async () => ({
-      status: "unavailable",
-      alternatives: [],
-      attempts: [],
-      installedPlugins: [],
-    }));
-    const { context } = createContext(request, methods, { agentsList });
-    const { page } = await mountPage(context);
-    await settled(page);
+    const request = vi.fn(async () => unavailable());
+    const { page } = await mountSetup(request);
     click(page, "Open AI setup");
     click(page, "Use a different Gateway");
     click(page, "Review permissions");
@@ -277,13 +270,8 @@ describe("custodian automatic setup", () => {
     vi.stubGlobal("webkit", { messageHandlers: { openclawDeviceSettings: { postMessage: post } } });
     vi.stubGlobal("__OPENCLAW_NATIVE_DEVICE_SETTINGS__", snapshot);
     const nativeDeviceSettings = createNativeDeviceSettingsCapability()!;
-    const request = vi.fn(async () => ({
-      status: "unavailable",
-      alternatives: [],
-      attempts: [],
-      installedPlugins: [],
-    }));
-    const { context } = createContext(request, methods, { agentsList });
+    const request = vi.fn(async () => unavailable());
+    const { context } = setupContext(request);
     try {
       const { page } = await mountPage({ ...context, nativeDeviceSettings });
       await settled(page);
@@ -312,9 +300,7 @@ describe("custodian automatic setup", () => {
       }
       return reply;
     });
-    const { context } = createContext(request, methods, { agentsList });
-    const { page } = await mountPage(context);
-    await settled(page);
+    const { page } = await mountSetup(request);
     expect(page.querySelector('[role="alert"]')?.textContent).toContain(
       "Gateway lost its connection",
     );
@@ -328,7 +314,7 @@ describe("custodian automatic setup", () => {
     const request = vi.fn(async (method: string) =>
       method === "openclaw.setup.auto" ? result() : reply,
     );
-    const { context } = createContext(request, methods, { agentsList });
+    const { context } = setupContext(request);
     const first = await mountPage(context);
     await settled(first.page);
     first.page.querySelector<HTMLButtonElement>('[aria-label="Dismiss"]')!.click();
@@ -344,7 +330,7 @@ describe("custodian automatic setup", () => {
   it("ignores an old Gateway result after connection ownership changes", async () => {
     const pending = createDeferred<SetupAutoResult>();
     const request = vi.fn(async () => pending.promise);
-    const { context, setGatewaySnapshot } = createContext(request, methods, { agentsList });
+    const { context, setGatewaySnapshot } = setupContext(request);
     const { page } = await mountPage(context);
     const replacement = vi.fn(async (method: string) =>
       method === "openclaw.setup.auto" ? { ...result(), selected: alternative } : reply,

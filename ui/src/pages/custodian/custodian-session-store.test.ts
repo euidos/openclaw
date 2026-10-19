@@ -15,6 +15,27 @@ import {
   currentPluginHelpReference,
 } from "./plugin-help.ts";
 
+const plugin = { id: "example", name: "Example" };
+function chatReply<T extends string | undefined>(sessionId: T, reply = "Ready.") {
+  return { sessionId, reply, action: "none" as const };
+}
+function connectStore(context: Parameters<CustodianSessionStore["connect"]>[0]) {
+  const store = new CustodianSessionStore();
+  store.connect(context, "caretaker");
+  return store;
+}
+function setupStore(
+  request = vi.fn().mockResolvedValue(chatReply("plugin-help-session")),
+  methods = ["openclaw.chat"],
+  options: Parameters<typeof createContext>[2] = {},
+) {
+  const harness = createContext(request, methods, options);
+  return { ...harness, store: connectStore(harness.context), request };
+}
+const idle = (store: CustodianSessionStore) => waitForFast(() => expect(store.sending).toBe(false));
+const canSend = (store: CustodianSessionStore) =>
+  waitForFast(() => expect(store.canSend).toBe(true));
+
 describe("CustodianSessionStore", () => {
   beforeEach(() => {
     installSafeLocalStorageForTesting(window).clear();
@@ -30,15 +51,12 @@ describe("CustodianSessionStore", () => {
     "retains setting help through %s initialization until explicit submission",
     async (phase) => {
       const startup = deferred<never>();
-      const request = vi
-        .fn()
-        .mockResolvedValue({ sessionId: "plugin-help-session", reply: "Ready.", action: "none" });
+      const request = vi.fn().mockResolvedValue(chatReply("plugin-help-session"));
       if (phase !== "cold") {
         request.mockReturnValueOnce(startup.promise);
       }
       const { context, setPathname, setGatewaySnapshot } = createContext(request);
       setPathname("/settings/plugins/example");
-      const plugin = { id: "example", name: "Example" };
       publishPluginHelpContext(context, {}, plugin, { overview: false, installed: true });
       const agentsList = context.agents.state.agentsList;
       if (phase === "metadata") {
@@ -61,7 +79,7 @@ describe("CustodianSessionStore", () => {
       if (phase === "cold") {
         expect(request).not.toHaveBeenCalled();
         store.connect(context, "caretaker");
-        await waitForFast(() => expect(store.canSend).toBe(true));
+        await canSend(store);
         expect(store.input).toBe('Explain Names\n\nCurrent value: ["first"]');
       } else {
         expect(store.input).toBe("Keep this draft.\n\nExplain Limit\n\nCurrent value: 5");
@@ -79,7 +97,7 @@ describe("CustodianSessionStore", () => {
         await store.send();
         expect(request).toHaveBeenCalledOnce();
         store.retry();
-        await waitForFast(() => expect(store.canSend).toBe(true));
+        await canSend(store);
         expect(store.input).toBe(edited);
       }
       expect(request.mock.calls.every((call) => call[1].message === undefined)).toBe(true);
@@ -94,18 +112,12 @@ describe("CustodianSessionStore", () => {
   );
 
   it("appends setting questions without overwriting an ordinary draft or a hosted secret answer", async () => {
-    const request = vi
-      .fn()
-      .mockResolvedValue({ sessionId: "plugin-help-session", reply: "Ready.", action: "none" });
-    const { context } = createContext(request);
-    const store = new CustodianSessionStore();
-    store.connect(context, "caretaker");
-    await waitForFast(() => expect(store.canSend).toBe(true));
+    const { request, context, store } = setupStore();
+    await canSend(store);
     store.setInput("Keep this ordinary draft.");
     store.sensitive = true;
     store.wizardInputPending = true;
     store.setInput("synthetic-answer");
-    const plugin = { id: "example", name: "Example" };
     await createPluginHelpRequest(
       context,
       plugin,
@@ -126,13 +138,8 @@ describe("CustodianSessionStore", () => {
   });
 
   it("masks nested sensitive values, references, sentinels and URL credentials in setting drafts", async () => {
-    const request = vi
-      .fn()
-      .mockResolvedValue({ sessionId: "plugin-help-session", reply: "Ready.", action: "none" });
-    const { context } = createContext(request);
-    const store = new CustodianSessionStore();
-    store.connect(context, "caretaker");
-    await waitForFast(() => expect(store.canSend).toBe(true));
+    const { context, store } = setupStore();
+    await canSend(store);
     const path = ["plugins", "entries", "example", "config", "accounts"];
     const hints = { "plugins.entries.example.config.accounts.*.opaque": { sensitive: true } };
     const values = [
@@ -150,7 +157,10 @@ describe("CustodianSessionStore", () => {
     for (const value of values) {
       const original = structuredClone(value);
       store.setInput("");
-      await createPluginHelpRequest(context, { id: "example", name: "Example" })({
+      await createPluginHelpRequest(
+        context,
+        plugin,
+      )({
         path,
         label: "Accounts",
         value,
@@ -175,9 +185,7 @@ describe("CustodianSessionStore", () => {
   it.each(["operator", "navigation"] as const)(
     "retires plugin references and pending drafts on %s change",
     async (change) => {
-      const request = vi
-        .fn()
-        .mockResolvedValue({ sessionId: "plugin-help-session", reply: "Ready.", action: "none" });
+      const request = vi.fn().mockResolvedValue(chatReply("plugin-help-session"));
       const { context, setGatewayToken, setPathname } = createContext(request);
       setPathname("/settings/plugins/example");
       const owner = {};
@@ -187,8 +195,8 @@ describe("CustodianSessionStore", () => {
         { id: "first", name: "First" },
         { overview: true, installed: true },
       );
-      const plugin = { id: "second", name: "Second" };
-      const releaseCurrent = publishPluginHelpContext(context, owner, plugin, {
+      const currentPlugin = { id: "second", name: "Second" };
+      const releaseCurrent = publishPluginHelpContext(context, owner, currentPlugin, {
         overview: true,
         installed: true,
       });
@@ -196,7 +204,7 @@ describe("CustodianSessionStore", () => {
       expect(currentPluginHelpReference(context)?.id).toBe("second");
       const pending = createPluginHelpRequest(
         context,
-        plugin,
+        currentPlugin,
       )({ path: ["limit"], label: "Limit", value: 5, sensitive: false });
       if (change === "operator") {
         await pending;
@@ -207,9 +215,8 @@ describe("CustodianSessionStore", () => {
       }
       expect(currentPluginHelpReference(context)).toBeUndefined();
       releaseCurrent();
-      const store = new CustodianSessionStore();
-      store.connect(context, "caretaker");
-      await waitForFast(() => expect(store.canSend).toBe(true));
+      const store = connectStore(context);
+      await canSend(store);
       expect(store.input).toBe("");
     },
   );
@@ -217,16 +224,8 @@ describe("CustodianSessionStore", () => {
   it("shares one live session across repeated surface connections", async () => {
     const request = vi
       .fn()
-      .mockResolvedValueOnce({
-        sessionId: "shared-session",
-        reply: "Ready.",
-        action: "none",
-      })
-      .mockResolvedValueOnce({
-        sessionId: "shared-session",
-        reply: "Still here.",
-        action: "none",
-      });
+      .mockResolvedValueOnce(chatReply("shared-session"))
+      .mockResolvedValueOnce(chatReply("shared-session", "Still here."));
     const { context } = createContext(request);
     const store = new CustodianSessionStore();
     const firstSurfaceUpdates = vi.fn();
@@ -257,7 +256,7 @@ describe("CustodianSessionStore", () => {
 
   it("reuses the persisted session id across store instances", async () => {
     const request = vi.fn((_method: string, params: { sessionId: string }) =>
-      Promise.resolve({ sessionId: params.sessionId, reply: "Ready.", action: "none" }),
+      Promise.resolve(chatReply(params.sessionId)),
     );
     const { context } = createContext(request);
 
@@ -274,7 +273,7 @@ describe("CustodianSessionStore", () => {
 
   it.each([false, true])("remints an invalidated session (live=%s)", async (live) => {
     const ready = (_method: string, params: { sessionId: string }) =>
-      Promise.resolve({ sessionId: params.sessionId, reply: "Ready.", action: "none" });
+      Promise.resolve(chatReply(params.sessionId));
     const error = new GatewayRequestError({
       code: live ? "UNAVAILABLE" : "INVALID_REQUEST",
       message: live ? "OpenClaw session expired." : "OpenClaw session belongs to another caller.",
@@ -287,10 +286,8 @@ describe("CustodianSessionStore", () => {
           .mockRejectedValueOnce(error)
           .mockImplementationOnce(ready)
       : vi.fn().mockRejectedValue(error);
-    const { context } = createContext(request);
-    const store = new CustodianSessionStore();
-    store.connect(context, "caretaker");
-    await waitForFast(() => expect(store.sending).toBe(false));
+    const { store } = setupStore(request);
+    await idle(store);
     const staleSessionId = request.mock.calls[0]?.[1].sessionId;
     if (live) {
       expect(store.messages.at(-1)?.text).toBe("Ready.");
@@ -314,12 +311,10 @@ describe("CustodianSessionStore", () => {
       if (method === "openclaw.chat.history") {
         return ++historyCall === 1 ? Promise.resolve({ turns: [] }) : pending.promise;
       }
-      return Promise.resolve({ sessionId: params.sessionId, reply: "Ready.", action: "none" });
+      return Promise.resolve(chatReply(params.sessionId));
     });
-    const { context } = createContext(request, ["openclaw.chat", "openclaw.chat.history"]);
-    const store = new CustodianSessionStore();
-    store.connect(context, "caretaker");
-    await waitForFast(() => expect(store.sending).toBe(false));
+    const { store } = setupStore(request, ["openclaw.chat", "openclaw.chat.history"]);
+    await idle(store);
 
     const firstRefresh = store.refreshTranscriptIfIdle();
     const secondRefresh = store.refreshTranscriptIfIdle();
@@ -384,12 +379,10 @@ describe("CustodianSessionStore", () => {
       if (params.message) {
         return reply.promise;
       }
-      return Promise.resolve({ sessionId: params.sessionId, reply: "Ready.", action: "none" });
+      return Promise.resolve(chatReply(params.sessionId));
     });
-    const { context } = createContext(request, ["openclaw.chat", "openclaw.chat.history"]);
-    const store = new CustodianSessionStore();
-    store.connect(context, "caretaker");
-    await waitForFast(() => expect(store.sending).toBe(false));
+    const { store } = setupStore(request, ["openclaw.chat", "openclaw.chat.history"]);
+    await idle(store);
     expect(store.transcript.status.error).toContain("history unavailable");
 
     const refresh = store.refreshTranscriptIfIdle();
@@ -399,7 +392,7 @@ describe("CustodianSessionStore", () => {
 
     expect(store.transcript.status.error).toContain("history unavailable");
     expect(store.messages.some((message) => message.text === "Stale history")).toBe(false);
-    reply.resolve({ sessionId: "session-after-send", reply: "Continued.", action: "none" });
+    reply.resolve(chatReply("session-after-send", "Continued."));
     await send;
   });
 
@@ -418,16 +411,15 @@ describe("CustodianSessionStore", () => {
             options?.signal?.addEventListener("abort", () => reject(new DOMException("Aborted")));
           });
         }
-        return Promise.resolve({ sessionId: params.sessionId, reply: "Ready.", action: "none" });
+        return Promise.resolve(chatReply(params.sessionId));
       },
     );
     const { context, setGatewaySnapshot } = createContext(initialRequest, [
       "openclaw.chat",
       "openclaw.chat.history",
     ]);
-    const store = new CustodianSessionStore();
-    store.connect(context, "caretaker");
-    await waitForFast(() => expect(store.sending).toBe(false));
+    const store = connectStore(context);
+    await idle(store);
 
     const interruptedSend = store.send("Finish the repair");
     await waitForFast(() => expect(store.sending).toBe(true));
@@ -490,11 +482,10 @@ describe("CustodianSessionStore", () => {
       const displayed = error.message.startsWith("OPENAI_API_KEY=")
         ? "OPENAI_API_KEY=sk-123...cdef"
         : error.message;
-      const request = vi.fn().mockRejectedValueOnce(error).mockResolvedValueOnce({
-        sessionId: "shared-session",
-        reply: "Ready.",
-        action: "none",
-      });
+      const request = vi
+        .fn()
+        .mockRejectedValueOnce(error)
+        .mockResolvedValueOnce(chatReply("shared-session"));
       const { context } = createContext(request);
       const store = new CustodianSessionStore();
 
@@ -529,10 +520,8 @@ describe("CustodianSessionStore", () => {
             throw new Error("Request was not sent.");
           }),
         );
-      const { context } = createContext(request);
-      const store = new CustodianSessionStore();
-      store.connect(context, "caretaker");
-      await waitForFast(() => expect(store.canSend).toBe(true));
+      const { store } = setupStore(request);
+      await canSend(store);
       store.setInput("Original question");
       const sending = store.send();
       expect(store.input).toBe("");
@@ -551,11 +540,7 @@ describe("CustodianSessionStore", () => {
   it("rechecks failed inference without replaying a user turn", async () => {
     const request = vi
       .fn()
-      .mockResolvedValueOnce({
-        sessionId: "shared-session",
-        reply: "Ready.",
-        action: "none",
-      })
+      .mockResolvedValueOnce(chatReply("shared-session"))
       .mockImplementationOnce((_method, _params, options?: { onSent?: () => void }) => {
         options?.onSent?.();
         return Promise.reject(
@@ -566,15 +551,9 @@ describe("CustodianSessionStore", () => {
           }),
         );
       })
-      .mockResolvedValueOnce({
-        sessionId: "shared-session",
-        reply: "Recovered.",
-        action: "none",
-      });
-    const { context } = createContext(request);
-    const store = new CustodianSessionStore();
-    store.connect(context, "caretaker");
-    await waitForFast(() => expect(store.sending).toBe(false));
+      .mockResolvedValueOnce(chatReply("shared-session", "Recovered."));
+    const { store } = setupStore(request);
+    await idle(store);
     await store.send("Check this system");
     expect(store.error).toBe("Runtime verification failed.");
     expect(store.messages.map((message) => message.text)).toContain("Check this system");
@@ -593,11 +572,9 @@ describe("CustodianSessionStore", () => {
     async (utility) => {
       const request = vi.fn();
       if (utility) {
-        request.mockResolvedValue({
-          sessionId: "utility-setup-session",
-          reply: "Choose a primary model for your agent.",
-          action: "none",
-        });
+        request.mockResolvedValue(
+          chatReply("utility-setup-session", "Choose a primary model for your agent."),
+        );
       }
       const { context } = createContext(request, ["openclaw.chat"], {
         agentsList: {
@@ -717,8 +694,7 @@ describe("CustodianSessionStore", () => {
     const { context, emitGatewayEvent } = createContext(request, ["openclaw.chat"], {
       healthRequest,
     });
-    const store = new CustodianSessionStore();
-    store.connect(context, "caretaker");
+    const store = connectStore(context);
     emitGatewayEvent({ event: "tick", payload: {} });
     expect(healthRequest).toHaveBeenCalledOnce();
 
@@ -741,13 +717,11 @@ describe("CustodianSessionStore", () => {
         .fn()
         .mockReturnValueOnce(pending.promise)
         .mockResolvedValue({ channels: {} });
-      const { context, emitGatewayEvent, setGatewaySnapshot, setGatewayToken } = createContext(
+      const { context, store, emitGatewayEvent, setGatewaySnapshot, setGatewayToken } = setupStore(
         request,
         ["openclaw.chat"],
         { healthRequest },
       );
-      const store = new CustodianSessionStore();
-      store.connect(context, "caretaker");
       await waitForFast(() => expect(healthRequest).toHaveBeenCalledOnce());
       if (change === "event") {
         emitGatewayEvent({ event: "health", payload: { channels: {} } });
@@ -768,14 +742,8 @@ describe("CustodianSessionStore", () => {
   );
 
   it("accepts new event nudges after a conversation variant rotates", async () => {
-    const request = vi.fn().mockResolvedValue({
-      sessionId: "shared-session",
-      reply: "Ready.",
-      action: "none",
-    });
-    const { context, emitGatewayEvent } = createContext(request);
-    const store = new CustodianSessionStore();
-    store.connect(context, "caretaker");
+    const request = vi.fn().mockResolvedValue(chatReply("shared-session"));
+    const { context, store, emitGatewayEvent } = setupStore(request);
     await waitForFast(() => expect(request).toHaveBeenCalledOnce());
 
     emitGatewayEvent({
