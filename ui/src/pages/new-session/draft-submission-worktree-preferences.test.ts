@@ -352,7 +352,6 @@ it("does not let a replacement draft's pending preference load restore a consume
     {
       reconciliation: "background",
       signal: expect.any(AbortSignal),
-      retainSentResultOnAbort: true,
     },
   );
 });
@@ -429,7 +428,6 @@ it("retires the restored agent's name despite default-agent hydration", async ()
   expect(retry.context.sessions.createResult).toHaveBeenCalledExactlyOnceWith(original, {
     reconciliation: "background",
     signal: expect.any(AbortSignal),
-    retainSentResultOnAbort: true,
   });
   expect(start).toHaveBeenCalledOnce();
   expect(prefs.stored("work")).toMatchObject({ worktreeName: "" });

@@ -27,6 +27,7 @@ export async function sendMcpAppNewConversation(
     throw new Error(uploadsDisabledMessage());
   }
   const current = () =>
+    !signal?.aborted &&
     context.gateway.snapshot.client === client &&
     gatewayPresentationScope(context.gateway).key === scope &&
     context.router.getState().location === location &&

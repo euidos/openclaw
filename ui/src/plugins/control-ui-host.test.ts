@@ -155,6 +155,7 @@ describe("native UI roster refresh", () => {
     expect(request).toHaveBeenCalledWith("sessions.create", params, {
       timeoutMs: GATEWAY_STARTUP_ADMISSION_WAIT_MS,
       signal: fixture.host.signal,
+      retainSentResultOnAbort: true,
     });
     expect(request).toHaveBeenCalledWith(
       "sessions.list",

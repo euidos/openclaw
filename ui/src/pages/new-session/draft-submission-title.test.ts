@@ -124,7 +124,6 @@ it("keeps a title handoff on the selected draft account before update", async ()
     {
       reconciliation: "background",
       signal: expect.any(AbortSignal),
-      retainSentResultOnAbort: true,
     },
   );
   expect(createdParams(context)).not.toHaveProperty("displayName");
@@ -198,7 +197,6 @@ it.each(["explicit worktree", "pending", "incognito", "retry", "stale"] as const
         {
           reconciliation: "background",
           signal: expect.any(AbortSignal),
-          retainSentResultOnAbort: true,
         },
       );
     } else if (state === "retry") {

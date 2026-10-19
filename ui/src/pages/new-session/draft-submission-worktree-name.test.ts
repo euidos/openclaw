@@ -67,7 +67,6 @@ it.each([true, false])("consumes accepted names, explicit base=%s", async (expli
       {
         reconciliation: "background",
         signal: expect.any(AbortSignal),
-        retainSentResultOnAbort: true,
       },
     );
     expect(place).toMatchObject({ worktree: true, baseRef: "main" });
@@ -162,7 +161,6 @@ it.each([false, true])("retries frozen placement, restored=%s", async (restored)
   expect(retry.create).toHaveBeenLastCalledWith(original, {
     reconciliation: "background",
     signal: expect.any(AbortSignal),
-    retainSentResultOnAbort: true,
   });
   expect(start).toHaveBeenCalledExactlyOnceWith(
     expect.objectContaining({

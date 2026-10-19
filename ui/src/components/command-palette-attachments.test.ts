@@ -118,7 +118,6 @@ async function mount(options: Parameters<typeof createDraftFixture>[0] = {}) {
       expect(create).toHaveBeenCalledExactlyOnceWith(expect.objectContaining(params), {
         reconciliation: "background",
         signal: expect.any(AbortSignal),
-        retainSentResultOnAbort: true,
       }),
   };
 }

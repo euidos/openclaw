@@ -565,7 +565,6 @@ export class DraftSubmissionFlow {
               {
                 reconciliation: "background",
                 signal: requestSignal,
-                retainSentResultOnAbort: true,
               },
             );
       instant = beginInstant?.();

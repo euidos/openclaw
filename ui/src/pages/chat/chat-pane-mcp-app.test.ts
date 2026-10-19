@@ -1,6 +1,9 @@
 import { createRoot } from "solid-js";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { GatewayPendingRequests } from "../../../../packages/gateway-client/src/pending-request.js";
+import type { RequestFrame } from "../../../../packages/gateway-protocol/src/schema/frames.js";
 import { createDeferred } from "../../../../test/helpers/promise.js";
+import { createChatSubmissions } from "../../app/chat-submissions.ts";
 import type { ApplicationContext } from "../../app/context.ts";
 import { MCP_APP_OPEN_EVENT, type McpAppOpenDetail } from "../../components/mcp-app-launch.ts";
 import { MCP_APP_RESOURCE_MENTION_EVENT } from "../../components/mcp-app-resources.tsx";
@@ -14,8 +17,13 @@ import {
 import type { ChatAttachment } from "../../lib/chat/chat-types.ts";
 import { readMcpAppContexts } from "../../lib/mcp-app-context.ts";
 import * as appMessages from "../../lib/mcp-app-new-conversation.ts";
+import {
+  createTestSessionCapability,
+  sessionsResult,
+} from "../../lib/sessions/session-capability.test-support.ts";
 import { createApplicationGateway } from "../../test-helpers/application-context.ts";
 import { createTestGatewayClient } from "../../test-helpers/gateway-client.ts";
+import { StartedSessionNavigation } from "../new-session/started-session-navigation.ts";
 import {
   getChatAttachmentDataUrl,
   releaseChatAttachmentPayloads,
@@ -250,6 +258,73 @@ describe("MCP app pane actions", () => {
     await handleAbortChat(host, { preserveDraft: true });
     expect(signal?.aborted).toBe(true);
     expect(await sent.receipt.promise).toBe(false);
+  });
+
+  it("acknowledges a dispatched new conversation after Stop without navigating or resending", async () => {
+    vi.useFakeTimers();
+    const f = fixture();
+    const pending = new GatewayPendingRequests({
+      createRequestId: () => "mcp-create",
+      nowMs: Date.now,
+    });
+    cleanups.push(() => {
+      pending.flush(new Error("test disposed"));
+      vi.useRealTimers();
+    });
+    const frames: RequestFrame[] = [];
+    const dispatched = createDeferred<RequestFrame>();
+    let requestSignal: AbortSignal | undefined;
+    f.client.request = createTestGatewayClient((method, params, options) => {
+      if (method !== "sessions.create") {
+        return sessionsResult([]);
+      }
+      requestSignal = options?.signal;
+      return pending.request(
+        {
+          send(raw) {
+            // The real request owner serializes this transport frame.
+            const frame = JSON.parse(raw) as RequestFrame;
+            frames.push(frame);
+            dispatched.resolve(frame);
+          },
+        },
+        method,
+        params,
+        options,
+      );
+    }).request;
+    Object.assign(f.context, {
+      router: { getState: () => ({ location: "/chat/one" }) },
+      sessions: createTestSessionCapability(f.context.gateway),
+      chatSubmissions: createChatSubmissions(),
+      config: {},
+    });
+    const navigate = vi.spyOn(StartedSessionNavigation.prototype, "navigate").mockResolvedValue();
+    const host = Object.assign(makeChatHost({ client: f.client, sessionKey: f.state.sessionKey }), {
+      handleSendChat: f.state.handleSendChat,
+      handleOpenSidebar: f.state.handleOpenSidebar,
+    });
+    f.owner.state = host;
+    const sent = message(host.sessionKey, "new");
+    sent.detail.content = [{ type: "text", text: "Start a conversation" }];
+    f.dispatch(MCP_APP_MESSAGE_EVENT, sent.detail);
+    const frame = await dispatched.promise;
+
+    await handleAbortChat(host, { preserveDraft: true });
+    expect(requestSignal?.aborted).toBe(true);
+    pending.handleResponse({
+      type: "res",
+      id: frame.id,
+      ok: true,
+      payload: { key: "agent:main:created", runStarted: true, runId: "created-run" },
+    });
+
+    expect(await sent.receipt.promise).toBe(true);
+    expect(sent.respond).toHaveBeenCalledExactlyOnceWith(true);
+    expect(navigate).not.toHaveBeenCalled();
+    expect(frames).toHaveLength(1);
+    expect(pending.hasPending).toBe(false);
+    expect(f.state.handleSendChat).not.toHaveBeenCalled();
   });
 
   it.each(["retirement", "Stop", "agent change", "selection change"] as const)(

@@ -339,7 +339,6 @@ describe("DraftSubmissionFlow submit gates", () => {
         expect(context.sessions.createResult).toHaveBeenCalledExactlyOnceWith(createParams, {
           reconciliation: "background",
           signal: expect.any(AbortSignal),
-          retainSentResultOnAbort: true,
         });
       } else {
         expect(context.sessions.createResult).not.toHaveBeenCalled();

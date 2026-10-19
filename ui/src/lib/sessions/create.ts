@@ -20,10 +20,7 @@ export type SessionCreateParams = SessionsCreateParams & {
   currentSessionKey?: string;
 };
 
-export type SessionCreateRequestOptions = Pick<
-  GatewayProtocolRequestOptions,
-  "signal" | "retainSentResultOnAbort"
->;
+export type SessionCreateRequestOptions = Pick<GatewayProtocolRequestOptions, "signal">;
 
 export function resolveSessionCreateParams(sessionKey = "", agentId?: string) {
   const normalizedSessionKey = sessionKey.trim();
@@ -48,7 +45,7 @@ export async function requestSessionCreate(
   const result = await client.request<SessionsCreateResult>("sessions.create", params, {
     timeoutMs: GATEWAY_STARTUP_ADMISSION_WAIT_MS,
     signal: options?.signal,
-    retainSentResultOnAbort: options?.retainSentResultOnAbort,
+    retainSentResultOnAbort: true,
   });
   const key = stringValue(result?.key) ?? "";
   if (!key) {

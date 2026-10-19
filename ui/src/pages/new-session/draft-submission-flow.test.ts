@@ -182,7 +182,6 @@ describe("DraftSubmissionFlow", () => {
           {
             reconciliation: "background",
             signal: expect.any(AbortSignal),
-            retainSentResultOnAbort: true,
           },
         );
         if (storage === "available") {
@@ -467,7 +466,6 @@ describe("DraftSubmissionFlow", () => {
       {
         reconciliation: "background",
         signal: expect.any(AbortSignal),
-        retainSentResultOnAbort: true,
       },
     );
     expect(context.navigateAndWait).not.toHaveBeenCalled();
@@ -789,7 +787,6 @@ describe("DraftSubmissionFlow", () => {
       {
         reconciliation: "background",
         signal: expect.any(AbortSignal),
-        retainSentResultOnAbort: true,
       },
     );
     expect(request).not.toHaveBeenCalledWith("projects.add", expect.anything(), expect.anything());

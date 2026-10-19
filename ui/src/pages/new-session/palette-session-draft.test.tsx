@@ -65,7 +65,6 @@ describe("PaletteSessionDraft", () => {
       {
         reconciliation: "background",
         signal: expect.any(AbortSignal),
-        retainSentResultOnAbort: true,
       },
     );
     expect(context.placementStartup.start).toHaveBeenCalledOnce();
@@ -311,7 +310,6 @@ describe("PaletteSessionDraft", () => {
         {
           reconciliation: "background",
           signal: expect.any(AbortSignal),
-          retainSentResultOnAbort: true,
         },
       );
       if (initialRun.status === "rejected") {
