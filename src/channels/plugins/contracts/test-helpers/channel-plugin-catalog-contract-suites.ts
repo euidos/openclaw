@@ -1,8 +1,3 @@
-/**
- * External channel plugin catalog contract suites.
- *
- * Writes synthetic manifests and catalog files to prove parser behavior for discovered plugins.
- */
 import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -26,8 +21,13 @@ type RichExternalCatalogFixture = {
   name: string;
   prefix: string;
   channelId: string;
-  entry: Record<string, unknown>;
-  expected: Record<string, unknown>;
+  packageName?: string;
+  description?: string;
+  meta: Record<string, unknown>;
+  aliases: string[];
+  order: number;
+  install: Record<string, unknown>;
+  installSource?: Record<string, unknown>;
 };
 
 function createCatalogEntry(params: {
@@ -94,22 +94,15 @@ function writeDiscoveredChannelPlugin(params: {
 }) {
   const pluginDir = path.join(params.stateDir, "extensions", "demo-channel-plugin");
   fs.mkdirSync(pluginDir, { recursive: true });
+  const entry = createCatalogEntry({
+    packageName: params.packageName,
+    channelId: "demo-channel",
+    label: params.channelLabel,
+    blurb: params.blurb,
+  });
   fs.writeFileSync(
     path.join(pluginDir, "package.json"),
-    JSON.stringify({
-      name: params.packageName,
-      openclaw: {
-        extensions: ["./index.js"],
-        channel: {
-          id: "demo-channel",
-          label: params.channelLabel,
-          selectionLabel: params.channelLabel,
-          docsPath: "/channels/demo-channel",
-          blurb: params.blurb,
-        },
-        install: { npmSpec: params.packageName },
-      },
-    }),
+    JSON.stringify({ ...entry, openclaw: { ...entry.openclaw, extensions: ["./index.js"] } }),
     "utf8",
   );
   fs.writeFileSync(
@@ -127,174 +120,134 @@ function createRichExternalCatalogCase(
     name: fixture.name,
     setup: () => ({
       channelId: fixture.channelId,
-      catalogPaths: [createTemporaryCatalogFile(fixture.prefix, fixture.entry, true)],
-      expected: fixture.expected,
+      catalogPaths: [
+        createTemporaryCatalogFile(
+          fixture.prefix,
+          {
+            name: fixture.packageName,
+            description: fixture.description,
+            source: "external",
+            kind: "channel",
+            openclaw: {
+              channel: {
+                id: fixture.channelId,
+                ...fixture.meta,
+                aliases: fixture.aliases,
+                order: fixture.order,
+              },
+              install: fixture.install,
+            },
+          },
+          true,
+        ),
+      ],
+      expected: {
+        id: fixture.channelId,
+        meta: fixture.meta,
+        install: fixture.install,
+        ...(fixture.installSource ? { installSource: fixture.installSource } : {}),
+      },
     }),
   };
 }
+
+const wecomMeta = {
+  label: "WeCom",
+  selectionLabel: "WeCom (企业微信)",
+  detailLabel: "WeCom",
+  docsPath: "/channels/wecom",
+  docsLabel: "wecom",
+  blurb: "企业微信 (WeCom) bot & conversation channel.",
+};
+const wecomInstall = {
+  npmSpec: "@wecom/wecom-openclaw-plugin@1.2.3",
+  defaultChoice: "npm",
+  minHostVersion: ">=2026.4.10",
+  expectedIntegrity: "sha512-wecom",
+};
+const clawhubMeta = {
+  label: "ClawHub Chat",
+  selectionLabel: "ClawHub Chat",
+  detailLabel: "ClawHub",
+  docsPath: "/channels/clawhub-chat",
+  docsLabel: "clawhub chat",
+  blurb: "ClawHub-backed chat channel.",
+};
+const clawhubInstall = {
+  clawhubSpec: "clawhub:openclaw/clawhub-chat@2026.5.2",
+  defaultChoice: "clawhub",
+  minHostVersion: ">=2026.5.1",
+};
+const yuanbaoMeta = {
+  label: "Yuanbao",
+  selectionLabel: "Yuanbao (Tencent Yuanbao)",
+  detailLabel: "Yuanbao",
+  docsPath: "/channels/yuanbao",
+  docsLabel: "yuanbao",
+  blurb: "Tencent Yuanbao AI assistant conversation channel.",
+};
+const yuanbaoInstall = {
+  npmSpec: "openclaw-plugin-yuanbao@1.0.0",
+  defaultChoice: "npm",
+  minHostVersion: ">=2026.4.10",
+  expectedIntegrity: "sha512-yuanbao",
+};
 
 const [richNpmCatalogFixture, clawhubCatalogFixture, yuanbaoCatalogFixture] = [
   {
     name: "accepts rich external manifest entries with pinned npm metadata",
     prefix: "openclaw-catalog-rich-",
     channelId: "wecom",
-    entry: {
-      name: "@wecom/wecom-openclaw-plugin",
-      description:
-        "OpenClaw WeCom (企业微信) channel plugin — community maintained, published on npm.",
-      source: "external",
-      kind: "channel",
-      openclaw: {
-        channel: {
-          id: "wecom",
-          label: "WeCom",
-          selectionLabel: "WeCom (企业微信)",
-          detailLabel: "WeCom",
-          docsPath: "/channels/wecom",
-          docsLabel: "wecom",
-          blurb: "企业微信 (WeCom) bot & conversation channel.",
-          aliases: ["qywx", "wework"],
-          order: 45,
-        },
-        install: {
-          npmSpec: "@wecom/wecom-openclaw-plugin@1.2.3",
-          defaultChoice: "npm",
-          minHostVersion: ">=2026.4.10",
-          expectedIntegrity: "sha512-wecom",
-        },
-      },
-    },
-    expected: {
-      id: "wecom",
-      meta: {
-        label: "WeCom",
-        selectionLabel: "WeCom (企业微信)",
-        detailLabel: "WeCom",
-        docsPath: "/channels/wecom",
-        docsLabel: "wecom",
-        blurb: "企业微信 (WeCom) bot & conversation channel.",
-      },
-      install: {
-        npmSpec: "@wecom/wecom-openclaw-plugin@1.2.3",
-        defaultChoice: "npm",
-        minHostVersion: ">=2026.4.10",
+    packageName: "@wecom/wecom-openclaw-plugin",
+    description:
+      "OpenClaw WeCom (企业微信) channel plugin — community maintained, published on npm.",
+    aliases: ["qywx", "wework"],
+    order: 45,
+    meta: wecomMeta,
+    install: wecomInstall,
+    installSource: {
+      defaultChoice: "npm",
+      npm: {
+        spec: "@wecom/wecom-openclaw-plugin@1.2.3",
+        packageName: "@wecom/wecom-openclaw-plugin",
+        selector: "1.2.3",
+        selectorKind: "exact-version",
+        exactVersion: true,
         expectedIntegrity: "sha512-wecom",
+        pinState: "exact-with-integrity",
       },
-      installSource: {
-        defaultChoice: "npm",
-        npm: {
-          spec: "@wecom/wecom-openclaw-plugin@1.2.3",
-          packageName: "@wecom/wecom-openclaw-plugin",
-          selector: "1.2.3",
-          selectorKind: "exact-version",
-          exactVersion: true,
-          expectedIntegrity: "sha512-wecom",
-          pinState: "exact-with-integrity",
-        },
-        warnings: [],
-      },
+      warnings: [],
     },
   },
   {
     name: "accepts external manifest entries with ClawHub-only install metadata",
     prefix: "openclaw-catalog-clawhub-",
     channelId: "clawhub-chat",
-    entry: {
-      source: "external",
-      kind: "channel",
-      openclaw: {
-        channel: {
-          id: "clawhub-chat",
-          label: "ClawHub Chat",
-          selectionLabel: "ClawHub Chat",
-          detailLabel: "ClawHub",
-          docsPath: "/channels/clawhub-chat",
-          docsLabel: "clawhub chat",
-          blurb: "ClawHub-backed chat channel.",
-          aliases: ["chchat"],
-          order: 47,
-        },
-        install: {
-          clawhubSpec: "clawhub:openclaw/clawhub-chat@2026.5.2",
-          defaultChoice: "clawhub",
-          minHostVersion: ">=2026.5.1",
-        },
+    aliases: ["chchat"],
+    order: 47,
+    meta: clawhubMeta,
+    install: clawhubInstall,
+    installSource: {
+      defaultChoice: "clawhub",
+      clawhub: {
+        spec: "clawhub:openclaw/clawhub-chat@2026.5.2",
+        packageName: "openclaw/clawhub-chat",
+        version: "2026.5.2",
+        exactVersion: true,
       },
-    },
-    expected: {
-      id: "clawhub-chat",
-      meta: {
-        label: "ClawHub Chat",
-        selectionLabel: "ClawHub Chat",
-        detailLabel: "ClawHub",
-        docsPath: "/channels/clawhub-chat",
-        docsLabel: "clawhub chat",
-        blurb: "ClawHub-backed chat channel.",
-      },
-      install: {
-        clawhubSpec: "clawhub:openclaw/clawhub-chat@2026.5.2",
-        defaultChoice: "clawhub",
-        minHostVersion: ">=2026.5.1",
-      },
-      installSource: {
-        defaultChoice: "clawhub",
-        clawhub: {
-          spec: "clawhub:openclaw/clawhub-chat@2026.5.2",
-          packageName: "openclaw/clawhub-chat",
-          version: "2026.5.2",
-          exactVersion: true,
-        },
-        warnings: [],
-      },
+      warnings: [],
     },
   },
   {
     name: "accepts rich external manifest entries for yuanbao with pinned npm metadata",
     prefix: "openclaw-catalog-yuanbao-",
     channelId: "openclaw-plugin-yuanbao",
-    entry: {
-      name: "openclaw-plugin-yuanbao",
-      description:
-        "OpenClaw Yuanbao (元宝) channel plugin — community maintained, published on npm.",
-      source: "external",
-      kind: "channel",
-      openclaw: {
-        channel: {
-          id: "openclaw-plugin-yuanbao",
-          label: "Yuanbao",
-          selectionLabel: "Yuanbao (Tencent Yuanbao)",
-          detailLabel: "Yuanbao",
-          docsPath: "/channels/yuanbao",
-          docsLabel: "yuanbao",
-          blurb: "Tencent Yuanbao AI assistant conversation channel.",
-          aliases: ["yb", "tencent-yuanbao"],
-          order: 78,
-        },
-        install: {
-          npmSpec: "openclaw-plugin-yuanbao@1.0.0",
-          defaultChoice: "npm",
-          minHostVersion: ">=2026.4.10",
-          expectedIntegrity: "sha512-yuanbao",
-        },
-      },
-    },
-    expected: {
-      id: "openclaw-plugin-yuanbao",
-      meta: {
-        label: "Yuanbao",
-        selectionLabel: "Yuanbao (Tencent Yuanbao)",
-        detailLabel: "Yuanbao",
-        docsPath: "/channels/yuanbao",
-        docsLabel: "yuanbao",
-        blurb: "Tencent Yuanbao AI assistant conversation channel.",
-      },
-      install: {
-        npmSpec: "openclaw-plugin-yuanbao@1.0.0",
-        defaultChoice: "npm",
-        minHostVersion: ">=2026.4.10",
-        expectedIntegrity: "sha512-yuanbao",
-      },
-    },
+    packageName: "openclaw-plugin-yuanbao",
+    description: "OpenClaw Yuanbao (元宝) channel plugin — community maintained, published on npm.",
+    aliases: ["yb", "tencent-yuanbao"],
+    order: 78,
+    meta: yuanbaoMeta,
+    install: yuanbaoInstall,
   },
 ] satisfies [RichExternalCatalogFixture, RichExternalCatalogFixture, RichExternalCatalogFixture];
 

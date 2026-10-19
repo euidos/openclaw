@@ -1,8 +1,3 @@
-/**
- * Channel catalog contract suites.
- *
- * Exercises manifest/catalog loading paths used by setup and install-on-demand surfaces.
- */
 import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -20,10 +15,26 @@ type CatalogEntryMeta = {
 };
 
 function createCatalogFixtureEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
-  return {
-    ...process.env,
-    ...overrides,
-  };
+  return { ...process.env, ...overrides };
+}
+
+function createCatalogDir(prefix: string) {
+  return fs.mkdtempSync(path.join(resolvePreferredOpenClawTmpDir(), prefix));
+}
+
+function writeJson(file: string, value: unknown) {
+  fs.writeFileSync(file, JSON.stringify(value), "utf8");
+}
+
+function writeExternalCatalog(
+  dir: string,
+  name: string,
+  channel: CatalogEntryMeta,
+  install: object,
+) {
+  const file = path.join(dir, "catalog.json");
+  writeJson(file, { entries: [{ name, openclaw: { channel, install } }] });
+  return file;
 }
 
 function createCatalogFallbackOnlyEnv(): NodeJS.ProcessEnv {
@@ -59,37 +70,27 @@ export function describeBundledMetadataOnlyChannelCatalogContract(params: {
 }) {
   describe(`${params.pluginId} bundled metadata-only channel catalog contract`, () => {
     it("includes the bundled metadata-only channel entry when the runtime entrypoint is omitted", () => {
-      const workspaceDir = fs.mkdtempSync(
-        path.join(resolvePreferredOpenClawTmpDir(), "openclaw-bundled-catalog-"),
-      );
+      const workspaceDir = createCatalogDir("openclaw-bundled-catalog-");
       const bundledDir = path.join(workspaceDir, ".openclaw", "extensions", params.pluginId);
       fs.mkdirSync(bundledDir, { recursive: true });
-      fs.writeFileSync(
-        path.join(workspaceDir, "package.json"),
-        JSON.stringify({ name: "openclaw" }),
-        "utf8",
-      );
-      fs.writeFileSync(
-        path.join(bundledDir, "package.json"),
-        JSON.stringify({
-          name: params.packageName,
-          openclaw: {
-            extensions: ["./index.js"],
-            channel: params.meta,
-            install: {
-              npmSpec: params.npmSpec,
-              defaultChoice: params.defaultChoice,
-            },
+      writeJson(path.join(workspaceDir, "package.json"), { name: "openclaw" });
+      writeJson(path.join(bundledDir, "package.json"), {
+        name: params.packageName,
+        openclaw: {
+          extensions: ["./index.js"],
+          channel: params.meta,
+          install: {
+            npmSpec: params.npmSpec,
+            defaultChoice: params.defaultChoice,
           },
-        }),
-        "utf8",
-      );
+        },
+      });
       fs.writeFileSync(path.join(bundledDir, "index.js"), "export default {};\n", "utf8");
-      fs.writeFileSync(
-        path.join(bundledDir, "openclaw.plugin.json"),
-        JSON.stringify({ id: params.pluginId, channels: [params.meta.id], configSchema: {} }),
-        "utf8",
-      );
+      writeJson(path.join(bundledDir, "openclaw.plugin.json"), {
+        id: params.pluginId,
+        channels: [params.meta.id],
+        configSchema: {},
+      });
 
       const entry = listRawChannelPluginCatalogEntries({
         workspaceDir,
@@ -113,9 +114,7 @@ export function describeOfficialFallbackChannelCatalogContract(params: {
 }) {
   describe(`${params.channelId} official fallback channel catalog contract`, () => {
     it("includes shipped official channel catalog entries when bundled metadata is omitted", () => {
-      const dir = fs.mkdtempSync(
-        path.join(resolvePreferredOpenClawTmpDir(), "openclaw-official-catalog-"),
-      );
+      const dir = createCatalogDir("openclaw-official-catalog-");
       const catalogPath = path.join(dir, "channel-catalog.json");
 
       const entry = listRawChannelPluginCatalogEntries({
@@ -129,30 +128,18 @@ export function describeOfficialFallbackChannelCatalogContract(params: {
     });
 
     it("lets external catalogs override shipped fallback channel metadata", () => {
-      const dir = fs.mkdtempSync(
-        path.join(resolvePreferredOpenClawTmpDir(), "openclaw-fallback-catalog-"),
-      );
+      const dir = createCatalogDir("openclaw-fallback-catalog-");
       const officialCatalogPath = path.join(dir, "channel-catalog.json");
-      const externalCatalogPath = path.join(dir, "catalog.json");
-      fs.writeFileSync(
-        externalCatalogPath,
-        JSON.stringify({
-          entries: [
-            {
-              name: params.externalNpmSpec,
-              openclaw: {
-                channel: {
-                  ...params.meta,
-                  label: params.externalLabel,
-                  selectionLabel: params.externalLabel,
-                  blurb: "external override",
-                },
-                install: { npmSpec: params.externalNpmSpec },
-              },
-            },
-          ],
-        }),
-        "utf8",
+      const externalCatalogPath = writeExternalCatalog(
+        dir,
+        params.externalNpmSpec,
+        {
+          ...params.meta,
+          label: params.externalLabel,
+          selectionLabel: params.externalLabel,
+          blurb: "external override",
+        },
+        { npmSpec: params.externalNpmSpec },
       );
 
       const entry = listRawChannelPluginCatalogEntries({
@@ -168,27 +155,11 @@ export function describeOfficialFallbackChannelCatalogContract(params: {
     });
 
     it("surfaces package-name drift in external channel catalog install metadata", () => {
-      const dir = fs.mkdtempSync(
-        path.join(resolvePreferredOpenClawTmpDir(), "openclaw-drifted-catalog-"),
-      );
-      const catalogPath = path.join(dir, "catalog.json");
-      fs.writeFileSync(
-        catalogPath,
-        JSON.stringify({
-          entries: [
-            {
-              name: params.packageName,
-              openclaw: {
-                channel: params.meta,
-                install: {
-                  npmSpec: `${params.packageName}-fork@1.2.3`,
-                  expectedIntegrity: "sha512-drifted",
-                },
-              },
-            },
-          ],
-        }),
-        "utf8",
+      const catalogPath = writeExternalCatalog(
+        createCatalogDir("openclaw-drifted-catalog-"),
+        params.packageName,
+        params.meta,
+        { npmSpec: `${params.packageName}-fork@1.2.3`, expectedIntegrity: "sha512-drifted" },
       );
 
       const entry = listRawChannelPluginCatalogEntries({
