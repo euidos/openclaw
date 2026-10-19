@@ -85,79 +85,51 @@ afterEach(async () => {
 });
 
 describe("createChannelNativeApprovalRuntime", () => {
-  it("dedupes converged prepared targets", async () => {
-    vi.useFakeTimers();
-    const adapter = dmAdapter(
-      {
-        resolveOriginTarget: async () => ({ to: "origin-room" }),
-      },
-      true,
-    );
-    const prepareTarget = vi.fn(
-      async ({ plannedTarget }: { plannedTarget: { target: { to: string } } }) => ({
-        dedupeKey: "shared-dm",
-        target: { channelId: "shared-dm", recipientId: plannedTarget.target.to },
-      }),
-    );
-    const deliverTarget = vi.fn(
-      async ({ preparedTarget }: { preparedTarget: { channelId: string } }) => ({
-        channelId: preparedTarget.channelId,
-      }),
-    );
-    const onDuplicateSkipped = vi.fn();
-    const finalizeResolved = vi.fn(async () => undefined);
-
-    const runtime = createChannelNativeApprovalRuntime({
-      nowMs: () => 0,
-      nativeAdapter: adapter,
-      prepareTarget,
-      deliverTarget,
-      onDuplicateSkipped,
-      finalizeResolved,
-    });
-    await runtime.handleRequested(execRequest);
-    await runtime.handleResolved({ id: execRequest.id, decision: "allow-once", ts: 1 });
-
-    expect(prepareTarget).toHaveBeenCalledTimes(2);
-    expect(deliverTarget).toHaveBeenCalledTimes(1);
-    expect(onDuplicateSkipped).toHaveBeenCalledTimes(1);
-    expect(finalizeResolved).toHaveBeenCalledExactlyOnceWith(
-      expect.objectContaining({ entries: [{ channelId: "shared-dm" }] }),
-    );
-  });
-
-  it("continues after per-target delivery failures", async () => {
-    vi.useFakeTimers();
-    const onDeliveryError = vi.fn();
-    const finalizeResolved = vi.fn(async () => undefined);
-    const deliverTarget = vi
-      .fn()
-      .mockImplementation(async ({ preparedTarget }: { preparedTarget: { channelId: string } }) => {
-        if (preparedTarget.channelId === "approver-1") {
-          throw new Error("boom");
-        }
-        return { channelId: preparedTarget.channelId };
+  it.each(["dedupe", "delivery-failure"] as const)(
+    "resolves successful deliveries after %s",
+    async (mode) => {
+      vi.useFakeTimers();
+      const dedupe = mode === "dedupe";
+      const prepareTarget = vi.fn(
+        async ({ plannedTarget }: { plannedTarget: { target: { to: string } } }) => ({
+          dedupeKey: dedupe ? "shared-dm" : plannedTarget.target.to,
+          target: { channelId: dedupe ? "shared-dm" : plannedTarget.target.to },
+        }),
+      );
+      const deliverTarget = vi.fn(
+        async ({ preparedTarget }: { preparedTarget: { channelId: string } }) => {
+          if (!dedupe && preparedTarget.channelId === "approver-1") {
+            throw new Error("boom");
+          }
+          return { channelId: preparedTarget.channelId };
+        },
+      );
+      const onDuplicateSkipped = vi.fn();
+      const onDeliveryError = vi.fn();
+      const finalizeResolved = vi.fn(async () => undefined);
+      const runtime = createChannelNativeApprovalRuntime({
+        nowMs: () => 0,
+        nativeAdapter: dmAdapter(
+          dedupe ? { resolveOriginTarget: async () => ({ to: "origin-room" }) } : {},
+          dedupe,
+        ),
+        prepareTarget,
+        deliverTarget,
+        onDuplicateSkipped,
+        onDeliveryError,
+        finalizeResolved,
       });
-
-    const runtime = createChannelNativeApprovalRuntime({
-      nowMs: () => 0,
-      nativeAdapter: dmAdapter(),
-      prepareTarget: ({ plannedTarget }) => ({
-        dedupeKey: plannedTarget.target.to,
-        target: { channelId: plannedTarget.target.to },
-      }),
-      deliverTarget,
-      onDeliveryError,
-      finalizeResolved,
-    });
-    await runtime.handleRequested(execRequest);
-    await runtime.handleResolved({ id: execRequest.id, decision: "allow-once", ts: 1 });
-
-    expect(onDeliveryError).toHaveBeenCalledTimes(1);
-    expect(finalizeResolved).toHaveBeenCalledExactlyOnceWith(
-      expect.objectContaining({ entries: [{ channelId: "approver-2" }] }),
-    );
-  });
+      await runtime.handleRequested(execRequest);
+      await runtime.handleResolved({ id: execRequest.id, decision: "allow-once", ts: 1 });
+      expect(prepareTarget).toHaveBeenCalledTimes(2);
+      expect(deliverTarget).toHaveBeenCalledTimes(dedupe ? 1 : 2);
+      expect(onDuplicateSkipped).toHaveBeenCalledTimes(dedupe ? 1 : 0);
+      expect(onDeliveryError).toHaveBeenCalledTimes(dedupe ? 0 : 1);
+      expect(finalizeResolved).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ entries: [{ channelId: dedupe ? "shared-dm" : "approver-2" }] }),
+      );
+    },
+  );
 
   it("selects and expires system-agent approval targets through the native lifecycle", async () => {
     const deliverTarget = vi.fn().mockResolvedValue({ chatId: "123", messageId: "m1" });
@@ -176,7 +148,6 @@ describe("createChannelNativeApprovalRuntime", () => {
         }),
         resolveOriginTarget: () => ({ to: "123" }),
       },
-      shouldHandle: vi.fn().mockReturnValue(true),
       buildPendingContent: vi.fn().mockResolvedValue({ text: "pending" }),
       deliverTarget,
       finalizeExpired,

@@ -1,6 +1,6 @@
 // Canonical durable approval presentation safety tests.
 import { describe, expect, it } from "vitest";
-import { prepareExecApprovalPresentation } from "../gateway/exec-approval-registration.js";
+import { prepareExecApprovalPresentation as prepare } from "../gateway/exec-approval-registration.js";
 import type { PluginApprovalRequestPayload } from "./plugin-approvals.js";
 
 const allowedDecisions = ["allow-once", "deny"] as const;
@@ -8,20 +8,20 @@ const invalidPresentation = "approval cannot be persisted without a valid review
 const rocket = String.fromCodePoint(0x1f680);
 const shield = String.fromCodePoint(0x1f6e1);
 
-function buildExecPresentation(request: {
+function exec(request: {
   command: string;
   host?: string | null;
   nodeId?: string | null;
   agentId?: string | null;
 }) {
-  return prepareExecApprovalPresentation("exec", request, allowedDecisions);
+  return prepare("exec", request, allowedDecisions);
 }
 
-function buildPluginPresentation(
+function plugin(
   request: Partial<PluginApprovalRequestPayload>,
-  decisions: Parameters<typeof prepareExecApprovalPresentation>[2] = allowedDecisions,
+  decisions: Parameters<typeof prepare>[2] = allowedDecisions,
 ) {
-  return prepareExecApprovalPresentation(
+  return prepare(
     "plugin",
     {
       title: "World verification",
@@ -32,11 +32,11 @@ function buildPluginPresentation(
   );
 }
 
-function externalPresentation(
+function external(
   externalResolution: PluginApprovalRequestPayload["externalResolution"],
-  decisions: Parameters<typeof prepareExecApprovalPresentation>[2] = ["deny"],
+  decisions: Parameters<typeof prepare>[2] = ["deny"],
 ) {
-  return buildPluginPresentation({ pluginId: "agentkit", externalResolution }, decisions);
+  return plugin({ pluginId: "agentkit", externalResolution }, decisions);
 }
 
 describe("prepareExecApprovalPresentation", () => {
@@ -53,18 +53,14 @@ describe("prepareExecApprovalPresentation", () => {
       currency: "EUR",
       target: "Stripe\u202E",
     } as const;
-    const presentation = prepareExecApprovalPresentation(
-      params.kind,
-      { ...params.request, scope },
-      allowedDecisions,
-    );
+    const presentation = prepare(params.kind, { ...params.request, scope }, allowedDecisions);
 
     expect(presentation).toMatchObject({
       kind: params.kind,
       scope: { ...scope, target: "Stripe\\u{202E}" },
     });
 
-    const oversizedScopePresentation = prepareExecApprovalPresentation(
+    const oversizedScopePresentation = prepare(
       params.kind,
       { ...params.request, scope: { ...scope, target: `${"x".repeat(125)}\u202E` } },
       allowedDecisions,
@@ -76,7 +72,7 @@ describe("prepareExecApprovalPresentation", () => {
 
   it("sanitizes exec routing metadata and preserves empty values as null", () => {
     const githubToken = `ghp_${"a".repeat(100)}`;
-    const presentation = buildExecPresentation({
+    const presentation = exec({
       command: "printf safe",
       host: "gate\nway\u202E",
       nodeId: "node\u0000id",
@@ -90,12 +86,12 @@ describe("prepareExecApprovalPresentation", () => {
       agentId: githubToken,
     });
     expect(
-      buildExecPresentation({ command: "printf safe", host: "   ", nodeId: null, agentId: "\t" }),
+      exec({ command: "printf safe", host: "   ", nodeId: null, agentId: "\t" }),
     ).toMatchObject({ kind: "exec", host: null, nodeId: null, agentId: null });
   });
 
   it("escapes control and bidi spoofing while preserving description line breaks", () => {
-    const presentation = buildPluginPresentation({
+    const presentation = plugin({
       title: "Deploy\u202Eprod\nnow",
       description: "Line one\r\nLine two\u0000\u202E",
       detail: "Input one\r\nInput two\u0000\u202E",
@@ -119,25 +115,15 @@ describe("prepareExecApprovalPresentation", () => {
     const title = rocket.repeat(80);
     const description = shield.repeat(512);
 
-    expect(buildPluginPresentation({ title, description })).toMatchObject({
-      kind: "plugin",
-      title,
-      description,
-    });
-    expect(() => buildPluginPresentation({ title: `${title}${rocket}`, description })).toThrow(
+    expect(plugin({ title, description })).toMatchObject({ kind: "plugin", title, description });
+    expect(() => plugin({ title: `${title}${rocket}`, description })).toThrow(invalidPresentation);
+    expect(() => plugin({ title, description: `${description}${shield}` })).toThrow(
       invalidPresentation,
     );
-    expect(() =>
-      buildPluginPresentation({ title, description: `${description}${shield}` }),
-    ).toThrow(invalidPresentation);
   });
 
   it("truncates oversized plugin detail without invalidating the presentation", () => {
-    const presentation = buildPluginPresentation({
-      title: "Review tool input",
-      description: "Bounded channel summary",
-      detail: "x".repeat(16_385),
-    });
+    const presentation = plugin({ detail: "x".repeat(16_385) });
 
     expect(presentation).toMatchObject({
       kind: "plugin",
@@ -151,7 +137,7 @@ describe("prepareExecApprovalPresentation", () => {
 
   it("projects only bounded reviewer-safe external verification metadata", () => {
     expect(
-      externalPresentation({
+      external({
         label: "Verify with World\u202E",
         decisions: ["allow-once", "allow-always"],
       }),
@@ -166,18 +152,10 @@ describe("prepareExecApprovalPresentation", () => {
     });
   });
 
-  it("rejects an external label that exceeds its limit after spoof-resistant escaping", () => {
-    expect(() =>
-      externalPresentation({ label: "\u202E".repeat(11), decisions: ["allow-once"] }),
-    ).toThrow(invalidPresentation);
-  });
-
   it("applies the external label limit by Unicode code point", () => {
     const label = rocket.repeat(80);
     const buildWithLabel = (value: string) =>
-      buildPluginPresentation({ externalResolution: { label: value, decisions: ["allow-once"] } }, [
-        "deny",
-      ]);
+      plugin({ externalResolution: { label: value, decisions: ["allow-once"] } }, ["deny"]);
 
     expect(buildWithLabel(label)).toMatchObject({
       kind: "plugin",
@@ -190,37 +168,29 @@ describe("prepareExecApprovalPresentation", () => {
     { label: " ", decisions: undefined },
     { label: "Verify", decisions: [] },
     { label: "Verify", decisions: ["allow-once", "allow-once"] as const },
+    { label: "\u202E".repeat(11), decisions: ["allow-once"] as const },
   ])("rejects malformed external verification metadata", (externalResolution) => {
-    expect(() => externalPresentation(externalResolution, allowedDecisions)).toThrow(
-      invalidPresentation,
-    );
+    expect(() => external(externalResolution, allowedDecisions)).toThrow(invalidPresentation);
   });
 
   it("defaults external verification to allow once", () => {
-    expect(externalPresentation({ label: " Verify\nwith World " }, allowedDecisions)).toMatchObject(
-      {
-        externalResolution: {
-          label: "Verify\\u{A}with World",
-          decisions: ["allow-once"],
-        },
+    expect(external({ label: " Verify\nwith World " }, allowedDecisions)).toMatchObject({
+      externalResolution: {
+        label: "Verify\\u{A}with World",
+        decisions: ["allow-once"],
       },
-    );
+    });
   });
-});
 
-describe("prepareExecApprovalPresentation (system-agent)", () => {
   it("drops split emoji at the title and description boundaries without lone surrogates", () => {
     const title = `${"a".repeat(79)}\u{1F600}`;
     const description = `${"a".repeat(511)}\u{1F6E1}`;
-    const presentation = prepareExecApprovalPresentation(
+    const presentation = prepare(
       "system-agent",
       {
         title,
         description,
-        command: "true",
         proposalHash: "a".repeat(64),
-        allowedDecisions,
-        sessionId: "s1",
       },
       allowedDecisions,
     );

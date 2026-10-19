@@ -13,7 +13,7 @@ import {
   publishPreparedBackupArchive as publish,
   type BackupArchivePublication,
 } from "./backup-archive-publication.js";
-import { writeArchiveStreamToFile, type PreparedBackupArchive } from "./backup-create-stream.js";
+import { writeArchiveStreamToFile } from "./backup-create-stream.js";
 import * as directoryDurability from "./directory-durability.js";
 import { getPublishFileExclusiveFailureDetails } from "./directory-durability.js";
 
@@ -33,10 +33,7 @@ async function createPublication() {
   return { outputDir, outputPath, plan };
 }
 
-async function prepareArchive(
-  plan: BackupArchivePublication,
-  content = "complete archive",
-): Promise<PreparedBackupArchive> {
+async function prepareArchive(plan: BackupArchivePublication, content = "complete archive") {
   const archiveStream = new PassThrough();
   const preparedPromise = writeArchiveStreamToFile({
     archivePath: plan.tempArchivePath,
@@ -51,7 +48,10 @@ async function prepareArchive(
 
 async function setup() {
   const publication = await createPublication();
-  return { ...publication, prepared: await prepareArchive(publication.plan) };
+  const prepared = await prepareArchive(publication.plan);
+  const commit = (log?: (message: string) => void) =>
+    publish({ plan: publication.plan, prepared, log });
+  return { ...publication, prepared, commit };
 }
 
 async function expectMissing(filePath: string) {
@@ -64,11 +64,11 @@ async function expectContents(filePath: string, content = "complete archive") {
 
 describe("backup archive publication", () => {
   it("retires its prepared archive when cancellation precedes publication", async () => {
-    const { outputDir, plan, prepared } = await setup();
+    const { outputDir, commit } = await setup();
     await expect(
       withCommandProcessScope(async (stop) => {
         stop();
-        await publish({ plan, prepared });
+        await commit();
       }),
     ).rejects.toMatchObject({ name: "AbortError" });
     await expect(fs.readdir(outputDir)).resolves.toEqual([]);
@@ -100,11 +100,11 @@ describe("backup archive publication", () => {
   });
 
   it.each(["EXDEV"])("fails closed when hard-link publication returns %s", async (code) => {
-    const { outputPath, plan, prepared } = await setup();
+    const { outputPath, plan, prepared, commit } = await setup();
     const publicationSpy = vi
       .spyOn(directoryDurability, "publishFileExclusive")
       .mockRejectedValue(Object.assign(new Error("unsupported"), { code }));
-    await expect(publish({ plan, prepared })).rejects.toThrow(/requires hard-link support/iu);
+    await expect(commit()).rejects.toThrow(/requires hard-link support/iu);
     expect(publicationSpy).toHaveBeenCalledWith(
       expect.objectContaining({ targetPath: plan.canonicalOutputPath, strategy: "link-required" }),
     );
@@ -113,38 +113,32 @@ describe("backup archive publication", () => {
   });
 
   it("preserves a destination raced in before publication", async () => {
-    const { outputPath, plan, prepared } = await setup();
+    const { outputPath, commit } = await setup();
     await fs.writeFile(outputPath, "racer", "utf8");
 
-    await expect(publish({ plan, prepared })).rejects.toThrow(
-      /Refusing to overwrite existing backup archive/iu,
-    );
+    await expect(commit()).rejects.toThrow(/Refusing to overwrite existing backup archive/iu);
     await expectContents(outputPath, "racer");
   });
 
   it.runIf(process.platform !== "win32")(
     "preserves a concurrently published hard link to the prepared archive",
     async () => {
-      const { outputPath, plan, prepared } = await setup();
+      const { outputPath, prepared, commit } = await setup();
       await fs.link(prepared.archivePath, outputPath);
 
-      await expect(publish({ plan, prepared })).rejects.toThrow(
-        /Refusing to overwrite existing backup archive/iu,
-      );
+      await expect(commit()).rejects.toThrow(/Refusing to overwrite existing backup archive/iu);
       await expectContents(outputPath);
       await expectMissing(prepared.archivePath);
     },
   );
 
   it("rejects a replaced staging pathname without publishing replacement bytes", async () => {
-    const { outputPath, plan, prepared } = await setup();
+    const { outputPath, prepared, commit } = await setup();
     const originalPath = `${prepared.archivePath}.original`;
     await fs.rename(prepared.archivePath, originalPath);
     await fs.writeFile(prepared.archivePath, "replacement", "utf8");
 
-    await expect(publish({ plan, prepared })).rejects.toThrow(
-      /Backup archive changed during publication/iu,
-    );
+    await expect(commit()).rejects.toThrow(/Backup archive changed during publication/iu);
     await expectMissing(outputPath);
     await expectContents(prepared.archivePath, "replacement");
   });
@@ -174,12 +168,12 @@ describe("backup archive publication", () => {
   it.runIf(process.platform !== "win32")(
     "rejects a canonical output-parent directory replacement",
     async () => {
-      const { outputDir, outputPath, plan, prepared } = await setup();
+      const { outputDir, outputPath, commit } = await setup();
       const movedOutputDir = `${outputDir}.moved`;
       await fs.rename(outputDir, movedOutputDir);
       await fs.mkdir(outputDir);
 
-      await expect(publish({ plan, prepared })).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(commit()).rejects.toMatchObject({ code: "ENOENT" });
       await expectMissing(outputPath);
     },
   );
@@ -187,7 +181,7 @@ describe("backup archive publication", () => {
   it.runIf(process.platform !== "win32").each(["ENOTSUP"])(
     "preserves the complete final archive when commit directory sync fails with %s",
     async (code) => {
-      const { outputPath, plan, prepared } = await setup();
+      const { outputPath, plan, commit } = await setup();
       const log = vi.fn();
       const originalOpen = fs.open.bind(fs);
       vi.spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
@@ -199,7 +193,7 @@ describe("backup archive publication", () => {
         }
         return handle;
       });
-      const error = await publish({ plan, prepared, log }).catch((caught: unknown) => caught);
+      const error = await commit(log).catch((caught: unknown) => caught);
       expect(error).toBeInstanceOf(Error);
       expect(String(error)).toMatch(/sync failed/iu);
       expect(getPublishFileExclusiveFailureDetails(error)).toMatchObject({
@@ -212,27 +206,8 @@ describe("backup archive publication", () => {
     },
   );
 
-  it("preserves a destination that replaces the linked archive before validation", async () => {
-    const { outputPath, plan, prepared } = await setup();
-    const displacedPath = `${outputPath}.displaced`;
-    __setFsSafeTestHooksForTest({
-      afterPublishTargetCreated: async (_method, targetPath) => {
-        if (path.resolve(targetPath) === path.resolve(plan.canonicalOutputPath)) {
-          __setFsSafeTestHooksForTest(undefined);
-          await fs.rename(plan.canonicalOutputPath, displacedPath);
-          await fs.writeFile(plan.canonicalOutputPath, "racer", "utf8");
-        }
-      },
-    });
-    await expect(publish({ plan, prepared })).rejects.toThrow(
-      /Backup archive changed during publication/iu,
-    );
-    await expectContents(outputPath, "racer");
-    await expectContents(displacedPath);
-  });
-
   it("keeps the committed final archive when staging cleanup fails", async () => {
-    const { outputPath, plan, prepared } = await setup();
+    const { outputPath, plan, prepared, commit } = await setup();
     const log = vi.fn();
     const originalUnlinkSync = fsSync.unlinkSync.bind(fsSync);
     const unlinkSpy = vi.spyOn(fsSync, "unlinkSync").mockImplementation((target) => {
@@ -241,18 +216,15 @@ describe("backup archive publication", () => {
       }
       return originalUnlinkSync(target);
     });
-    try {
-      await expect(publish({ plan, prepared, log })).resolves.toBeUndefined();
-      await expectContents(outputPath);
-      expect(log).toHaveBeenCalledWith(
-        `Backup archiver preserved changed staging file ${prepared.archivePath}.`,
-      );
-    } finally {
-      unlinkSpy.mockRestore();
-      await cleanupBackupArchivePublication(plan);
-      await expectMissing(prepared.archivePath);
-      await expectMissing(plan.stagingDir);
-    }
+    await expect(commit(log)).resolves.toBeUndefined();
+    await expectContents(outputPath);
+    expect(log).toHaveBeenCalledWith(
+      `Backup archiver preserved changed staging file ${prepared.archivePath}.`,
+    );
+    unlinkSpy.mockRestore();
+    await cleanupBackupArchivePublication(plan);
+    await expectMissing(prepared.archivePath);
+    await expectMissing(plan.stagingDir);
   });
 
   it("retries cleanup when descriptor and pathname identity reads initially fail", async () => {
@@ -271,23 +243,37 @@ describe("backup archive publication", () => {
       }
       return originalLstatSync(target, options);
     });
-    try {
-      await expect(prepareArchive(plan, "partial archive")).rejects.toThrow("fstat failed");
-      expect(plan.pendingCleanupArchives).toEqual([{ archivePath: plan.tempArchivePath }]);
-    } finally {
-      fstatSpy.mockRestore();
-      lstatSpy.mockRestore();
-    }
+    await expect(prepareArchive(plan, "partial archive")).rejects.toThrow("fstat failed");
+    expect(plan.pendingCleanupArchives).toEqual([{ archivePath: plan.tempArchivePath }]);
+    fstatSpy.mockRestore();
+    lstatSpy.mockRestore();
 
     await cleanupBackupArchivePublication(plan);
     await expectMissing(plan.tempArchivePath);
     await expectMissing(plan.stagingDir);
   });
 
-  it("preserves a final-path replacement after the commit point", async () => {
-    const { outputPath, plan, prepared } = await setup();
+  it("preserves a destination that replaces the linked archive before validation", async () => {
+    const { outputPath, plan, commit } = await setup();
     const displacedPath = `${outputPath}.displaced`;
-    const originalUnlinkSync = fsSync.unlinkSync.bind(fsSync);
+    __setFsSafeTestHooksForTest({
+      afterPublishTargetCreated: async (_method, targetPath) => {
+        if (path.resolve(targetPath) === path.resolve(plan.canonicalOutputPath)) {
+          __setFsSafeTestHooksForTest(undefined);
+          await fs.rename(plan.canonicalOutputPath, displacedPath);
+          await fs.writeFile(plan.canonicalOutputPath, "racer", "utf8");
+        }
+      },
+    });
+    await expect(commit()).rejects.toThrow(/Backup archive changed during publication/iu);
+    await expectContents(outputPath, "racer");
+    await expectContents(displacedPath);
+  });
+
+  it("preserves a final-path replacement after the commit point", async () => {
+    const { outputPath, plan, prepared, commit } = await setup();
+    const displacedPath = `${outputPath}.displaced`;
+    const unlink = fsSync.unlinkSync.bind(fsSync);
     let replaced = false;
     vi.spyOn(fsSync, "unlinkSync").mockImplementation((target) => {
       if (!replaced && path.resolve(String(target)) === path.resolve(prepared.archivePath)) {
@@ -295,9 +281,9 @@ describe("backup archive publication", () => {
         fsSync.renameSync(plan.canonicalOutputPath, displacedPath);
         fsSync.writeFileSync(plan.canonicalOutputPath, "racer", "utf8");
       }
-      return originalUnlinkSync(target);
+      return unlink(target);
     });
-    await expect(publish({ plan, prepared })).resolves.toBeUndefined();
+    await expect(commit()).resolves.toBeUndefined();
     await expectContents(outputPath, "racer");
     await expectContents(displacedPath);
   });

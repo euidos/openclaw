@@ -280,21 +280,6 @@ describe("archive utils", () => {
     },
   );
 
-  it("rejects tar path traversal (zip slip)", async () => {
-    await withArchiveCase("tar", async ({ workDir, archivePath, extractDir }) => {
-      const insideDir = path.join(workDir, "inside");
-      await fs.mkdir(insideDir, { recursive: true });
-      await fs.writeFile(path.join(workDir, "outside.txt"), "pwnd");
-
-      await tar.c({ cwd: insideDir, file: archivePath }, ["../outside.txt"]);
-      await fs.writeFile(path.join(workDir, "outside.txt"), "outside sentinel");
-
-      await expectRejectedCode(extract(archivePath, extractDir), "entry-path");
-      expect(await fs.readdir(extractDir)).toEqual([]);
-      expect(await fs.readFile(path.join(workDir, "outside.txt"), "utf8")).toBe("outside sentinel");
-    });
-  });
-
   it("rejects tar entries that traverse pre-existing destination symlinks", async () => {
     await withArchiveCase("tar", async ({ workDir, archivePath, extractDir }) => {
       const outsideDir = path.join(workDir, "outside");
@@ -355,15 +340,17 @@ describe("archive utils", () => {
     });
   });
 
-  it("rejects tar entries with absolute extraction paths", async () => {
+  it.each(["relative", "absolute"] as const)("rejects tar %s path traversal", async (kind) => {
     await withArchiveCase("tar", async ({ workDir, archivePath, extractDir }) => {
       const inputDir = path.join(workDir, "input");
-      const outsideFile = path.join(inputDir, "outside.txt");
+      const absolute = kind === "absolute";
+      const outsideFile = path.join(absolute ? inputDir : workDir, "outside.txt");
       await fs.mkdir(inputDir, { recursive: true });
-      await fs.writeFile(outsideFile, "owned");
-      await tar.c({ file: archivePath, preservePaths: true }, [outsideFile]);
+      await fs.writeFile(outsideFile, absolute ? "owned" : "pwnd");
+      await tar.c({ cwd: inputDir, file: archivePath, preservePaths: absolute }, [
+        absolute ? outsideFile : "../outside.txt",
+      ]);
       await fs.writeFile(outsideFile, "outside sentinel");
-
       await expectRejectedCode(extract(archivePath, extractDir), "entry-path");
       expect(await fs.readdir(extractDir)).toEqual([]);
       expect(await fs.readFile(outsideFile, "utf8")).toBe("outside sentinel");

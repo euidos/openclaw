@@ -195,41 +195,24 @@ describe("full backup config include capture", () => {
     });
   });
 
-  it.each(["missing", "alias"])(
-    "refuses an indeterminate %s graph before publication",
-    async (kind) => {
-      await withOpenClawTestState({ layout: "split" }, async (state) => {
-        const { leafPath } = await configGraph(state);
-        if (kind === "missing") {
-          await fs.unlink(leafPath);
-        }
-        if (kind === "alias") {
-          const moved = path.join(path.dirname(state.configPath), "real-parts");
-          await fs.rename(path.dirname(leafPath), moved);
-          await fs.symlink(
-            moved,
-            path.dirname(leafPath),
-            process.platform === "win32" ? "junction" : "dir",
-          );
-        }
-        await expectRefused(state);
-        // Even an unresolved graph can still be exported explicitly as root-only.
-        const rootOnly = await createBackupArchive({
-          output: state.path("root-only.tar.gz"),
-          onlyConfig: true,
-        });
-        await verifyBackupArchive(rootOnly.archivePath);
-      });
-    },
-  );
-
-  it.each(["leaf", "replacement", "unreadable"])(
-    "refuses %s changes after discovery without overwriting sources",
+  it.each(["missing", "alias", "leaf", "replacement", "unreadable"])(
+    "refuses an indeterminate or changed %s graph without overwriting sources",
     async (kind) => {
       await withOpenClawTestState({ layout: "split" }, async (state) => {
         const { leafPath, files } = await configGraph(state);
-        afterDiscovery(async () => {
-          if (kind === "leaf") {
+        const discoveryFailure = kind === "missing" || kind === "alias";
+        const mutate = async () => {
+          if (kind === "missing") {
+            await fs.unlink(leafPath);
+          } else if (kind === "alias") {
+            const moved = path.join(path.dirname(state.configPath), "real-parts");
+            await fs.rename(path.dirname(leafPath), moved);
+            await fs.symlink(
+              moved,
+              path.dirname(leafPath),
+              process.platform === "win32" ? "junction" : "dir",
+            );
+          } else if (kind === "leaf") {
             const stat = await fs.stat(leafPath);
             await fs.writeFile(leafPath, files.get(leafPath)!.replace("local", "other"));
             await fs.utimes(leafPath, stat.atime, stat.mtime);
@@ -245,12 +228,23 @@ describe("full backup config include capture", () => {
               return open(...args);
             });
           }
-        });
-        await expectRefused(state);
-        if (kind === "leaf") {
-          expect(await fs.readFile(leafPath, "utf8")).toContain('mode: "other"');
+        };
+        if (discoveryFailure) {
+          await mutate();
+        } else {
+          afterDiscovery(mutate);
         }
-        if (kind === "replacement") {
+        await expectRefused(state);
+        if (discoveryFailure) {
+          // An unresolved graph may still be exported explicitly as root-only.
+          const rootOnly = await createBackupArchive({
+            output: state.path("root-only.tar.gz"),
+            onlyConfig: true,
+          });
+          await verifyBackupArchive(rootOnly.archivePath);
+        } else if (kind === "leaf") {
+          expect(await fs.readFile(leafPath, "utf8")).toContain('mode: "other"');
+        } else if (kind === "replacement") {
           await expectText(`${leafPath}.original`, files.get(leafPath));
         }
       });
