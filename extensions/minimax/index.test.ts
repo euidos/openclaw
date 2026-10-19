@@ -1,6 +1,7 @@
 import { streamSimpleAnthropic } from "@openclaw/ai/internal/anthropic";
+import type { StreamFn } from "openclaw/plugin-sdk/agent-core";
 import { createAssistantMessageEventStream, type Model } from "openclaw/plugin-sdk/llm";
-import type { OpenClawPluginApi, ProviderCatalogContext } from "openclaw/plugin-sdk/plugin-entry";
+import type { ProviderCatalogContext } from "openclaw/plugin-sdk/plugin-entry";
 import {
   registerProviderPlugin,
   requireRegisteredProvider,
@@ -37,10 +38,6 @@ vi.mock("./oauth.runtime.js", async (importOriginal) => ({
   })),
 }));
 
-const minimaxProviderPlugin = {
-  register: registerMinimaxProviders,
-};
-
 const globalApi = "https://api.minimax.io/anthropic";
 const cnApi = "https://api.minimaxi.com/anthropic";
 const currentCnApi = "https://api.minimax.cn/anthropic";
@@ -49,6 +46,9 @@ const cnToken = "https://account.minimaxi.com/oauth2/token";
 const modelConfig = (baseUrl: string, provider = "minimax-portal") => ({
   models: { providers: { [provider]: { baseUrl, models: [] } } },
 });
+const portalOutcome = (profileId: string | undefined, status: "ready" | "unavailable") => [
+  { provider: "minimax-portal", profileId, status },
+];
 function catalogContext(overrides: Partial<ProviderCatalogContext> = {}): ProviderCatalogContext {
   return {
     config: {},
@@ -61,28 +61,31 @@ function catalogContext(overrides: Partial<ProviderCatalogContext> = {}): Provid
 
 async function registeredProviders(baseUrl?: string) {
   const { providers } = await registerProviderPlugin({
-    plugin:
-      baseUrl === undefined
-        ? minimaxProviderPlugin
-        : {
-            register: (api: OpenClawPluginApi) =>
-              registerMinimaxProviders({
-                ...api,
-                runtime: {
-                  ...api.runtime,
-                  config: {
-                    ...api.runtime.config,
-                    current: () => modelConfig(baseUrl),
-                  },
-                },
-              }),
-          },
+    plugin: {
+      register(api) {
+        const config =
+          baseUrl === undefined
+            ? api.runtime.config
+            : {
+                ...api.runtime.config,
+                current: () => modelConfig(baseUrl),
+              };
+        registerMinimaxProviders({ ...api, runtime: { ...api.runtime, config } });
+      },
+    },
     id: "minimax",
     name: "MiniMax Provider",
   });
   return {
     apiProvider: requireRegisteredProvider(providers, "minimax"),
     portalProvider: requireRegisteredProvider(providers, "minimax-portal"),
+  };
+}
+
+function payloadStream(payload: Record<string, unknown>): StreamFn {
+  return (model, _context, options) => {
+    options?.onPayload?.(payload, model);
+    return createAssistantMessageEventStream();
   };
 }
 
@@ -114,7 +117,10 @@ afterEach(() => {
 });
 
 describe("minimax provider hooks", () => {
-  beforeEach(() => {
+  let apiProvider: ProviderPlugin;
+  let portalProvider: ProviderPlugin;
+  beforeEach(async () => {
+    ({ apiProvider, portalProvider } = await registeredProviders());
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => Response.json({ data: [{ id: "MiniMax-M3" }] })),
@@ -122,30 +128,18 @@ describe("minimax provider hooks", () => {
   });
 
   it.each([
-    {
-      name: "environment endpoint with blank configuration",
-      baseUrl: " ",
-      host: "https://api.minimaxi.com",
-      expectedEndpoint: "https://api.minimaxi.com/anthropic/v1/models",
-    },
-    {
-      name: "OpenAI-compatible Global configuration ahead of the CN environment",
-      baseUrl: "https://api.minimax.io/v1",
-      api: "openai-completions" as const,
-      host: "https://api.minimaxi.com",
-      expectedEndpoint: "https://api.minimax.io/v1/models",
-    },
-  ])(
-    "keeps API catalog discovery on the $name",
-    async ({ baseUrl, host, api, expectedEndpoint }) => {
-      const expectedBaseUrl = baseUrl.trim() || `${host}/anthropic`;
+    [" ", undefined, "https://api.minimaxi.com/anthropic/v1/models"],
+    ["https://api.minimax.io/v1", "openai-completions", "https://api.minimax.io/v1/models"],
+  ] as const)(
+    "discovers configured endpoint %s/%s ahead of the CN environment",
+    async (baseUrl, api, expectedEndpoint) => {
+      const expectedBaseUrl = baseUrl.trim() || cnApi;
       const fetchMock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) =>
         input === expectedEndpoint
           ? Response.json({ data: [{ id: "MiniMax-M3" }] })
           : new Response(null, { status: 401 }),
       );
       vi.stubGlobal("fetch", fetchMock);
-      const { apiProvider } = await registeredProviders();
       const result = await runProviderCatalog({
         ...catalogContext(),
         provider: apiProvider,
@@ -160,7 +154,7 @@ describe("minimax provider hooks", () => {
             },
           },
         },
-        env: { MINIMAX_API_HOST: host },
+        env: { MINIMAX_API_HOST: "https://api.minimaxi.com" },
         resolveProviderApiKey: () => ({
           apiKey: "MINIMAX_API_KEY",
           discoveryApiKey: "selected-api-key",
@@ -188,7 +182,6 @@ describe("minimax provider hooks", () => {
 
   it("keeps explicit portal API keys ahead of stored OAuth profiles", async () => {
     const fetchMock = vi.mocked(fetch);
-    const { portalProvider } = await registeredProviders();
 
     const catalog = await portalProvider.catalog?.run(
       catalogContext({
@@ -220,7 +213,6 @@ describe("minimax provider hooks", () => {
     "keeps selected profile mode %s coherent through the shared catalog wrapper",
     async (mode) => {
       const fetchMock = vi.mocked(fetch);
-      const { portalProvider } = await registeredProviders();
       const legacyToken = mode === undefined;
       const apiKey = mode === "oauth" ? MINIMAX_OAUTH_MARKER : "MINIMAX_API_KEY";
 
@@ -242,13 +234,7 @@ describe("minimax provider hooks", () => {
         }),
       });
 
-      expect(result?.outcomes).toMatchObject([
-        {
-          provider: "minimax-portal",
-          profileId: "minimax-portal:selected",
-          status: "ready",
-        },
-      ]);
+      expect(result?.outcomes).toMatchObject(portalOutcome("minimax-portal:selected", "ready"));
       const provider = result && "provider" in result ? result.provider : undefined;
       expect(provider?.apiKey).toBe(apiKey);
       const headers = new Headers(fetchMock.mock.calls[0]?.[1]?.headers);
@@ -264,7 +250,6 @@ describe("minimax provider hooks", () => {
   ] as const)(
     "does not complete matching markers with %s",
     async (_name, selectedProfileId, resolvedProfileId, mode) => {
-      const { portalProvider } = await registeredProviders();
       const result = await runProviderCatalog({
         provider: portalProvider,
         ...catalogContext(),
@@ -284,36 +269,26 @@ describe("minimax provider hooks", () => {
 
       expect(result).toEqual({
         providers: {},
-        outcomes: [
-          {
-            provider: "minimax-portal",
-            profileId: selectedProfileId,
-            status: "unavailable",
-          },
-        ],
+        outcomes: portalOutcome(selectedProfileId, "unavailable"),
       });
       expect(fetch).not.toHaveBeenCalled();
     },
   );
 
-  it("defaults M3 thinking on while keeping M2.x thinking off by default", async () => {
-    const { apiProvider, portalProvider } = await registeredProviders();
-
-    for (const provider of [apiProvider, portalProvider]) {
-      expect(
-        provider.resolveThinkingProfile?.({ provider: provider.id, modelId: "MiniMax-M3" }),
-      ).toMatchObject({ defaultLevel: "adaptive" });
-    }
-    expect(
-      apiProvider.resolveThinkingProfile?.({ modelId: "MiniMax-M2.7" } as never),
-    ).toMatchObject({
-      defaultLevel: "off",
+  it.each([
+    ["minimax", "MiniMax-M3", "adaptive"],
+    ["minimax-portal", "MiniMax-M3", "adaptive"],
+    ["minimax", "MiniMax-M2.7", "off"],
+  ])("defaults %s/%s thinking to %s", (providerId, modelId, defaultLevel) => {
+    const provider = providerId === "minimax" ? apiProvider : portalProvider;
+    expect(provider.resolveThinkingProfile?.({ provider: provider.id, modelId })).toMatchObject({
+      defaultLevel,
     });
   });
 
   it("discovers M3.1 with its mandatory five-level thinking profile on both auth routes", async () => {
-    const { apiProvider, portalProvider } = await registeredProviders();
     for (const provider of [apiProvider, portalProvider]) {
+      const ref = { provider: provider.id, modelId: m31Model.id };
       const catalog = await provider.staticCatalog?.run({ env: {}, config: {} } as never);
       const models =
         catalog && "providers" in catalog ? catalog.providers[provider.id]?.models : [];
@@ -327,16 +302,14 @@ describe("minimax provider hooks", () => {
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         }),
       );
-      expect(
-        provider.resolveThinkingProfile?.({ modelId: "MiniMax-M3.1-Flash-Preview" } as never),
-      ).toEqual({
+      expect(provider.resolveThinkingProfile?.(ref)).toEqual({
         levels: [{ id: "low" }, { id: "medium" }, { id: "high" }, { id: "xhigh" }, { id: "max" }],
         defaultLevel: "max",
       });
       expect(
         provider.resolveDynamicModel?.({
-          provider: provider.id,
-          modelId: "minimax-m3.1-flash-preview",
+          ...ref,
+          modelId: ref.modelId.toLowerCase(),
           providerConfig: {},
         } as never),
       ).toMatchObject({ id: "MiniMax-M3.1-Flash-Preview", api: "anthropic-messages" });
@@ -351,7 +324,6 @@ describe("minimax provider hooks", () => {
   ] as const)(
     "sends M3.1 effort %s as %s (model cap: %s, request cap: %s)",
     async (thinkingLevel, effort, modelMaxTokens, requestedMaxTokens) => {
-      const { apiProvider, portalProvider } = await registeredProviders();
       for (const provider of [apiProvider, portalProvider]) {
         for (const hook of ["wrapStreamFn", "wrapSimpleCompletionStreamFn"] as const) {
           const model = {
@@ -439,16 +411,12 @@ describe("minimax provider hooks", () => {
   );
 
   it("preserves M3.1 output configuration and resolves effort per call", async () => {
-    const { apiProvider } = await registeredProviders();
     const payload: Record<string, unknown> = { output_config: { format: { type: "json_schema" } } };
     const wrapped = apiProvider.wrapStreamFn?.({
       provider: "minimax",
       modelId: m31Model.id,
       thinkingLevel: "high",
-      streamFn: (model, _context, options) => {
-        options?.onPayload?.(payload, model);
-        return createAssistantMessageEventStream();
-      },
+      streamFn: payloadStream(payload),
     });
     for (const reasoning of ["low", "max", undefined] as const) {
       void wrapped?.(m31Model, { messages: [] }, { reasoning });
@@ -460,16 +428,12 @@ describe("minimax provider hooks", () => {
   });
 
   it("keeps M3.1 request shaping away from openai-completions", async () => {
-    const { apiProvider } = await registeredProviders();
     const payload = { thinking: { type: "disabled" } };
     const wrapped = apiProvider.wrapStreamFn?.({
       provider: "minimax",
       modelId: m31Model.id,
       thinkingLevel: "low",
-      streamFn: (model, _context, options) => {
-        options?.onPayload?.(payload, model);
-        return createAssistantMessageEventStream();
-      },
+      streamFn: payloadStream(payload),
     });
     void wrapped?.({ ...m31Model, api: "openai-completions" }, { messages: [] }, {});
     expect(payload).toEqual({ thinking: { type: "disabled" } });
@@ -477,7 +441,6 @@ describe("minimax provider hooks", () => {
 
   it("owns ultrafast stream wrapping for MiniMax transports", async () => {
     let fastMode: boolean | "ultrafast" = "ultrafast";
-    const { apiProvider, portalProvider } = await registeredProviders();
     const apiModel = captureFastModel(apiProvider, fastMode);
     const portalModel = captureFastModel(portalProvider, () => fastMode);
     expect(apiModel()).toBe("MiniMax-M2.7-highspeed");
@@ -487,7 +450,6 @@ describe("minimax provider hooks", () => {
   });
 
   it("prefers minimax-portal oauth when resolving MiniMax usage auth", async () => {
-    const { apiProvider } = await registeredProviders();
     const resolveOAuthToken = vi.fn(async (params?: { provider?: string }) =>
       params?.provider === "minimax-portal" ? { token: "portal-oauth-token" } : null,
     );
@@ -508,7 +470,6 @@ describe("minimax provider hooks", () => {
   });
 
   it("uses the configured MiniMax base URL for usage snapshots", async () => {
-    const { apiProvider } = await registeredProviders();
     const fetchFn = vi.fn(async (input: string | URL | Request) => {
       const url =
         typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
@@ -534,7 +495,6 @@ describe("minimax provider hooks", () => {
   });
 
   it("writes api and authHeader into the MiniMax portal OAuth config patch", async () => {
-    const { portalProvider } = await registeredProviders();
     const oauthMethod = portalProvider.auth.find((method) => method.id === "oauth");
 
     if (!oauthMethod) {
@@ -544,9 +504,7 @@ describe("minimax provider hooks", () => {
     const assertCurrent = vi.fn();
     const result = await oauthMethod.run({
       prompter: {
-        progress() {
-          return { stop() {} };
-        },
+        progress: () => ({ stop: vi.fn() }),
         note: vi.fn(async () => undefined),
       },
       openUrl: vi.fn(async () => undefined),
@@ -573,31 +531,41 @@ describe("minimax provider hooks", () => {
   });
 
   it.each([
-    [cnApi, globalApi, cnToken],
-    [currentCnApi, globalApi, cnToken],
-    [globalApi, undefined, globalToken],
-    ["https://proxy.example.com/anthropic", undefined, globalToken],
+    [cnApi, globalApi, cnToken, true],
+    [currentCnApi, globalApi, cnToken, true],
+    [globalApi, undefined, globalToken, true],
+    ["https://proxy.example.com/anthropic", undefined, globalToken, true],
+    [globalApi, undefined, undefined, false],
+    [cnApi, globalApi, globalToken, false],
+    [currentCnApi, globalApi, globalToken, false],
+    [globalApi, cnApi, cnToken, false],
   ] as const)(
-    "refreshes expired portal OAuth at its issuing endpoint (base URL %s)",
-    async (baseUrl, runtimeBaseUrl, tokenEndpoint) => {
-      const { portalProvider } = await registeredProviders(runtimeBaseUrl ?? baseUrl);
+    "binds portal OAuth refresh for %s (runtime: %s, issuer: %s, allowed: %s)",
+    async (baseUrl, runtimeBaseUrl, tokenEndpoint, allowed) => {
+      const scoped = await registeredProviders(runtimeBaseUrl ?? baseUrl);
       vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
       const fetchMock = vi.fn(async () =>
         Response.json({
           status: "success",
-          access_token: "fresh-access",
-          refresh_token: "rotated-refresh",
+          access_token: allowed ? "fresh-access" : "unexpected-access",
+          ...(allowed ? { refresh_token: "rotated-refresh" } : {}),
           expired_in: 7200,
         }),
       );
       vi.stubGlobal("fetch", fetchMock);
 
-      await expect(
-        portalProvider.refreshOAuth?.(
-          expiredPortalCredential(tokenEndpoint),
-          runtimeBaseUrl ? modelConfig(baseUrl) : undefined,
-        ),
-      ).resolves.toEqual({
+      const result = scoped.portalProvider.refreshOAuth?.(
+        expiredPortalCredential(tokenEndpoint),
+        runtimeBaseUrl ? modelConfig(baseUrl) : undefined,
+      );
+      if (!allowed) {
+        await expect(result).rejects.toThrow(
+          "openclaw models auth login --provider minimax-portal",
+        );
+        expect(fetchMock).not.toHaveBeenCalled();
+        return;
+      }
+      await expect(result).resolves.toEqual({
         ...expiredPortalCredential(tokenEndpoint),
         access: "fresh-access",
         refresh: "rotated-refresh",
@@ -610,30 +578,6 @@ describe("minimax provider hooks", () => {
         client_id: "78257093-7e40-4613-99e0-527b14b39113",
         refresh_token: "stored-refresh",
       });
-    },
-  );
-
-  it.each([
-    ["missing issuing endpoint", globalApi, undefined, undefined],
-    ["Global credential moved to CN", cnApi, globalApi, globalToken],
-    ["Global credential moved to current CN host", currentCnApi, globalApi, globalToken],
-    ["CN credential moved to Global", globalApi, cnApi, cnToken],
-  ] as const)(
-    "refuses portal OAuth refresh before any request: %s",
-    async (_case, baseUrl, runtimeBaseUrl, tokenEndpoint) => {
-      const { portalProvider } = await registeredProviders(runtimeBaseUrl ?? baseUrl);
-      const fetchMock = vi.fn(async () =>
-        Response.json({ status: "success", access_token: "unexpected-access", expired_in: 7200 }),
-      );
-      vi.stubGlobal("fetch", fetchMock);
-
-      await expect(
-        portalProvider.refreshOAuth?.(
-          expiredPortalCredential(tokenEndpoint),
-          runtimeBaseUrl ? modelConfig(baseUrl) : undefined,
-        ),
-      ).rejects.toThrow("openclaw models auth login --provider minimax-portal");
-      expect(fetchMock).not.toHaveBeenCalled();
     },
   );
 });

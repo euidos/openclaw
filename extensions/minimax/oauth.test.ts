@@ -188,53 +188,36 @@ describe("loginMiniMaxPortalOAuth", () => {
   );
 
   it.each([
-    [
-      "authorization error",
-      false,
-      503,
-      "minimax authorization unavailable ",
-      1024,
-      expect.stringMatching(
-        /MiniMax OAuth authorization failed: minimax authorization unavailable/,
-      ),
-    ],
-    [
-      "token error",
-      true,
-      503,
-      "minimax token unavailable ",
-      1024,
-      expect.stringContaining("minimax token unavailable"),
-    ],
-    [
-      "HTTP 200 token",
-      true,
-      200,
-      '{"status":"error","detail":"',
-      512,
-      "MiniMax OAuth failed to parse response.",
-    ],
-  ] as const)(
-    "bounds %s bodies without using response.text()",
-    async (_name, token, status, chunk, repeats, message) => {
-      const tracked = cancelTrackedTextResponse(`${chunk.repeat(repeats)}tail`, {
-        status,
-        headers: { "Content-Type": status === 200 ? "application/json" : "text/plain" },
-      });
-      const textSpy = vi.spyOn(tracked.response, "text").mockRejectedValue(new Error("unbounded"));
-      if (token) {
-        stubOAuthFetch((_input, init) => authResponse(init), tracked.response);
-      } else {
-        stubOAuthFetch(tracked.response);
-      }
-      const error = await loginMiniMax().catch((cause: unknown) => cause);
-      expect(error).toBeInstanceOf(Error);
-      expect((error as Error).message).toEqual(message);
-      expect((error as Error).message).not.toContain("tail");
-      expect(tracked.wasCanceled()).toBe(true);
-      expect(textSpy).not.toHaveBeenCalled();
-    },
-  );
+    ["authorization", false, 503],
+    ["token", true, 503],
+    ["HTTP 200 token", true, 200],
+  ] as const)("bounds %s bodies without using response.text()", async (name, token, status) => {
+    const malformed = status === 200;
+    const chunk = malformed ? '{"status":"error","detail":"' : `minimax ${name} unavailable `;
+    const message = malformed
+      ? "MiniMax OAuth failed to parse response."
+      : expect.stringContaining(
+          token
+            ? "minimax token unavailable"
+            : "MiniMax OAuth authorization failed: minimax authorization unavailable",
+        );
+    const tracked = cancelTrackedTextResponse(`${chunk.repeat(malformed ? 512 : 1024)}tail`, {
+      status,
+      headers: { "Content-Type": status === 200 ? "application/json" : "text/plain" },
+    });
+    const textSpy = vi.spyOn(tracked.response, "text").mockRejectedValue(new Error("unbounded"));
+    if (token) {
+      stubOAuthFetch((_input, init) => authResponse(init), tracked.response);
+    } else {
+      stubOAuthFetch(tracked.response);
+    }
+    const error = await loginMiniMax().catch((cause: unknown) => cause);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toEqual(message);
+    expect((error as Error).message).not.toContain("tail");
+    expect(tracked.wasCanceled()).toBe(true);
+    expect(textSpy).not.toHaveBeenCalled();
+  });
 
   it("records the issuing account endpoint for Global and CN credentials", async () => {
     for (const [region, host] of [
