@@ -71,13 +71,15 @@ const allocate = (offsets?: number[], fallback = false) =>
       })
     : ports.getDeterministicFreePortBlock(offsets && { offsets });
 
-function expectRange(port: number, low: number, high: number) {
-  expect(port).toBeGreaterThanOrEqual(low);
-  expect(port).toBeLessThanOrEqual(high);
-}
-
-function expectOutside(port: number, low = 32768, high = 60999) {
-  expect(port < low || port > high).toBe(true);
+function expectBlock(port: number, offsets: number[], outside?: number[], inside = [1024, 65535]) {
+  for (const offset of offsets) {
+    const candidate = port + offset;
+    expect(candidate).toBeGreaterThanOrEqual(inside[0]);
+    expect(candidate).toBeLessThanOrEqual(inside[1]);
+    if (outside) {
+      expect(candidate < outside[0] || candidate > outside[1]).toBe(true);
+    }
+  }
 }
 
 async function bindPort(port: number) {
@@ -100,6 +102,9 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  if (host.platform() !== "linux") {
+    expect.soft(host.reads).not.toHaveBeenCalled();
+  }
   Reflect.deleteProperty(globalThis, host.cacheKey);
   for (const server of listeners.splice(0)) {
     await new Promise<void>((resolve) => {
@@ -113,10 +118,7 @@ it("excludes kernel client ports across workers", async () => {
   host.range = `${low}\t${high}\n`;
   for (let worker = 0; worker < 64; worker += 1) {
     const port = await withEnvAsync({ VITEST_WORKER_ID: String(worker) }, () => allocate());
-    for (const offset of defaultOffsets) {
-      expectRange(port + offset, 1024, 65535);
-      expectOutside(port + offset, low, high);
-    }
+    expectBlock(port, defaultOffsets, [low, high]);
   }
   expect(host.reads).toHaveBeenCalledTimes(1);
 });
@@ -127,9 +129,7 @@ it.each(["linux", "darwin"])("binds non-overlapping %s blocks", async (os) => {
   for (let block = 0; block < 2; block += 1) {
     const port = await allocate();
     if (os === "darwin") {
-      expect(port).toBeGreaterThanOrEqual(30000);
-      expect(port + 4).toBeLessThanOrEqual(64999);
-      expect(host.reads).not.toHaveBeenCalled();
+      expectBlock(port, defaultOffsets, undefined, [30000, 64999]);
     }
     for (const offset of defaultOffsets) {
       expect(bound.has(port + offset)).toBe(false);
@@ -155,9 +155,7 @@ it("excludes HTTP-blocked base and derived ports", async () => {
   expect(blocked.status, blocked.stderr).toBe(0);
   expect(JSON.parse(blocked.stdout)).toEqual({ cause: "bad port" });
   const port = await allocate(offsets);
-  for (const offset of offsets) {
-    expectRange(port + offset, 1800, 1807);
-  }
+  expectBlock(port, offsets, undefined, [1800, 1807]);
 });
 
 it.each([
@@ -180,7 +178,6 @@ it.each([
     expect(host.rejectPort).toHaveBeenCalledWith(candidate);
     await bindPort(candidate);
   }
-  expect(host.reads).not.toHaveBeenCalled();
 });
 
 it.each([
@@ -210,22 +207,28 @@ it("falls back outside occupied worker and kernel ranges", async () => {
   });
   const port = await allocate();
   expect(occupiedStart).toBeDefined();
+  expectBlock(port, defaultOffsets, [occupiedStart!, occupiedStart! + 999]);
+  expectBlock(port, defaultOffsets, [32768, 60999]);
   for (const offset of defaultOffsets) {
-    const candidate = port + offset;
-    expectOutside(candidate, occupiedStart!, occupiedStart! + 999);
-    expectOutside(candidate);
-    expect(host.rejectPort).toHaveBeenCalledWith(candidate);
+    expect(host.rejectPort).toHaveBeenCalledWith(port + offset);
   }
   expect(host.rejectPort).not.toHaveBeenCalledWith(0);
 });
 
-it.each(["EPERM", "EACCES"])("excludes client ports on Linux %s", async (code) => {
+it.each([
+  ["linux", "EPERM"],
+  ["linux", "EACCES"],
+  ["darwin", "EACCES"],
+  ["win32", "EACCES"],
+])("preserves safe %s fallback on %s", async (os, code) => {
+  host.platform.mockReturnValue(os);
   host.rejectPort.mockReturnValue(code);
   const port = await allocate(fallbackOffsets, true);
-  for (const offset of fallbackOffsets) {
-    expectRange(port + offset, 1024, 65535);
-    expectOutside(port + offset);
+  if (os !== "linux") {
+    expect(port).toBe(44000 + (process.pid % 10000));
+    return;
   }
+  expectBlock(port, fallbackOffsets, [32768, 60999]);
   expect(host.rejectPort.mock.calls.map(([candidate]) => candidate)).toEqual(
     fallbackOffsets.map((offset) => port + offset),
   );
@@ -242,31 +245,17 @@ it("skips HTTP-blocked ports before Linux permission fallback", async () => {
   });
 });
 
-it.each(["darwin", "win32"])("preserves the explicit %s permission fallback", async (os) => {
-  host.platform.mockReturnValue(os);
-  host.rejectPort.mockReturnValue("EACCES");
-  await expect(allocate(fallbackOffsets, true)).resolves.toBe(44000 + (process.pid % 10000));
-  expect(host.reads).not.toHaveBeenCalled();
+it.each([
+  ["1024 65535", false, /ephemeral TCP (port )?range/],
+  ["invalid", false, /ephemeral TCP (port )?range/],
+  ["denied", true, "failed to read Linux ephemeral TCP port range"],
+] as const)("rejects Linux range %s before probing", async (range, denied, error) => {
+  host.range = range;
+  if (denied) {
+    host.reads.mockImplementationOnce(() => {
+      throw Object.assign(new Error("proc access denied"), { code: "EACCES" });
+    });
+  }
+  await expect(allocate(denied ? fallbackOffsets : undefined, denied)).rejects.toThrow(error);
+  expect(host.rejectPort).not.toHaveBeenCalled();
 });
-
-it.each(["1024 65535", "invalid", "denied"])(
-  "rejects Linux range %s before probing",
-  async (range) => {
-    host.range = range;
-    if (range === "denied") {
-      host.reads.mockImplementationOnce(() => {
-        throw Object.assign(new Error("proc access denied"), { code: "EACCES" });
-      });
-    }
-    const result = allocate(
-      range === "denied" ? fallbackOffsets : defaultOffsets,
-      range === "denied",
-    );
-    await expect(result).rejects.toThrow(
-      range === "denied"
-        ? "failed to read Linux ephemeral TCP port range"
-        : /ephemeral TCP (port )?range/,
-    );
-    expect(host.rejectPort).not.toHaveBeenCalled();
-  },
-);
