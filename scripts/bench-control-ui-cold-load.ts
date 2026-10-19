@@ -236,7 +236,7 @@ const { values } = parseArgs({
     "capture-ms": { type: "string", default: "0" },
     "sidebar-row-transfer": { type: "string", default: "full" },
     "bundle-dir": { type: "string" },
-    "compare-bundle-dir": { type: "string" },
+    "compare-bundle-dir": { type: "string", multiple: true, default: [] },
     runs: { type: "string", default: "3" },
     "latency-ms": { type: "string", default: "35" },
     "method-latency-ms": { type: "string", multiple: true, default: [] },
@@ -309,7 +309,7 @@ const captureMs = Number(values["capture-ms"]);
 if (
   !Number.isInteger(runs) ||
   runs < 1 ||
-  runs > (values["compare-bundle-dir"] ? 40 : 20) ||
+  runs > (values["compare-bundle-dir"].length ? 60 : 20) ||
   !Number.isFinite(latencyMs) ||
   latencyMs < 0 ||
   !Number.isFinite(frameGapMs) ||
@@ -322,10 +322,17 @@ if (
   );
 }
 if (
-  values["compare-bundle-dir"] &&
-  (!values["bundle-dir"] || !values["warm-reload"] || !values.untraced || cpuProfile || runs % 2)
+  values["compare-bundle-dir"].length &&
+  (!values["bundle-dir"] ||
+    !values["warm-reload"] ||
+    !values.untraced ||
+    cpuProfile ||
+    values["compare-bundle-dir"].length > 2 ||
+    runs % (values["compare-bundle-dir"].length + 1))
 ) {
-  throw new Error("Bundle comparison requires unprofiled warm reloads and paired prebuilt bundles");
+  throw new Error(
+    "Bundle comparison requires complete cycles of two or three unprofiled warm bundles",
+  );
 }
 if (sidebarRowTransfer === "interleaved" && (runs < 14 || runs % 2 !== 0)) {
   throw new Error("Interleaved sidebar transfer requires an even run count of at least 14");
@@ -340,20 +347,18 @@ const bundleDir = values["bundle-dir"]
 const server = values["bundle-dir"]
   ? await startBuiltControlUiE2eServer(bundleDir)
   : await startProductionControlUiE2eServer(bundleDir, head);
-const comparisonBundleDir = values["compare-bundle-dir"]
-  ? path.resolve(values["compare-bundle-dir"])
-  : undefined;
+const comparisonBundleDirs = values["compare-bundle-dir"].map((directory) =>
+  path.resolve(directory),
+);
 const parkedBaselineDir = path.join(artifactDir, "baseline-bundle");
-let comparisonActive = false;
-async function selectComparisonBundle(active: boolean) {
-  if (!comparisonBundleDir || comparisonActive === active) {
+const bundleSlots = [parkedBaselineDir, ...comparisonBundleDirs];
+let activeBundle = 0;
+async function selectComparisonBundle(index: number) {
+  if (!comparisonBundleDirs.length || activeBundle === index) {
     return;
   }
-  await server.replaceBuild(
-    active ? comparisonBundleDir : parkedBaselineDir,
-    active ? parkedBaselineDir : comparisonBundleDir,
-  );
-  comparisonActive = active;
+  await server.replaceBuild(bundleSlots[index]!, bundleSlots[activeBundle]!);
+  activeBundle = index;
 }
 const sandbox = createSandboxHostHttpServer();
 await new Promise<void>((resolve, reject) => {
@@ -610,13 +615,13 @@ try {
     persistColdLoadWarmState,
     warmInput,
   );
-  if (comparisonBundleDir) {
+  for (let index = 1; index < bundleSlots.length; index++) {
     await restoreColdLoadWarmState(page, warmStorage);
-    await selectComparisonBundle(true);
+    await selectComparisonBundle(index);
     await page.reload({ waitUntil: "domcontentloaded" });
     await settle();
-    await selectComparisonBundle(false);
   }
+  await selectComparisonBundle(0);
   for (let run = 0; run < runs; run++) {
     const cpuPhases: Record<string, ColdLoadCpuTables> = {};
     async function recordCpu(phase: string, profile: Parameters<typeof mapColdLoadCpuProfile>[0]) {
@@ -645,7 +650,7 @@ try {
       return { ...mapped, summary };
     }
     await restoreColdLoadWarmState(page, warmStorage);
-    await selectComparisonBundle(run % 2 === 1);
+    await selectComparisonBundle(run % bundleSlots.length);
     runTransfer =
       sidebarRowTransfer === "delta" || (sidebarRowTransfer === "interleaved" && run % 2 === 1)
         ? "delta"
@@ -1081,7 +1086,9 @@ try {
     await cdp.detach();
     const result = {
       run: run + 1,
-      ...(comparisonBundleDir ? { variant: comparisonActive ? "candidate" : "base" } : {}),
+      ...(comparisonBundleDirs.length
+        ? { variant: ["base", "candidate", "candidate-2"][activeBundle] }
+        : {}),
       head,
       sidebarRowTransfer: values["sidebar-list-churn"] ? runTransfer : undefined,
       ...metrics,
@@ -1138,7 +1145,7 @@ try {
   await context.close();
 } finally {
   await browser?.close();
-  await selectComparisonBundle(false);
+  await selectComparisonBundle(0);
   await server.close();
   sandbox.closeAllConnections();
   await new Promise<void>((resolve, reject) => {
@@ -1151,7 +1158,7 @@ try {
         head,
         dirty,
         bundleDir,
-        comparisonBundleDir,
+        comparisonBundleDirs,
         fixture: fixture.counts,
         sidebarView,
         streamingReply: values["streaming-reply"],
