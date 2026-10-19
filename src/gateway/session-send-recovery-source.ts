@@ -48,6 +48,7 @@ export async function prepareSessionSendRecoveryCommunication(params: {
   delivery: SessionSendDelivery;
   inputProvenance: PersistedUserTurnMessage["provenance"];
   target: Pick<SessionSendDeliveryEndpoint, "agentId" | "sessionKey" | "sessionId">;
+  /** Revalidate the retained input and its recovery owner. */
   assertCurrent: () => void;
   signal?: AbortSignal;
 }) {
@@ -108,6 +109,8 @@ export async function prepareSessionSendRecoveryCommunication(params: {
       inputProvenance: params.inputProvenance,
       access: { sandboxed: params.delivery.sandboxed },
       allowApproval: false,
+      // Accepted results retain their input owner's return route across recovery.
+      acceptedReply: params.delivery.returnedResult ? params.assertCurrent : undefined,
       assertSourceCurrent: params.assertCurrent,
       callGateway: async () => {
         throw new Error("Session delivery recovery requires current direct access");

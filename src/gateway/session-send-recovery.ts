@@ -206,7 +206,10 @@ async function recoverSessionSendDeliveriesForAgents(
                 delivery,
                 inputProvenance: input.message.provenance,
                 target: scope,
-                assertCurrent,
+                assertCurrent: () => {
+                  assertCurrent();
+                  retained.assertCurrent();
+                },
                 signal,
               });
               if (!communication) {
