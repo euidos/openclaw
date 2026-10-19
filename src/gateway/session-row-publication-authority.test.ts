@@ -92,7 +92,13 @@ it.each(["child and swarm links", "sharing role", "incognito"] as const)(
         bootId: "publication-authority",
         cfg,
       });
+      await using cleanup = new AsyncDisposableStack();
+      cleanup.defer(() => {
+        subagentRuns.delete("publication-child");
+      });
       const projection = await createSessionRowProjection({ cfg, modelCatalog: [] });
+      cleanup.defer(() => projection.dispose());
+      cleanup.defer(() => connection.mentionInbox.dispose());
       // Repeat each identity on a second socket so both visible projections exercise cache hits.
       const peers = [allowed!, restricted!, allowed!, restricted!].map((profile, index) => {
         const socket = createGatewayWsTestSocket();
@@ -110,103 +116,87 @@ it.each(["child and swarm links", "sharing role", "incognito"] as const)(
         connection.clients.add(client);
         return socket.send;
       });
-      const detach = connection.attachSessionRowProjection(projection);
-      try {
-        await projection.ensureMaterialized();
-        await withReadySessionRows(
-          projection,
-          () => [query],
-          (read) => {
-            const record = read.describe(query)!;
-            publishTranscriptFields(
-              record,
-              { lastMessagePreview: "Private preview 🦞", fallbackModel: undefined },
-              cfg,
-              read.state.rowContext,
-            );
-            const presentations = vi.spyOn(projection, "present");
-            const message = {
-              role: "assistant",
-              content: [{ type: "text", text: '"🦞"\n\\\ud800'.repeat(256) }],
-            };
-            const stringify = JSON.stringify;
-            let envelopes = 0;
-            const serialization = vi.spyOn(JSON, "stringify").mockImplementation((...args) => {
-              const value: unknown = args[0];
-              if (
-                isRecord(value) &&
-                isRecord(value.payload) &&
-                value.payload.sessionKey === query.key
-              ) {
-                envelopes++;
-              }
-              return stringify(...args);
-            });
-            connection.broadcast(
-              "session.message",
-              {
-                sessionKey: query.key,
-                agentId: query.agentId,
-                message,
-                session: { key: query.key, sessionId: "publication-session" },
-              },
-              {
-                prepareSessionProjection: prepareSessionEventProjection(projection, read, {
-                  ancestors: projection.ancestorRows(record, read),
-                  encodeMessage: true,
-                }),
-              },
-            );
-            serialization.mockRestore();
-            expect(envelopes).toBe(links ? 2 : 1);
-            for (const [index, send] of peers.entries()) {
-              const visible = index % 2 === 0 || links;
-              expect(send).toHaveBeenCalledTimes(visible ? 1 : 0);
-              if (!visible) {
-                continue;
-              }
-              const frame = JSON.parse(String(send.mock.calls[0]![0]));
-              expect(frame.payload.message).toEqual(message);
-              expect(frame.seq).toBe(1);
-              expect(send.mock.calls[0]![1]).toEqual({ binary: false });
-              const row = frame.payload.session;
-              expect(row).toMatchObject({
-                key: query.key,
-                sessionId: "publication-session",
-                lastMessagePreview: "Private preview 🦞",
-                sharingRole: incognito ? "admin" : "viewer",
-              });
-              expect(row.childSessions).toEqual(links && index % 2 === 0 ? [childKey] : undefined);
-              expect(row.swarm).toEqual(
-                links
-                  ? {
-                      groups: [
-                        {
-                          groupId: "publication-group",
-                          createdAt: now - 100,
-                          queued: 0,
-                          running: 0,
-                          done: 1,
-                          failed: 0,
-                          children:
-                            index % 2 === 0 ? [{ sessionKey: childKey, status: "done" }] : [],
-                        },
-                      ],
-                      otherActiveGroups: 0,
-                    }
-                  : undefined,
-              );
+      cleanup.defer(connection.attachSessionRowProjection(projection));
+      await projection.ensureMaterialized();
+      await withReadySessionRows(
+        projection,
+        () => [query],
+        (read) => {
+          const record = read.describe(query)!;
+          publishTranscriptFields(
+            record,
+            { lastMessagePreview: "Private preview 🦞", fallbackModel: undefined },
+            cfg,
+            read.state.rowContext,
+          );
+          const presentations = vi.spyOn(projection, "present");
+          const message = {
+            role: "assistant",
+            content: [{ type: "text", text: '"🦞"\n\\\ud800'.repeat(256) }],
+          };
+          const serialization = vi.spyOn(JSON, "stringify");
+          connection.broadcast(
+            "session.message",
+            {
+              sessionKey: query.key,
+              agentId: query.agentId,
+              message,
+              session: { key: query.key, sessionId: "publication-session" },
+            },
+            {
+              prepareSessionProjection: prepareSessionEventProjection(projection, read, {
+                ancestors: projection.ancestorRows(record, read),
+                encodeMessage: true,
+              }),
+            },
+          );
+          const envelopes = serialization.mock.calls.filter(
+            ([value]) =>
+              isRecord(value) && isRecord(value.payload) && value.payload.sessionKey === query.key,
+          );
+          serialization.mockRestore();
+          expect(envelopes).toHaveLength(links ? 2 : 1);
+          for (const [index, send] of peers.entries()) {
+            const visible = index % 2 === 0 || links;
+            expect(send).toHaveBeenCalledTimes(visible ? 1 : 0);
+            if (!visible) {
+              continue;
             }
-            expect(presentations).toHaveBeenCalledTimes(links ? 2 : 1);
-            presentations.mockRestore();
-          },
-        );
-      } finally {
-        detach();
-        await connection.mentionInbox.dispose();
-        projection.dispose();
-        subagentRuns.delete("publication-child");
-      }
+            const frame = JSON.parse(String(send.mock.calls[0]![0]));
+            expect(frame.payload.message).toEqual(message);
+            expect(frame.seq).toBe(1);
+            expect(send.mock.calls[0]![1]).toEqual({ binary: false });
+            const row = frame.payload.session;
+            expect(row).toMatchObject({
+              key: query.key,
+              sessionId: "publication-session",
+              lastMessagePreview: "Private preview 🦞",
+              sharingRole: incognito ? "admin" : "viewer",
+            });
+            expect(row.childSessions).toEqual(links && index % 2 === 0 ? [childKey] : undefined);
+            expect(row.swarm).toEqual(
+              links
+                ? {
+                    groups: [
+                      {
+                        groupId: "publication-group",
+                        createdAt: now - 100,
+                        queued: 0,
+                        running: 0,
+                        done: 1,
+                        failed: 0,
+                        children: index % 2 === 0 ? [{ sessionKey: childKey, status: "done" }] : [],
+                      },
+                    ],
+                    otherActiveGroups: 0,
+                  }
+                : undefined,
+            );
+          }
+          expect(presentations).toHaveBeenCalledTimes(links ? 2 : 1);
+          presentations.mockRestore();
+        },
+      );
     });
   },
 );

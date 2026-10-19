@@ -5,7 +5,6 @@ import { setRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
 import { replaceSessionEntrySync } from "../config/sessions/session-accessor.js";
 import type { SessionRowDatabaseFacts } from "../config/sessions/session-row-facts.types.js";
 import { addSessionMember } from "../config/sessions/session-sharing-store.native.js";
-import * as history from "../config/sessions/session-transcript-worker-runtime.js";
 import type { InternalSessionEntry, SessionAcpMeta } from "../config/sessions/types.js";
 import { sessionChanges } from "../sessions/session-row-changes.js";
 import { createDeferredCore } from "../shared/deferred.js";
@@ -16,11 +15,7 @@ import * as databaseFactsRead from "./session-row-database-facts.js";
 import { withReadySessionRows } from "./session-row-prepared-read.js";
 import { ready, type Row } from "./session-row-projection-record.js";
 import type { SessionRowProjection } from "./session-row-projection.js";
-import {
-  createTestProjection,
-  holdForeground,
-  seedRow,
-} from "./session-row-projection.read-fixture.test-support.js";
+import * as rowFixture from "./session-row-projection.read-fixture.test-support.js";
 import * as rowInputs from "./session-utils-row.js";
 
 /** Pause after the real worker read scope has released its request hold. */
@@ -62,7 +57,7 @@ export async function withAcceptedSuffix(
     const [profileOwner, viewer] = options.membership
       ? ["owner", "viewer"].map((name) => ensureProfileForEmail(`accepted-${name}@example.test`))
       : [];
-    const entries = keys.map<InternalSessionEntry>((_, index) => ({
+    const entries = keys.map<InternalSessionEntry>((_key, index) => ({
       sessionId: `accepted-${index}`,
       updatedAt: 1,
       label: `initial-${index}`,
@@ -79,7 +74,7 @@ export async function withAcceptedSuffix(
       suffixEntry.createdActor = { type: "human", source: "profile", id: profileOwner.id };
     }
     for (const [index, sessionKey] of keys.entries()) {
-      seedRow(sessionKey, entries[index]!);
+      rowFixture.seedRow(sessionKey, entries[index]!);
     }
     if (options.acpMeta) {
       seedCanonicalAcpSessionMeta({
@@ -101,8 +96,8 @@ export async function withAcceptedSuffix(
       );
       await closeOpenClawAgentDatabaseByPathAsync(replacementPath, "main");
     }
-    using foreground = holdForeground();
-    using projection = await createTestProjection({ cfg, modelCatalog: [] });
+    using _ = rowFixture.holdForeground();
+    using projection = await rowFixture.createTestProjection({ cfg, modelCatalog: [] });
     const paused = createDeferredCore();
     const release = createDeferredCore();
     let reading: Promise<void> | undefined;
@@ -114,34 +109,21 @@ export async function withAcceptedSuffix(
         (read) => read.describe(query)!,
       );
       const count = projection.materializedCount;
-      const releases: string[] = [];
+      let releases = 0;
       let trackingCustody = false;
       const reads: SessionRowDatabaseFacts[][] = [];
-      const readDatabases = history.withSessionHistoryWorkerDatabases;
-      vi.spyOn(history, "withSessionHistoryWorkerDatabases").mockImplementation(
-        async (selected, consume, lane) => {
-          const tracked = trackingCustody;
-          const result = await readDatabases(
-            selected,
-            (owners) =>
-              consume(
-                owners.map((owner) => ({
-                  ...owner,
-                  async readRowFacts(input) {
-                    const reply = await owner.readRowFacts(input);
-                    reads.push(structuredClone(reply.rows));
-                    return reply;
-                  },
-                })),
-              ),
-            lane,
-          );
-          if (tracked) {
-            releases.push("worker");
-          }
-          return result;
-        },
-      );
+      const databases = rowFixture.watchRowFacts((owner) => async (input) => {
+        const reply = await owner.readRowFacts(input);
+        reads.push(structuredClone(reply.rows));
+        return reply;
+      });
+      const readDatabases = databases.getMockImplementation()!;
+      databases.mockImplementation(async (...args) => {
+        const tracked = trackingCustody;
+        const result = await readDatabases(...args);
+        releases += tracked ? 1 : 0;
+        return result;
+      });
       let elapsed = 0;
       vi.spyOn(performance, "now").mockImplementation(() => elapsed);
       const readInputs = rowInputs.readSessionRowInputs;
@@ -169,7 +151,7 @@ export async function withAcceptedSuffix(
         label: `accepted-${index}`,
       }));
       for (const [index, sessionKey] of keys.entries()) {
-        seedRow(sessionKey, acceptedEntries[index]!);
+        rowFixture.seedRow(sessionKey, acceptedEntries[index]!);
         sessionChanges.emit({
           agentId: "main",
           storePath: previous.storeTarget.storePath,
@@ -184,7 +166,7 @@ export async function withAcceptedSuffix(
           throw new Error("Drain bypassed the released-custody boundary");
         }),
       ]);
-      expect(releases).toEqual(["worker"]);
+      expect(releases).toBe(1);
       const suffix = projection.findBySessionId({
         agentId: "main",
         sessionId: entries[1]!.sessionId,
@@ -220,8 +202,6 @@ export async function withAcceptedSuffix(
       release.resolve();
       await Promise.allSettled(reading ? [reading] : []);
       vi.restoreAllMocks();
-      projection.dispose();
-      foreground();
     }
   });
 }
