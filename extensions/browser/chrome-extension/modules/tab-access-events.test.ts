@@ -1,26 +1,9 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { chromeEvent, deferred } from "./browser.test-support.js";
 import { registerTabAccessEvents } from "./tab-access-events.js";
 import type { BrowserTabSnapshot } from "./tab-eligibility.js";
 
-function deferred<T>() {
-  let resolve = (_value: T) => {};
-  const promise = new Promise<T>((next) => {
-    resolve = next;
-  });
-  return { promise, resolve };
-}
-
-function chromeEvent<Args extends unknown[]>() {
-  let listener = (..._args: Args) => {
-    throw new Error("Chrome event listener was not registered");
-  };
-  return {
-    addListener: (next: (...args: Args) => void) => {
-      listener = next;
-    },
-    emit: (...args: Args) => listener(...args),
-  };
-}
+const makeEpoch = (revision = 0) => ({ revision, groupRevision: 0, tabRevision: 0 });
 
 function createHarness(
   mode: "all" | "selected" = "selected",
@@ -28,7 +11,7 @@ function createHarness(
 ) {
   let revision = 0;
   let accessible = true;
-  const attachments = new Map([[7, { epoch: { revision: 0, groupRevision: 0, tabRevision: 0 } }]]);
+  const attachments = new Map([[7, { epoch: makeEpoch() }]]);
   const send = vi.fn();
   const policy = {
     mode,
@@ -42,7 +25,7 @@ function createHarness(
     }),
     beginRevocation: vi.fn(() => Symbol("revocation")),
     endRevocation: vi.fn(),
-    capture: vi.fn(() => ({ revision, groupRevision: 0, tabRevision: 0 })),
+    capture: vi.fn(() => makeEpoch(revision)),
     epochIsCurrent: vi.fn(
       (_tabId: number, epoch: { revision: number }) => epoch.revision === revision,
     ),
@@ -51,7 +34,6 @@ function createHarness(
     }),
     renewTabAccess: vi.fn(() => {
       revision += 1;
-      return undefined;
     }),
     forwardDocumentEvent: vi.fn((event, emit) => emit(event)),
     invalidateGroup: vi.fn(() => {
@@ -118,8 +100,6 @@ function createHarness(
   };
 }
 
-afterEach(() => vi.unstubAllGlobals());
-
 async function overlapUpdates(
   h: ReturnType<typeof createHarness>,
   url: string,
@@ -165,13 +145,7 @@ describe("tab access event epochs", () => {
   it("ignores a stale URL revocation after a newer eligible update", async () => {
     const h = createHarness("all");
     const resume = await overlapUpdates(h, "https://two.example", true);
-    await vi.waitFor(() => {
-      expect(h.attachments.get(7)?.epoch).toEqual({
-        revision: 2,
-        groupRevision: 0,
-        tabRevision: 0,
-      });
-    });
+    await vi.waitFor(() => expect(h.attachments.get(7)?.epoch).toEqual(makeEpoch(2)));
 
     await resume();
 
@@ -203,7 +177,6 @@ describe("tab access event epochs", () => {
   });
 
   it("does not refresh epochs from a stale group-wide access snapshot", async () => {
-    vi.stubGlobal("chrome", { tabGroups: { get: vi.fn() } });
     const h = createHarness();
     const firstList = deferred<Array<{ id: number }>>();
     h.policy.listAccessibleTabs

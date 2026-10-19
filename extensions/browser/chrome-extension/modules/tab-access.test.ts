@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
+import { deferred, storageArea } from "./browser.test-support.js";
 import { OPENCLAW_TAB_GROUP_TITLE } from "./relay-core.js";
-import { createTabAccessPolicy } from "./tab-access.js";
+import { createTabAccessPolicy, type TabAccessMode } from "./tab-access.js";
 import { tabEligibility } from "./tab-eligibility.js";
 import type { BrowserTabSnapshot } from "./tab-eligibility.js";
 
@@ -9,33 +10,15 @@ const restricted = { eligible: false, reason: "restricted" };
 const expectRestricted = (snapshot: BrowserTabSnapshot, fileAccessAllowed = true) =>
   expect(tabEligibility(snapshot, { fileAccessAllowed })).toEqual(restricted);
 
-function storageArea(seed: Record<string, unknown> = {}) {
-  const values = { ...seed };
-  return {
-    values,
-    get: vi.fn(async (keys: string[]) =>
-      Object.fromEntries(
-        keys.filter((key) => Object.hasOwn(values, key)).map((key) => [key, values[key]]),
-      ),
-    ),
-    set: vi.fn(async (next: Record<string, unknown>) => {
-      Object.assign(values, next);
-    }),
-    remove: vi.fn(async (keys: string[]) => {
-      for (const key of keys) {
-        delete values[key];
-      }
-    }),
-  };
-}
-
 function createHarness({
-  tabs,
+  tabs = [makeTab()],
   denied = [],
+  isSelectedTab = async (tab: BrowserTabSnapshot) => tab.groupId === 7,
 }: {
-  tabs: Array<BrowserTabSnapshot & { id: number }>;
+  tabs?: Array<BrowserTabSnapshot & { id: number }>;
   denied?: unknown[];
-}) {
+  isSelectedTab?: (tab: BrowserTabSnapshot) => boolean | Promise<boolean>;
+} = {}) {
   const session = storageArea({ deniedTabIdsV1: denied });
   const current = new Map(tabs.map((tab) => [tab.id, tab]));
   const chromeApi = {
@@ -51,15 +34,15 @@ function createHarness({
       query: vi.fn(async () => [...current.values()]),
     },
   };
-  const policy = createTabAccessPolicy({
-    chromeApi,
-    isSelectedTab: async (tab) => tab.groupId === 7,
-  });
+  const policy = createTabAccessPolicy({ chromeApi, isSelectedTab });
   return { chromeApi, current, policy, session };
 }
 
-async function initialized(groupId = 7, mode: "all" | "selected" = "selected") {
-  const h = createHarness({ tabs: [makeTab(groupId)] });
+async function initialized(
+  options: Parameters<typeof createHarness>[0] = {},
+  mode: TabAccessMode = "selected",
+) {
+  const h = createHarness(options);
   await h.policy.initialize(mode, true);
   return h;
 }
@@ -124,24 +107,19 @@ describe("tab access policy", () => {
   });
 
   it("blocks new authority before the asynchronous pause lookup completes", async () => {
-    const h = await initialized(-1, "all");
-    let releaseLookup = () => {};
-    h.chromeApi.tabs.get.mockImplementationOnce(
-      async () =>
-        await new Promise((resolve) => {
-          releaseLookup = () => resolve({ id: 1, url: "https://one.example", groupId: -1 });
-        }),
-    );
+    const h = await initialized({ tabs: [makeTab(-1)] }, "all");
+    const lookup = deferred<ReturnType<typeof makeTab>>();
+    h.chromeApi.tabs.get.mockReturnValueOnce(lookup.promise);
 
     const pausing = h.policy.pause(1);
     expect(h.policy.isDenied(1)).toBe(true);
     await expect(h.policy.requireTab(1)).rejects.toThrow("paused for OpenClaw");
-    releaseLookup();
+    lookup.resolve(makeTab(-1));
     await expect(pausing).resolves.toBeUndefined();
   });
 
   it("blocks newly arriving authority throughout a mode transition", async () => {
-    const h = await initialized(-1, "all");
+    const h = await initialized({ tabs: [makeTab(-1)] }, "all");
     h.policy.beginTransition();
     await expect(h.policy.requireTab(1)).rejects.toThrow("access was revoked");
     await expect(h.policy.listAccessibleTabs()).resolves.toEqual([]);
@@ -186,75 +164,54 @@ describe("tab access policy", () => {
     expect(h.policy.epochIsCurrent(2, tabTwoRevocationEpoch)).toBe(true);
   });
 
-  it("fails closed when selected-mode membership changes during an async policy check", async () => {
+  it.each<[string, ReturnType<typeof makeTab> & { pendingUrl?: string }]>([
+    ["membership changes", makeTab(-1)],
+    ["a pending navigation appears", { ...makeTab(), pendingUrl: "https://two.example" }],
+  ])("revokes selected authority when %s between reads", async (_name, next) => {
     const h = await initialized();
-    h.chromeApi.tabs.get.mockResolvedValueOnce(makeTab()).mockResolvedValueOnce(makeTab(-1));
+    h.chromeApi.tabs.get.mockResolvedValueOnce(makeTab()).mockResolvedValueOnce(next);
     await expect(h.policy.requireTab(1)).rejects.toThrow("access was revoked");
   });
 
   it("revalidates selected group authority when the group title changes in place", async () => {
-    const h = createHarness({ tabs: [makeTab()] });
     const isSelectedTab = vi.fn().mockResolvedValueOnce(true).mockResolvedValueOnce(false);
-    const policy = createTabAccessPolicy({
-      chromeApi: h.chromeApi,
-      isSelectedTab,
-    });
-    await policy.initialize("selected", true);
+    const { policy } = await initialized({ isSelectedTab });
 
     await expect(policy.requireTab(1)).rejects.toThrow("access was revoked");
     expect(isSelectedTab).toHaveBeenCalledTimes(2);
   });
 
   it("restarts an in-flight discovery when an OpenClaw group becomes eligible", async () => {
-    const h = createHarness({ tabs: [makeTab()] });
-    let releaseFirst = (_selected: boolean) => {};
-    const firstSelection = new Promise<boolean>((resolve) => {
-      releaseFirst = resolve;
-    });
+    const firstSelection = deferred<boolean>();
     const isSelectedTab = vi
       .fn()
-      .mockImplementationOnce(async () => await firstSelection)
+      .mockImplementationOnce(async () => await firstSelection.promise)
       .mockResolvedValue(true);
-    const policy = createTabAccessPolicy({ chromeApi: h.chromeApi, isSelectedTab });
-    await policy.initialize("selected", true);
+    const { policy } = await initialized({ isSelectedTab });
 
     const listing = policy.listAccessibleTabs();
     await vi.waitFor(() => expect(isSelectedTab).toHaveBeenCalledOnce());
     policy.invalidateGroup({ id: 7, title: OPENCLAW_TAB_GROUP_TITLE });
-    releaseFirst(false);
+    firstSelection.resolve(false);
 
     await expect(listing).resolves.toEqual([makeTab()]);
     expect(isSelectedTab).toHaveBeenCalledTimes(2);
   });
 
   it("rejects an epoch revoked during the final selected-group lookup", async () => {
-    const h = createHarness({ tabs: [makeTab()] });
-    let releaseFinalLookup = () => {};
-    const finalLookup = new Promise<boolean>((resolve) => {
-      releaseFinalLookup = () => resolve(true);
-    });
-    const isSelectedTab = vi.fn().mockResolvedValueOnce(true).mockReturnValueOnce(finalLookup);
-    const policy = createTabAccessPolicy({
-      chromeApi: h.chromeApi,
-      isSelectedTab,
-    });
-    await policy.initialize("selected", true);
+    const finalLookup = deferred<boolean>();
+    const isSelectedTab = vi
+      .fn()
+      .mockResolvedValueOnce(true)
+      .mockReturnValueOnce(finalLookup.promise);
+    const { policy } = await initialized({ isSelectedTab });
 
     const requiring = policy.requireTab(1);
     await vi.waitFor(() => expect(isSelectedTab).toHaveBeenCalledTimes(2));
     policy.invalidateTab(1);
-    releaseFinalLookup();
+    finalLookup.resolve(true);
 
     await expect(requiring).rejects.toThrow("access was revoked");
-  });
-
-  it("revokes selected authority when a pending navigation appears between reads", async () => {
-    const h = await initialized();
-    h.chromeApi.tabs.get
-      .mockResolvedValueOnce(makeTab())
-      .mockResolvedValueOnce({ ...makeTab(), pendingUrl: "https://two.example" });
-
-    await expect(h.policy.requireTab(1)).rejects.toThrow("access was revoked");
   });
 
   it("restores existing-tab session denies across worker instances and prunes closed ids", async () => {

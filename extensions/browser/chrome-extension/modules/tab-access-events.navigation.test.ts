@@ -1,21 +1,9 @@
+import { setImmediate as drainEvents } from "node:timers/promises";
 import { describe, expect, it, vi } from "vitest";
+import { chromeEvent, deferred, storageArea } from "./browser.test-support.js";
 import { registerTabAccessEvents } from "./tab-access-events.js";
 import { createTabAccessPolicy, type TabAccessEpoch, type TabAccessMode } from "./tab-access.js";
 import type { BrowserTabSnapshot } from "./tab-eligibility.js";
-
-function chromeEvent<Args extends unknown[]>() {
-  let listener: (...args: Args) => void = () => {
-    throw new Error("Chrome event listener was not registered");
-  };
-  return {
-    addListener(next: (...args: Args) => void) {
-      listener = next;
-    },
-    emit(...args: Args) {
-      listener(...args);
-    },
-  };
-}
 
 const navigationEvents = [
   { method: "Network.responseReceived", params: { requestId: "navigation-1" } },
@@ -23,19 +11,7 @@ const navigationEvents = [
   { method: "Page.frameNavigated", params: { frame: { id: "frame-7", loaderId: "loader-1" } } },
   { method: "Page.lifecycleEvent", params: { frameId: "frame-7", name: "load" } },
 ];
-
-function deferred<T>() {
-  let resolve = (_value: T) => {};
-  const promise = new Promise<T>((next) => {
-    resolve = next;
-  });
-  return { promise, resolve };
-}
-
-const drainEvents = () =>
-  new Promise<void>((resolve) => {
-    setImmediate(resolve);
-  });
+type NavigationHarness = Awaited<ReturnType<typeof createNavigationHarness>>;
 
 async function createNavigationHarness(
   mode: TabAccessMode,
@@ -49,13 +25,7 @@ async function createNavigationHarness(
   };
   const chromeApi = {
     extension: { isAllowedFileSchemeAccess: async () => fileAccessAllowed },
-    storage: {
-      session: {
-        get: async () => ({}),
-        set: async () => {},
-        remove: async () => {},
-      },
-    },
+    storage: { session: storageArea() },
     tabs: {
       get: vi.fn(async (_tabId: number) => tab),
       query: vi.fn(async () => [tab]),
@@ -150,66 +120,59 @@ async function createNavigationHarness(
   };
 }
 
+async function revokeGroup(h: NavigationHarness, event: "onUpdated" | "onRemoved") {
+  h.chromeApi.tabGroups[event].emit({ id: 12, title: "Other" });
+  await expect(h.policy.requireTab(7)).resolves.toMatchObject({ url: "about:blank" });
+  h.chromeApi.tabGroups[event].emit({ id: 11, title: "Other" });
+}
+
 describe("Chrome navigation event access", () => {
   it("projects native child session ids only while the attachment epoch is current", async () => {
     const h = await createNavigationHarness("selected");
     const params = { frame: { id: "child", loaderId: "child-loader", url: "about:blank" } };
-    for (const source of [{ tabId: 7 }, { tabId: 7, sessionId: "child-session" }]) {
-      h.chromeApi.debugger.onEvent.emit(source, "Page.frameNavigated", params);
-    }
-    expect(h.send.mock.calls.map(([event]) => event)).toEqual([
-      { type: "cdpEvent", tabId: 7, method: "Page.frameNavigated", params },
-      {
-        type: "cdpEvent",
-        tabId: 7,
-        sessionId: "child-session",
-        method: "Page.frameNavigated",
-        params,
-      },
+    const sources = [{ tabId: 7 }, { tabId: 7, sessionId: "child-session" }];
+    const emit = () =>
+      sources.forEach((source) =>
+        h.chromeApi.debugger.onEvent.emit(source, "Page.frameNavigated", params),
+      );
+    emit();
+    const event = { type: "cdpEvent", tabId: 7, method: "Page.frameNavigated", params };
+    expect(h.send.mock.calls.map(([sent]) => sent)).toEqual([
+      event,
+      { ...event, sessionId: "child-session" },
     ]);
     h.send.mockClear();
     h.policy.invalidateTab(7);
-    h.chromeApi.debugger.onEvent.emit({ tabId: 7 }, "Page.frameNavigated", params);
-    h.chromeApi.debugger.onEvent.emit(
-      { tabId: 7, sessionId: "child-session" },
-      "Page.frameNavigated",
-      params,
-    );
+    emit();
     expect(h.send).not.toHaveBeenCalled();
   });
 
-  it.each(["pause", "mode change", "remove", "detach", "group rename", "group removal"])(
+  it.each<[string, (h: NavigationHarness) => void | Promise<void>]>([
+    [
+      "pause",
+      async (h) => {
+        await h.policy.pause(7);
+        expect(h.policy.isDenied(7)).toBe(true);
+        await h.policy.allow(7);
+      },
+    ],
+    [
+      "mode change",
+      (h) => {
+        h.policy.setMode("selected");
+        h.policy.setMode("all");
+      },
+    ],
+    ["remove", (h) => h.chromeApi.tabs.onRemoved.emit(7)],
+    ["detach", (h) => h.chromeApi.debugger.onDetach.emit({ tabId: 7 }, "target_closed")],
+    ["group rename", (h) => revokeGroup(h, "onUpdated")],
+    ["group removal", (h) => revokeGroup(h, "onRemoved")],
+  ])(
     "retires controlled blank authority on %s without reauthorizing it",
-    async (reason) => {
+    async (reason, revoke) => {
       const h = await createNavigationHarness("all", { groupId: 11 });
       await h.controlBlank();
-      switch (reason) {
-        case "pause":
-          await h.policy.pause(7);
-          expect(h.policy.isDenied(7)).toBe(true);
-          await h.policy.allow(7);
-          break;
-        case "mode change":
-          h.policy.setMode("selected");
-          h.policy.setMode("all");
-          break;
-        case "remove":
-          h.chromeApi.tabs.onRemoved.emit(7);
-          break;
-        case "detach":
-          h.chromeApi.debugger.onDetach.emit({ tabId: 7 }, "target_closed");
-          break;
-        case "group rename":
-          h.chromeApi.tabGroups.onUpdated.emit({ id: 12, title: "Other" });
-          await expect(h.policy.requireTab(7)).resolves.toMatchObject({ url: "about:blank" });
-          h.chromeApi.tabGroups.onUpdated.emit({ id: 11, title: "Other" });
-          break;
-        case "group removal":
-          h.chromeApi.tabGroups.onRemoved.emit({ id: 12 });
-          await expect(h.policy.requireTab(7)).resolves.toMatchObject({ url: "about:blank" });
-          h.chromeApi.tabGroups.onRemoved.emit({ id: 11 });
-          break;
-      }
+      await revoke(h);
       h.send.mockClear();
       h.emitNavigation();
       await expect(h.policy.requireTab(7)).rejects.toThrow(
@@ -281,52 +244,26 @@ describe("Chrome navigation event access", () => {
     expect(h.detachDebugger).not.toHaveBeenCalled();
   });
 
-  it.each([
-    "restricted committed URL",
-    "restricted pending URL",
-    "incognito tab",
-    "different selected group",
-    "wrong tab identity",
-    "paused tab",
-    "changed group authority",
-    "forged epoch copy",
-    "replaced tab",
-  ])("does not renew access for %s from a URL snapshot", async (scenario) => {
+  it.each<[string, Partial<BrowserTabSnapshot>, ((h: NavigationHarness) => void)?]>([
+    ["restricted committed URL", { url: "chrome://settings" }],
+    ["restricted pending URL", { pendingUrl: "chrome://settings" }],
+    ["incognito tab", { incognito: true }],
+    ["different selected group", { groupId: 12 }],
+    ["wrong tab identity", { id: 8 }],
+    ["paused tab", {}],
+    ["changed group authority", {}, (h) => h.chromeApi.tabGroups.onUpdated.emit()],
+    ["forged epoch copy", {}, (h) => h.attachments.set(7, { epoch: { ...h.attachmentEpoch } })],
+    ["replaced tab", {}, (h) => h.chromeApi.tabs.onReplaced.emit(8, 7)],
+  ])("does not renew access for %s from a URL snapshot", async (scenario, update, revoke) => {
     const h = await createNavigationHarness(scenario === "paused tab" ? "all" : "selected");
-    const update: Partial<BrowserTabSnapshot> = { url: "https://destination.example/" };
     if (scenario === "paused tab") {
       await h.policy.pause(7);
     }
     const releaseLookup = h.deferLookup();
     try {
-      switch (scenario) {
-        case "restricted committed URL":
-          update.url = "chrome://settings";
-          break;
-        case "restricted pending URL":
-          update.pendingUrl = "chrome://settings";
-          break;
-        case "incognito tab":
-          update.incognito = true;
-          break;
-        case "different selected group":
-          update.groupId = 12;
-          break;
-        case "wrong tab identity":
-          update.id = 8;
-          break;
-        case "changed group authority":
-          h.chromeApi.tabGroups.onUpdated.emit();
-          break;
-        case "forged epoch copy":
-          h.attachments.set(7, { epoch: { ...h.attachmentEpoch } });
-          break;
-        case "replaced tab":
-          h.chromeApi.tabs.onReplaced.emit(8, 7);
-          break;
-      }
+      revoke?.(h);
       h.send.mockClear();
-      h.update(update);
+      h.update({ url: "https://destination.example/", ...update });
       h.emitNavigation();
       expect(h.send).not.toHaveBeenCalled();
     } finally {

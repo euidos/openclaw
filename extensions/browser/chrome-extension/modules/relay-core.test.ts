@@ -1,4 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
+import { storageArea } from "./browser.test-support.js";
 import {
   createPairingConfigStore,
   parsePairingString,
@@ -8,20 +9,11 @@ import {
 
 const RELAY_SECRET = "a".repeat(64);
 const localPairing = { relayUrl: "ws://127.0.0.1:18797/extension", token: RELAY_SECRET };
+const pairingKeys = ["relayUrl", "gatewayUrl", "token", "authVersion"];
 
 function pairingStore(stored: Record<string, unknown> = {}) {
-  const storage = {
-    get: async () => stored,
-    set: vi.fn(async (values: Record<string, unknown>) => {
-      Object.assign(stored, values);
-    }),
-    remove: vi.fn(async (keys: string[]) => {
-      for (const key of keys) {
-        delete stored[key];
-      }
-    }),
-  };
-  return { stored, ...storage, store: createPairingConfigStore(storage) };
+  const storage = storageArea(stored);
+  return { stored: storage.values, ...storage, store: createPairingConfigStore(storage) };
 }
 
 describe("parsePairingString", () => {
@@ -83,22 +75,6 @@ describe("parsePairingString", () => {
   });
 });
 
-async function readStoredPairing(stored: Record<string, unknown>) {
-  const config = await createPairingConfigStore({
-    get: async () => stored,
-    set: async () => undefined,
-    remove: async () => undefined,
-  }).read();
-  if (!config.relayUrl) {
-    return null;
-  }
-  return {
-    relayUrl: config.relayUrl,
-    token: config.token,
-    ...(config.gatewayUrl ? { gatewayUrl: config.gatewayUrl } : {}),
-  };
-}
-
 describe("persisted pairing storage", () => {
   it("accepts an exact direct relay with its matching trailing-slash Gateway hint", async () => {
     const stored = {
@@ -106,7 +82,7 @@ describe("persisted pairing storage", () => {
       token: RELAY_SECRET,
       gatewayUrl: "wss://gateway.example.com/",
     };
-    expect(await readStoredPairing(stored)).toEqual(stored);
+    await expect(pairingStore(stored).store.read()).resolves.toMatchObject(stored);
   });
 
   it("migrates a canonical existing pairing to authVersion 2 without re-pairing", async () => {
@@ -137,21 +113,14 @@ describe("persisted pairing storage", () => {
   it("clears the access mode when unpairing", async () => {
     const { store, remove } = pairingStore();
     await store.clear();
-    expect(remove).toHaveBeenCalledWith([
-      "relayUrl",
-      "gatewayUrl",
-      "token",
-      "authVersion",
-      "accessMode",
-      "pairingStatus",
-    ]);
+    expect(remove).toHaveBeenCalledWith([...pairingKeys, "accessMode", "pairingStatus"]);
   });
 
   it("rejects and clears an unsupported stored auth version", async () => {
     const { store, remove } = pairingStore({ ...localPairing, gatewayUrl: "", authVersion: 1 });
     const config = await store.read();
     expect(config.relayUrl).toBe("");
-    expect(remove).toHaveBeenCalledWith(["relayUrl", "gatewayUrl", "token", "authVersion"]);
+    expect(remove).toHaveBeenCalledWith(pairingKeys);
   });
 
   it("clears stored proxy-prefixed direct pairing with safe guidance", async () => {
@@ -167,7 +136,7 @@ describe("persisted pairing storage", () => {
     expect(config).toMatchObject({ relayUrl: "", token: "", authVersion: undefined });
     expect(config.pairingStatusHint).toContain("no path prefix");
     expect(config.pairingStatusHint).not.toContain(RELAY_SECRET);
-    expect(remove).toHaveBeenCalledWith(["relayUrl", "gatewayUrl", "token", "authVersion"]);
+    expect(remove).toHaveBeenCalledWith(pairingKeys);
     expect(set).toHaveBeenCalledWith({ pairingStatus: "proxy-prefix-unsupported" });
 
     const afterWorkerRestart = await createPairingConfigStore(storage).read();
@@ -194,7 +163,7 @@ describe("persisted pairing storage", () => {
       },
     ],
   ])("rejects %s", async (_label, stored) => {
-    expect(await readStoredPairing(stored)).toBeNull();
+    expect((await pairingStore(stored).store.read()).relayUrl).toBe("");
   });
 });
 
