@@ -100,15 +100,16 @@ vi.mock("./session-accessor.sqlite-reclamation-worker.js", async () => {
 test("maintenance preparation yields to foreground writes and retains commit admission through publication", async () => {
   storage.committed = false;
   storage.release.mockClear();
-  const preparation = createDeferredCore();
-  const validationGap = createDeferredCore();
-  const commitGap = createDeferredCore();
+  const checkpoints = new Map(
+    ["preparation", "validation-gap", "commit-gap"].map((name) => [name, createDeferredCore()]),
+  );
   const archiveEntered = createDeferredCore();
   const releaseArchive = createDeferredCore();
   const admissions: number[] = [];
   const order: string[] = [];
-  const write = (name: string, onEntered?: () => void) =>
-    runExclusiveSqliteSessionWrite(
+  const writers: Promise<void>[] = [];
+  const write = (name: string, onEntered?: () => void) => {
+    const pending = runExclusiveSqliteSessionWrite(
       options,
       async () => {
         onEntered?.();
@@ -116,15 +117,16 @@ test("maintenance preparation yields to foreground writes and retains commit adm
       },
       "session-entry.patch",
     );
+    writers.push(pending);
+    return pending;
+  };
   const worker = new Worker(
     `const { parentPort } = require("node:worker_threads");
      let admissions = 0;
      parentPort.on("message", (message) => {
        if (message.type === "start") {
          parentPort.postMessage({ type: "preparation" });
-       } else if (message.type === "prepare") {
-         parentPort.postMessage({ type: "admission-request", operationId: 1 });
-       } else if (message.type === "continue") {
+       } else if (message.type === "prepare" || message.type === "continue") {
          parentPort.postMessage({ type: "admission-request", operationId: 1 });
        } else if (message.type === "admission" && ++admissions === 1) {
          parentPort.postMessage({ type: "admission-release", operationId: 1 });
@@ -141,13 +143,7 @@ test("maintenance preparation yields to foreground writes and retains commit adm
     { eval: true, execArgv: [] },
   );
   worker.on("message", (message) => {
-    if (message.type === "preparation") {
-      preparation.resolve();
-    } else if (message.type === "validation-gap") {
-      validationGap.resolve();
-    } else if (message.type === "commit-gap") {
-      commitGap.resolve();
-    }
+    checkpoints.get(message.type)?.resolve();
   });
   storage.run.mockImplementation((params) =>
     runSqliteMutationWorkerRequest<SqliteSessionReclamationResult>({
@@ -179,42 +175,34 @@ test("maintenance preparation yields to foreground writes and retains commit adm
       materializedPlans: [],
     },
   });
-  const settledFinalization = finalization.then(
-    () => {
-      throw new Error("Finalization settled before its protocol checkpoint");
-    },
-    (error: unknown) => {
-      throw error;
-    },
-  );
+  const settledFinalization = finalization.then(() => {
+    throw new Error("Finalization settled before its protocol checkpoint");
+  });
   // Observe early failure while any protocol checkpoint is pending.
   void settledFinalization.catch(() => {});
-  let precedingWriter: Promise<void> | undefined;
-  let preparationWriter: Promise<void> | undefined;
-  let validationWriter: Promise<void> | undefined;
-  let laterWriter: Promise<void> | undefined;
+  const waitFor = (checkpoint: string) =>
+    Promise.race([checkpoints.get(checkpoint)!.promise, settledFinalization]);
   let laterObservedCommit = false;
   try {
     // A preceding archive request can still acquire this store's writer.
-    precedingWriter = write("preceding-writer");
-    await precedingWriter;
+    await write("preceding-writer");
     releaseArchive.resolve();
     await earlierArchive;
-    await Promise.race([preparation.promise, settledFinalization]);
-    preparationWriter = write("preparation-writer");
+    await waitFor("preparation");
+    write("preparation-writer");
     worker.postMessage({ type: "prepare" }, []);
-    await Promise.race([validationGap.promise, settledFinalization]);
+    await waitFor("validation-gap");
     expect(order).toEqual(["preceding-writer", "preparation-writer"]);
-    validationWriter = write("validation-writer");
+    write("validation-writer");
     worker.postMessage({ type: "continue" }, []);
-    await Promise.race([commitGap.promise, settledFinalization]);
+    await waitFor("commit-gap");
     expect(order).toEqual(["preceding-writer", "preparation-writer", "validation-writer"]);
-    laterWriter = write("later-writer", () => {
+    write("later-writer", () => {
       laterObservedCommit = storage.committed;
     });
     worker.postMessage({ type: "settle" }, []);
     await expect(finalization).resolves.toMatchObject({ kind: "maintenance-finalize" });
-    await Promise.all([preparationWriter, validationWriter, laterWriter]);
+    await Promise.all(writers);
     expect(admissions).toEqual([1, 2]);
     expect(laterObservedCommit).toBe(true);
     expect(order).toEqual([
@@ -228,14 +216,7 @@ test("maintenance preparation yields to foreground writes and retains commit adm
   } finally {
     releaseArchive.resolve();
     worker.postMessage({ type: "settle" }, []);
-    await Promise.allSettled([
-      earlierArchive,
-      precedingWriter,
-      preparationWriter,
-      validationWriter,
-      finalization,
-      laterWriter,
-    ]);
+    await Promise.allSettled([earlierArchive, finalization, ...writers]);
     await worker.terminate();
   }
 });

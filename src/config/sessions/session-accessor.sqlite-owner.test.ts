@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, expect, it } from "vitest";
 import { observeHostDataSql } from "../../../test/helpers/sqlite-statement-execution-counter.js";
 import {
   FIRST_USE_ADDITIVE_AGENT_COLUMN_DEFINITIONS,
@@ -27,19 +27,19 @@ afterEach(() => {
 });
 
 async function withOwnerSession(
-  sessionId: string,
-  overrides: Partial<SessionEntry>,
   run: (
     scope: { agentId: string; env: NodeJS.ProcessEnv; sessionKey: string },
     entry: SessionEntry,
   ) => Promise<void>,
+  overrides: Partial<SessionEntry> = {},
 ) {
   await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
     setRuntimeConfigSnapshot({});
-    const scope = { agentId: "main", env: state.env, sessionKey: `agent:main:${sessionId}` };
+    const scope = { agentId: "main", env: state.env, sessionKey: "agent:main:owner-test" };
     const entry: SessionEntry = {
-      sessionId,
+      sessionId: "owner-test",
       updatedAt: 1,
+      lifecycleRevision: "original-generation",
       createdActor: { type: "human", source: "profile", id: "profile-creator" },
       ...overrides,
     };
@@ -59,74 +59,61 @@ function ownerParams({ actor: owner, ...assignment }: ReturnType<typeof ownerAss
   return { owner, ...assignment };
 }
 
-describe("SQLite session owner assignment", () => {
-  it("guards incognito owner assignments without querying session rows", async () => {
-    await withOwnerSession(
-      "dashboard:incognito-owner",
-      {
-        sessionId: "incognito-owner",
-        lifecycleRevision: "original-generation",
-        incognito: true,
-        createdActor: { type: "human", source: "profile", id: "creator" },
-      },
-      async (scope, entry) => {
-        const sql = observeHostDataSql();
-        const assignment = ownerAssignment("creator");
-        const params = {
-          ...ownerParams(assignment),
-          expectedSessionId: entry.sessionId,
-          expectedEntry: entry,
-        };
-        try {
-          await expect(assignSessionOwnerInWorker(scope, params)).resolves.toEqual(assignment);
-          await expect(
-            assignSessionOwnerInWorker(scope, { ...params, expectedSessionId: "replaced-session" }),
-          ).rejects.toThrow("session changed before collaboration mutation");
-          expect(sql.queries).toEqual([]);
-        } finally {
-          sql.restore();
-        }
-        expect(loadSessionEntry(scope)?.owner).toEqual(assignment);
-      },
-    );
+it("guards incognito owner assignments without querying session rows", async () => {
+  await withOwnerSession(
+    async (scope, entry) => {
+      const sql = observeHostDataSql();
+      const assignment = ownerAssignment("profile-creator");
+      const params = {
+        ...ownerParams(assignment),
+        expectedSessionId: entry.sessionId,
+        expectedEntry: entry,
+      };
+      try {
+        await expect(assignSessionOwnerInWorker(scope, params)).resolves.toEqual(assignment);
+        await expect(
+          assignSessionOwnerInWorker(scope, { ...params, expectedSessionId: "replaced-session" }),
+        ).rejects.toThrow("session changed before collaboration mutation");
+        expect(sql.queries).toEqual([]);
+      } finally {
+        sql.restore();
+      }
+      expect(loadSessionEntry(scope)?.owner).toEqual(assignment);
+    },
+    { incognito: true },
+  );
+});
+
+it("refuses stale session identity and lifecycle before assigning an owner", async () => {
+  await withOwnerSession(async (scope) => {
+    const expectedEntry = loadSessionEntry(scope)!;
+    const assignment = {
+      owner: { type: "agent" as const, id: "research" },
+      assignedBy: { type: "human" as const, id: "profile-assigner" },
+    };
+    expect(() =>
+      assignSessionOwner(scope, { ...assignment, expectedSessionId: "session-replaced" }),
+    ).toThrow("session changed before owner assignment");
+    expect(loadSessionEntry(scope)?.owner).toBeUndefined();
+
+    await upsertSessionEntryCore(scope, {
+      ...expectedEntry,
+      lifecycleRevision: "replacement-generation",
+    });
+    expect(() =>
+      assignSessionOwner(scope, {
+        ...assignment,
+        expectedSessionId: expectedEntry.sessionId,
+        expectedEntry,
+      }),
+    ).toThrow("session ownership changed before owner assignment");
+    expect(loadSessionEntry(scope)?.owner).toBeUndefined();
   });
+});
 
-  it("refuses stale session identity and lifecycle before assigning an owner", async () => {
-    await withOwnerSession(
-      "guarded-owner",
-      {
-        sessionId: "session-original",
-        lifecycleRevision: "original-generation",
-      },
-      async (scope) => {
-        const expectedEntry = loadSessionEntry(scope)!;
-        const assignment = {
-          owner: { type: "agent" as const, id: "research" },
-          assignedBy: { type: "human" as const, id: "profile-assigner" },
-        };
-        expect(() =>
-          assignSessionOwner(scope, { ...assignment, expectedSessionId: "session-replaced" }),
-        ).toThrow("session changed before owner assignment");
-        expect(loadSessionEntry(scope)?.owner).toBeUndefined();
-
-        await upsertSessionEntryCore(scope, {
-          ...expectedEntry,
-          lifecycleRevision: "replacement-generation",
-        });
-        expect(() =>
-          assignSessionOwner(scope, {
-            ...assignment,
-            expectedSessionId: expectedEntry.sessionId,
-            expectedEntry,
-          }),
-        ).toThrow("session ownership changed before owner assignment");
-        expect(loadSessionEntry(scope)?.owner).toBeUndefined();
-      },
-    );
-  });
-
-  it("lazily adds bare columns and preserves the assignment across reopen", async () => {
-    await withOwnerSession("owned-session", { sessionId: "session-owned" }, async (scope) => {
+it("lazily adds bare columns and preserves the assignment across reopen", async () => {
+  await withOwnerSession(
+    async (scope) => {
       const initial = openOpenClawAgentDatabase(scope);
       for (const { columnName, tableName } of FIRST_USE_ADDITIVE_AGENT_COLUMN_DEFINITIONS) {
         initial.db.exec(`ALTER TABLE ${tableName} DROP COLUMN ${columnName};`);
@@ -192,6 +179,7 @@ describe("SQLite session owner assignment", () => {
           dflt_value: null,
         });
       }
-    });
-  });
+    },
+    { lifecycleRevision: undefined },
+  );
 });

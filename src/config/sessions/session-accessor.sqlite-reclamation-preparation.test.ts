@@ -27,6 +27,7 @@ import type { SqliteReclamationWorkerMessage } from "./session-accessor.sqlite-r
 const integrity = vi.hoisted(() => ({
   gate: undefined as ReturnType<typeof createWorkerSqliteIntegrityGate> | undefined,
 }));
+const removedOne = { kind: "lifecycle-artifacts", value: { removedEntries: 1 } };
 vi.mock("node:worker_threads", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:worker_threads")>();
   return {
@@ -75,25 +76,16 @@ test("commits foreground replacement while cold reclamation holds native integri
   integrity.gate = gate;
   const spawned = observeReclamationWorkers();
   const work = runSqliteSessionReclamation({ plan: fixture.plans[0]! });
-  let settled = false;
-  void work.then(
-    () => {
-      settled = true;
-    },
-    () => {
-      settled = true;
-    },
+  const settled = vi.fn();
+  void work.then(settled, settled);
+  const outcome = work.then(
+    () => "completed",
+    () => "failed",
   );
   try {
-    expect(
-      await Promise.race([
-        gate.entered.then(() => "native integrity"),
-        work.then(
-          () => "completed",
-          () => "failed",
-        ),
-      ]),
-    ).toBe("native integrity");
+    expect(await Promise.race([gate.entered.then(() => "native integrity"), outcome])).toBe(
+      "native integrity",
+    );
     expect(gate.count()).toBe(1);
     await applySessionEntryReplacements({
       storePath: fixture.database.path,
@@ -111,12 +103,9 @@ test("commits foreground replacement while cold reclamation holds native integri
     });
     expect(read(1)).toMatchObject(foreground);
     expect(read(0)).toMatchObject({ sessionId: "victim" });
-    expect(settled).toBe(false);
+    expect(settled).not.toHaveBeenCalled();
     gate.release();
-    await expect(work).resolves.toMatchObject({
-      kind: "lifecycle-artifacts",
-      value: { removedEntries: 1 },
-    });
+    await expect(work).resolves.toMatchObject(removedOne);
     expect(read(0)).toBeUndefined();
     expect(read(1)).toMatchObject(foreground);
   } finally {
@@ -124,8 +113,7 @@ test("commits foreground replacement while cold reclamation holds native integri
     await Promise.allSettled([work]);
     await closeOpenClawAgentDatabaseByPathAsync(fixture.database.path);
   }
-  expect(spawned).toHaveLength(1);
-  expect(spawned[0]!.threadId).toBe(-1);
+  expect(spawned.map((worker) => worker.threadId)).toEqual([-1]);
   expect(leasesFor(fixture)).toHaveLength(0);
 });
 
@@ -169,7 +157,7 @@ test.each(["caller refusal", "source retirement"] as const)(
       if (failure === "source retirement") {
         expect(closing).toBeDefined();
         await closing;
-        expect(spawned[0]!.threadId).toBe(-1);
+        expect(spawned.map((worker) => worker.threadId)).toEqual([-1]);
         expect(leasesFor(fixture)).toHaveLength(0);
       } else {
         expect(spawned[0]!.threadId).toBeGreaterThan(0);
@@ -178,10 +166,7 @@ test.each(["caller refusal", "source retirement"] as const)(
       expect(loadSessionEntryReadOnly(fixture.scopes[0]!)).toMatchObject({ sessionId: "victim" });
       if (failure === "caller refusal") {
         allowed = true;
-        await expect(run()).resolves.toMatchObject({
-          kind: "lifecycle-artifacts",
-          value: { removedEntries: 1 },
-        });
+        await expect(run()).resolves.toMatchObject(removedOne);
         expect(spawned).toHaveLength(1);
         expect(loadSessionEntryReadOnly(fixture.scopes[0]!)).toBeUndefined();
       }
