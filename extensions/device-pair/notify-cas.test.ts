@@ -6,6 +6,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { notifySubscriberStoreKey, type NotifySubscription } from "./notify-state.js";
 
+// mock-isolation: Supply deterministic requests without reading real device-pair state.
 vi.mock("openclaw/plugin-sdk/device-bootstrap", () => ({
   listDevicePairing: async () => ({
     pending: [{ requestId: "request-1", deviceId: "device-1", ts: 2_000 }],

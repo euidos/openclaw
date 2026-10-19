@@ -79,6 +79,7 @@ it.each([
 
 it("reads and records normal observation without importing the writer", async () => {
   const loadWriter = vi.fn().mockRejectedValue(new Error("read imported the config writer"));
+  // mock-isolation: Fail if the read-only path imports the config writer.
   vi.doMock("./io.write.js", loadWriter);
   const { io, configPath, raw, readRaw, health } = await fixture();
 

@@ -9,6 +9,7 @@ import {
 } from "node:http";
 import net from "node:net";
 import { duplexPair, type Duplex } from "node:stream";
+import { rawDataToString } from "@openclaw/gateway-client/websocket-data";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { WebSocket, WebSocketServer } from "ws";
 import { mockIpv4OnlyLocalhostLookup } from "../../../test/helpers/loopback-dns.js";
@@ -58,7 +59,7 @@ function authenticatedCall(portal: { listenPort: number; tokenQuery: string }, p
 
 async function expectEcho(socket: WebSocket, message: string) {
   const echoed = new Promise<string>((resolve) => {
-    socket.once("message", (data) => resolve(data.toString()));
+    socket.once("message", (data) => resolve(rawDataToString(data)));
   });
   socket.send(message);
   expect(await echoed).toBe(message);

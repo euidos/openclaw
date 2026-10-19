@@ -38,10 +38,12 @@ const fetchWithSsrFGuardMock = vi.hoisted(() =>
   ),
 );
 
+// mock-isolation: Pin the temporary directory for exact staged-output path assertions.
 vi.mock("openclaw/plugin-sdk/temp-path", () => ({
   resolvePreferredOpenClawTmpDir: () => "/tmp",
 }));
 
+// mock-isolation: Keep ffprobe, ffmpeg, and unlink operations synthetic in upload tests.
 vi.mock("openclaw/plugin-sdk/media-runtime", () => ({
   runFfprobe: runFfprobeMock,
   runFfmpeg: runFfmpegMock,
@@ -247,7 +249,10 @@ describe("sendDiscordVoiceMessage", () => {
     });
 
     expect(
-      fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/attachments")),
+      fetchMock.mock.calls.filter(([input]) => {
+        const url = input instanceof Request ? input.url : input.toString();
+        return url.endsWith("/attachments");
+      }),
     ).toHaveLength(2);
     expect(successfulUpload.wasCanceled()).toBe(true);
     expect(fetchMock).toHaveBeenCalledTimes(4);

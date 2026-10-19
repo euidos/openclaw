@@ -68,11 +68,12 @@ type FetchResponder =
   | ((input: RequestInfo | URL, init?: RequestInit) => Response | Promise<Response>);
 
 function authResponse(init?: RequestInit, overrides: Record<string, unknown> = {}): Response {
+  const body = typeof init?.body === "string" ? init.body : "";
   return Response.json({
     user_code: "CODE",
     verification_uri: "https://example.com/device",
     expired_in: Date.now() + 10_000,
-    state: new URLSearchParams(String(init?.body ?? "")).get("state"),
+    state: new URLSearchParams(body).get("state"),
     ...overrides,
   });
 }
@@ -176,10 +177,9 @@ describe("loginMiniMaxPortalOAuth", () => {
         ).rejects.toHaveProperty("name", expect.stringMatching(/^(AbortError|TimeoutError)$/));
         expect(server.requests).toContain(path);
         expect(fetchMock.mock.calls[fetchIndex]?.[1]?.signal).toBeInstanceOf(AbortSignal);
-        expect(oauthTimeout.setTimeoutSpy).toHaveBeenCalledWith(
-          expect.any(Function),
-          fetchTimeoutMs,
-        );
+        expect(
+          oauthTimeout.setTimeoutSpy.mock.calls.some(([, timeout]) => timeout === fetchTimeoutMs),
+        ).toBe(true);
       } finally {
         await server.close();
         await loginPromise?.catch(() => undefined);

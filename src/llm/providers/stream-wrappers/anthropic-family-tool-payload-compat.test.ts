@@ -129,7 +129,7 @@ describe("createOpenAIAnthropicToolPayloadCompatibilityWrapper", () => {
       ],
     });
 
-    expect(payload?.tools).toEqual([lookupFunction()]);
+    expect(payload?.tools).toEqual([functionTool(lookupTool())]);
   });
 
   it("skips unreadable and structurally invalid schemas while preserving healthy siblings", () => {

@@ -377,7 +377,8 @@ describe("maybeRepairStaleConfiguredAuthOrders", () => {
     writeMainToken(stateDir);
     await fs.mkdir(workAgentDir, { recursive: true });
     await fs.writeFile(resolveAuthProfileDatabasePath(workAgentDir), "not-a-sqlite-database");
-    expectBlocked(anthropicOrderConfig("anthropic:missing", { work: {} }));
+    const cfg = anthropicOrderConfig("anthropic:missing", { work: {} });
+    expectBlocked(cfg);
     expect(warnings(cfg, env).join("\n")).toContain("SQLite auth profile store is unreadable");
   });
 

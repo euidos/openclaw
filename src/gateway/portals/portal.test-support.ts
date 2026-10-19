@@ -57,7 +57,7 @@ export function usePortalHarness() {
   afterAll(() => close(target.server));
   return {
     target,
-    makeService(options: Partial<Parameters<typeof createGatewayPortalService>[0]> = {}) {
+    makeService: (options: Partial<Parameters<typeof createGatewayPortalService>[0]> = {}) => {
       const httpServers = options.httpServers ?? [];
       const service = createGatewayPortalService({
         httpBindHosts: ["127.0.0.1"],
@@ -67,7 +67,7 @@ export function usePortalHarness() {
       services.push(service);
       return { service, httpServers };
     },
-    async listenTarget(handler: RequestListener) {
+    listenTarget: async (handler: RequestListener) => {
       const server = createServer(handler);
       temporary.push(server);
       return listen(server);
@@ -116,7 +116,7 @@ export function holdPortalBind() {
 export function authority(message: string) {
   const state = {
     current: true,
-    assertCurrent() {
+    assertCurrent: () => {
       if (!state.current) {
         throw new Error(message);
       }

@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const transcode = vi.hoisted(() => vi.fn());
 
+// mock-isolation: Capture speech transcoding without invoking ffmpeg.
 vi.mock("openclaw/plugin-sdk/media-runtime", () => ({
   transcodeAudioBufferToOpus: transcode,
 }));

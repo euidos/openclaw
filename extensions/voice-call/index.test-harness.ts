@@ -47,9 +47,7 @@ export function registerVoiceCall(
     config?: Record<string, unknown>;
     logger?: OpenClawPluginApi["logger"];
     registrationMode?: OpenClawPluginApi["registrationMode"];
-    startOnRegistration?: Parameters<
-      Parameters<OpenClawPluginApi["registerService"]>[0]["start"]
-    >[0];
+    startOnRegistration?: OpenClawPluginServiceContextV2;
   } = {},
 ) {
   let service: Parameters<OpenClawPluginApi["registerService"]>[0] | undefined;
