@@ -39,11 +39,27 @@ afterEach(async () => {
   services.clear();
 });
 
-function makeService(hosts: string[]) {
-  const httpServers: import("node:http").Server[] = [];
-  const service = createGatewayPortalService({ httpBindHosts: hosts, httpServers });
+function makeService(
+  hosts = ["127.0.0.1"],
+  options: Partial<Parameters<typeof createGatewayPortalService>[0]> = {},
+) {
+  const httpServers: Server[] = [];
+  const service = createGatewayPortalService({ httpBindHosts: hosts, httpServers, ...options });
   services.add(service);
   return { service, httpServers };
+}
+
+function openWorker(
+  service: GatewayPortalService,
+  environmentId: string,
+  ownerEpoch: number,
+  options: Partial<Parameters<GatewayPortalService["open"]>[0]> = {},
+) {
+  return service.open({
+    targetPort: 3000,
+    target: workerTarget(environmentId, ownerEpoch),
+    ...options,
+  });
 }
 
 async function getStatus(host: string, port: number, path: string): Promise<number> {
@@ -74,7 +90,7 @@ describe("portal open authority fence", () => {
         res.write("data: live\n\n");
       },
       async (targetUrl) => {
-        const { service } = makeService(["127.0.0.1"]);
+        const { service } = makeService();
         const owner = new AbortController();
         let requestCurrent = true;
         const release = vi.fn();
@@ -105,7 +121,7 @@ describe("portal open authority fence", () => {
   });
 
   it("refuses to mutate a reused portal when the caller's authority lapsed", async () => {
-    const { service } = makeService(["127.0.0.1"]);
+    const { service } = makeService();
     const first = await service.open({ targetPort: 41234, title: "Live" });
     const releaseRejected = vi.fn();
     await expect(
@@ -237,7 +253,7 @@ describe("gateway portal service", () => {
   );
 
   it("updates an existing target without replacing its listener or token", async () => {
-    const { service, httpServers } = makeService(["127.0.0.1"]);
+    const { service, httpServers } = makeService();
     const releaseFirst = vi.fn();
     const releaseRedundant = vi.fn();
     const first = await service.open({
@@ -274,21 +290,11 @@ describe("gateway portal service", () => {
   });
 
   it("keeps local and worker portals on the same application port distinct", async () => {
-    const { service } = makeService(["127.0.0.1"]);
+    const { service } = makeService();
     const local = await service.open({ targetPort: 3000 });
-    const worker = await service.open({
-      targetPort: 3000,
-      target: workerTarget("cloud/a", 7),
-      origin: "Cloud worker A",
-    });
-    const otherWorker = await service.open({
-      targetPort: 3000,
-      target: workerTarget("cloud-a", 7),
-    });
-    const staleWorker = await service.open({
-      targetPort: 3000,
-      target: workerTarget("cloud/a", 6),
-    });
+    const worker = await openWorker(service, "cloud/a", 7, { origin: "Cloud worker A" });
+    const otherWorker = await openWorker(service, "cloud-a", 7);
+    const staleWorker = await openWorker(service, "cloud/a", 6);
 
     expect(local.id).toBe("p3000");
     expect(new Set([local.id, worker.id, otherWorker.id, staleWorker.id]).size).toBe(4);
@@ -305,19 +311,11 @@ describe("gateway portal service", () => {
   });
 
   it("closes worker forwards only for the selected environment owner epoch", async () => {
-    const { service } = makeService(["127.0.0.1"]);
+    const { service } = makeService();
     const closeStaleForward = vi.fn();
     const closeCurrentForward = vi.fn();
-    const stale = await service.open({
-      targetPort: 3000,
-      target: workerTarget("cloud-a", 6),
-      onClose: closeStaleForward,
-    });
-    const current = await service.open({
-      targetPort: 3000,
-      target: workerTarget("cloud-a", 7),
-      onClose: closeCurrentForward,
-    });
+    const stale = await openWorker(service, "cloud-a", 6, { onClose: closeStaleForward });
+    const current = await openWorker(service, "cloud-a", 7, { onClose: closeCurrentForward });
 
     await service.closeWorkerPortals("cloud-a", 6);
 
@@ -331,7 +329,7 @@ describe("gateway portal service", () => {
   });
 
   it("revalidates worker close authority immediately before queued removal", async () => {
-    const { service } = makeService(["127.0.0.1"]);
+    const { service } = makeService();
     const owner = {
       environmentId: "cloud-a",
       ownerEpoch: 1,
@@ -362,13 +360,9 @@ describe("gateway portal service", () => {
       await bindReleased.promise;
       await actualListen(params);
     });
-    const { service } = makeService(["127.0.0.1"]);
+    const { service } = makeService();
     const closeForward = vi.fn();
-    const opening = service.open({
-      targetPort: 3000,
-      target: workerTarget("cloud-a", 7),
-      onClose: closeForward,
-    });
+    const opening = openWorker(service, "cloud-a", 7, { onClose: closeForward });
     await bindStarted.promise;
 
     const closing = service.closeWorkerPortals("cloud-a", 7);
@@ -386,20 +380,6 @@ describe("gateway portal service", () => {
     await expect(service.open({ targetPort: 3000 })).rejects.toThrow(/already listening/u);
     expect(service.list()).toEqual([]);
     expect(httpServers).toEqual([]);
-  });
-
-  it("distinguishes configured ingress from its loopback backend without claiming viewer access", async () => {
-    const httpServers: Server[] = [];
-    const service = createGatewayPortalService({
-      httpBindHosts: ["127.0.0.1"],
-      httpServers,
-      ingress: { domain: "previews.example.test", port: 0 },
-    });
-    services.add(service);
-    const portal = await service.open({ targetPort: 3000 });
-    expect(httpServers[0]?.address()).toMatchObject({ address: "127.0.0.1" });
-    expect(portal.exposure).toEqual({ kind: "non-loopback", browserReachability: "unverified" });
-    expect(service.list()[0]?.exposure).toEqual(portal.exposure);
   });
 
   it.each([
@@ -514,9 +494,7 @@ describe("direct HTTPS portal publication", () => {
         // A broken candidate must fail on TLS, not routing.
         vi.spyOn(advertisedLanHost, "resolveAdvertisedLanHostCore").mockResolvedValue("127.0.0.2");
       }
-      const service = createGatewayPortalService({
-        httpBindHosts: [kind === "LAN" ? "0.0.0.0" : "127.0.0.1"],
-        httpServers: [],
+      const { service } = makeService([kind === "LAN" ? "0.0.0.0" : "127.0.0.1"], {
         tlsOptions: { ...material, cert: kind === "chain" ? [material.cert] : material.cert },
         gatewayOrigins:
           kind === "wildcard"
@@ -525,7 +503,6 @@ describe("direct HTTPS portal publication", () => {
               ? ["https://unrelated.example.test", "https://alternate.example.test:8443"]
               : [],
       });
-      services.add(service);
       const checkPortal = async (targetPort: number) => {
         const portal = await service.open({ targetPort });
         expect(new URL(portal.publicUrl).hostname).toBe(hostname);

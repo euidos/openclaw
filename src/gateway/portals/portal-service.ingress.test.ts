@@ -34,6 +34,10 @@ function makeService(options: Partial<Parameters<typeof createGatewayPortalServi
   return { service, httpServers };
 }
 
+function wildcardService(httpBindHosts = ["127.0.0.1"]) {
+  return makeService({ httpBindHosts, ingress: { domain: "previews.example.net", port: 0 } });
+}
+
 function publishManaged(mode: "serve" | "funnel" = "serve") {
   const release = prepareTailscalePublishedOrigin({
     origin: "https://gateway.example.ts.net",
@@ -58,40 +62,38 @@ function fakeClaim() {
   return { claim, lose };
 }
 
+type IngressResponse = { status: number; body: string; cookie: string[]; location?: string };
+
 async function ingressRequest(port: number, url: string, host?: string) {
   const parsed = new URL(url);
   const authority = new URL(`http://${host ?? parsed.host}`);
   const agent = new Agent({ keepAlive: false });
   agent.createConnection = () => createConnection({ host: "127.0.0.1", port });
-  return await new Promise<{ status: number; body: string; cookie: string[]; location?: string }>(
-    (resolve, reject) => {
-      const req = request(
-        {
-          // Preserve the tested HTTP authority while routing only the test socket
-          // to the private ingress listener (no DNS or external network needed).
-          hostname: authority.hostname,
-          port: authority.port || 80,
-          path: `${parsed.pathname}${parsed.search}`,
-          headers: { host: host ?? parsed.host },
-          agent,
-        },
-        (res) => {
-          const chunks: Buffer[] = [];
-          res.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
-          res.on("end", () =>
-            resolve({
-              status: res.statusCode ?? 0,
-              body: Buffer.concat(chunks).toString(),
-              cookie: res.headers["set-cookie"] ?? [],
-              location: res.headers.location,
-            }),
-          );
-        },
-      );
-      req.on("error", reject);
-      req.end();
-    },
-  );
+  return await new Promise<IngressResponse>((resolve, reject) => {
+    const req = request(
+      {
+        hostname: authority.hostname,
+        port: authority.port || 80,
+        path: `${parsed.pathname}${parsed.search}`,
+        headers: { host: host ?? parsed.host },
+        agent,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+        res.on("end", () =>
+          resolve({
+            status: res.statusCode ?? 0,
+            body: Buffer.concat(chunks).toString(),
+            cookie: res.headers["set-cookie"] ?? [],
+            location: res.headers.location,
+          }),
+        );
+      },
+    );
+    req.on("error", reject);
+    req.end();
+  });
 }
 
 describe("operator-managed private wildcard portal ingress", () => {
@@ -102,10 +104,7 @@ describe("operator-managed private wildcard portal ingress", () => {
         res.end(JSON.stringify({ path: req.url, proto: req.headers["x-forwarded-proto"] }));
       },
       async (targetUrl) => {
-        const { service, httpServers } = makeService({
-          httpBindHosts: ["0.0.0.0"],
-          ingress: { domain: "previews.example.net", port: 0 },
-        });
+        const { service, httpServers } = wildcardService(["0.0.0.0"]);
         const resolveHost = vi.spyOn(advertisedLanHost, "resolveAdvertisedLanHostCore");
         const targetPort = Number(new URL(targetUrl).port);
         const first = await service.open({ targetPort, path: "/nested/start?theme=dark" });
@@ -118,6 +117,8 @@ describe("operator-managed private wildcard portal ingress", () => {
           address: "127.0.0.1",
           port: first.listenPort,
         });
+        expect(first.exposure).toEqual({ kind: "non-loopback", browserReachability: "unverified" });
+        expect(service.list()[0]?.exposure).toEqual(first.exposure);
         const response = await ingressRequest(first.listenPort, first.url);
         expect(response.status).toBe(200);
         expect(JSON.parse(response.body)).toEqual({
@@ -134,17 +135,13 @@ describe("operator-managed private wildcard portal ingress", () => {
         expect(restrictedCookie).toContain("SameSite=Strict");
         expect(restrictedCookie).not.toContain("SameSite=None");
         expect((await ingressRequest(first.listenPort, first.publicUrl)).status).toBe(401);
-        expect(
-          (await ingressRequest(first.listenPort, first.url, "unknown.previews.example.net"))
-            .status,
-        ).toBe(404);
-        expect(
-          (await ingressRequest(first.listenPort, first.url, "gateway.example.net")).status,
-        ).toBe(404);
-        expect(
-          (await ingressRequest(first.listenPort, first.url, `${new URL(first.url).hostname}:8443`))
-            .status,
-        ).toBe(404);
+        for (const host of [
+          "unknown.previews.example.net",
+          "gateway.example.net",
+          `${new URL(first.url).hostname}:8443`,
+        ]) {
+          expect((await ingressRequest(first.listenPort, first.url, host)).status).toBe(404);
+        }
         const reused = await service.open({ targetPort, path: "/updated" });
         expect(new URL(reused.url).origin).toBe(new URL(first.url).origin);
         expect(reused.publicUrl).toBe(`${new URL(first.url).origin}/updated`);
@@ -170,9 +167,7 @@ describe("operator-managed private wildcard portal ingress", () => {
         },
         async (targetUrl) => {
           targetPort = Number(new URL(targetUrl).port);
-          const { service } = makeService({
-            ingress: { domain: "previews.example.net", port: 0 },
-          });
+          const { service } = wildcardService();
           const portal = await service.open({ targetPort });
           const response = await ingressRequest(portal.listenPort, portal.url);
           expect(response.status).toBe(302);
@@ -183,9 +178,7 @@ describe("operator-managed private wildcard portal ingress", () => {
   );
 
   it("shares listener startup across concurrent opens and closes only the selected portal", async () => {
-    const { service, httpServers } = makeService({
-      ingress: { domain: "previews.example.net", port: 0 },
-    });
+    const { service, httpServers } = wildcardService();
     const [first, second] = await Promise.all([
       service.open({ targetPort: 3000 }),
       service.open({ targetPort: 4000 }),
@@ -210,9 +203,7 @@ describe("operator-managed private wildcard portal ingress", () => {
       await release.promise;
       await actual(params);
     });
-    const { service, httpServers } = makeService({
-      ingress: { domain: "previews.example.net", port: 0 },
-    });
+    const { service, httpServers } = wildcardService();
     const opening = service.open({ targetPort: 3000 });
     const rejected = expect(opening).rejects.toThrow("portals unavailable");
     await started.promise;
