@@ -222,7 +222,7 @@ describe("dreaming controller", () => {
   });
 
   it("patches config to update global dreaming enablement", async () => {
-    const { state, request } = createState();
+    const { state } = createState();
     state.hello = gatewayHelloForMethods(["config.patch"]);
     state.configSnapshot = {
       hash: "hash-1",
@@ -230,12 +230,9 @@ describe("dreaming controller", () => {
         config: { dreaming: { enabled: true } },
       }),
     };
-    request.mockResolvedValue({ ok: true });
     const config = createConfig(state);
 
-    const ok = await updateDreamingEnabled(state, config, false);
-
-    expect(ok).toBe(true);
+    await expect(updateDreamingEnabled(state, config, false)).resolves.toBe(true);
     expect(config.patch).toHaveBeenCalledWith({
       note: "Dreaming settings updated from the Dreaming tab.",
       raw: expect.any(Object),
@@ -395,9 +392,7 @@ describe("dreaming controller", () => {
     state.configSnapshot = {};
     const config = createConfig(state);
 
-    const ok = await updateDreamingEnabled(state, config, true);
-
-    expect(ok).toBe(false);
+    await expect(updateDreamingEnabled(state, config, true)).resolves.toBe(false);
     expect(config.patch).not.toHaveBeenCalled();
     expect(config.lookupSchemaPath).not.toHaveBeenCalled();
     expect(state.dreamingStatusError).toBe("Config hash missing; refresh and retry.");
@@ -535,38 +530,19 @@ describe("dreaming controller", () => {
     expect(state.dreamDiaryActionArchivePath).toBeNull();
   });
 
-  it("copies the dreaming repair archive path", async () => {
-    const { state } = createState();
-    state.dreamDiaryActionArchivePath =
-      "/tmp/openclaw/.openclaw-repair/dreaming/2026-04-11T22-10-00-000Z";
-    const writeText = vi.fn().mockResolvedValue(undefined);
-    vi.stubGlobal("navigator", { clipboard: { writeText } } as unknown as Navigator);
-
-    const ok = await copyDreamingArchivePath(state);
-
-    expect(ok).toBe(true);
-    expect(writeText).toHaveBeenCalledWith(
-      "/tmp/openclaw/.openclaw-repair/dreaming/2026-04-11T22-10-00-000Z",
-    );
-    expect(state.dreamDiaryActionMessage).toEqual({
-      kind: "success",
-      text: "Archive path copied.",
-    });
-  });
-
-  it("reports when the dreaming repair archive path cannot be copied", async () => {
+  it.each([
+    { copied: true, kind: "success", text: "Archive path copied." },
+    { copied: false, kind: "error", text: "Could not copy archive path." },
+  ])("reports clipboard result: $kind", async ({ copied, kind, text }) => {
     const { state } = createState();
     state.dreamDiaryActionArchivePath = "/tmp/openclaw/archive";
-    vi.stubGlobal("navigator", {
-      clipboard: { writeText: vi.fn().mockRejectedValue(new Error("denied")) },
-    } as unknown as Navigator);
+    const writeText = copied
+      ? vi.fn().mockResolvedValue(undefined)
+      : vi.fn().mockRejectedValue(new Error("denied"));
+    vi.stubGlobal("navigator", { clipboard: { writeText } } as unknown as Navigator);
 
-    const ok = await copyDreamingArchivePath(state);
-
-    expect(ok).toBe(false);
-    expect(state.dreamDiaryActionMessage).toEqual({
-      kind: "error",
-      text: "Could not copy archive path.",
-    });
+    await expect(copyDreamingArchivePath(state)).resolves.toBe(copied);
+    expect(writeText).toHaveBeenCalledWith("/tmp/openclaw/archive");
+    expect(state.dreamDiaryActionMessage).toEqual({ kind, text });
   });
 });
