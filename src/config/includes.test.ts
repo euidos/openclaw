@@ -1,4 +1,3 @@
-// Covers config include scanning and include-file merge behavior.
 import nodeFs from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -43,6 +42,35 @@ function createMockResolver(files: Record<string, unknown>): IncludeResolver {
 
 function resolve(obj: unknown, files: Record<string, unknown> = {}, basePath = DEFAULT_BASE_PATH) {
   return resolveConfigIncludes(obj, basePath, createMockResolver(files));
+}
+
+async function writeFixture(filePath: string, content: unknown, raw = false) {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, raw ? String(content) : JSON.stringify(content), "utf-8");
+}
+
+function includeChain(length: number) {
+  return Object.fromEntries(
+    Array.from({ length }, (_, i) => [
+      configPath(`chain${i}.json`),
+      i === length - 1 ? { done: true } : { $include: `./chain${i + 1}.json` },
+    ]),
+  );
+}
+
+function resolveWithEvents(obj: unknown, files: Record<string, unknown>) {
+  const events: ConfigIncludeResolutionEvent[] = [];
+  const resolver = createMockResolver(files);
+  resolver.onIncludeResolved = (event) => events.push(event);
+  return { result: resolveConfigIncludes(obj, DEFAULT_BASE_PATH, resolver), events };
+}
+
+function scan(configDir: string, parsed: unknown, allowedRoots?: string[]) {
+  return collectIncludePathsRecursive({
+    configPath: path.join(configDir, "openclaw.json"),
+    parsed,
+    allowedRoots,
+  });
 }
 
 function expectResolveIncludeError(
@@ -97,27 +125,21 @@ describe("resolveConfigIncludes", () => {
       [configPath("second.json")]: { enabled: true },
       [configPath("third.json")]: { mode: "strict" },
     };
-    const events: ConfigIncludeResolutionEvent[] = [];
-    const resolver = createMockResolver(files);
-    resolver.onIncludeResolved = (event) => events.push(event);
-
-    expect(
-      resolveConfigIncludes(
-        {
-          plugins: [
-            { $include: "./first.json" },
-            {
-              policy: {
-                $include: ["./second.json", "./third.json"],
-                enabled: false,
-              },
+    const { result, events } = resolveWithEvents(
+      {
+        plugins: [
+          { $include: "./first.json" },
+          {
+            policy: {
+              $include: ["./second.json", "./third.json"],
+              enabled: false,
             },
-          ],
-        },
-        DEFAULT_BASE_PATH,
-        resolver,
-      ),
-    ).toEqual({
+          },
+        ],
+      },
+      files,
+    );
+    expect(result).toEqual({
       plugins: [{ id: "first" }, { policy: { enabled: false, mode: "strict" } }],
     });
     expect(events).toEqual([
@@ -146,19 +168,13 @@ describe("resolveConfigIncludes", () => {
       [configPath("nested.json")]: { mode: "nested" },
       [configPath("override.json")]: { mode: "override" },
     };
-    const events: ConfigIncludeResolutionEvent[] = [];
-    const resolver = createMockResolver(files);
-    resolver.onIncludeResolved = (event) => events.push(event);
-
-    expect(
-      resolveConfigIncludes(
-        {
-          agents: { $include: ["./delegating.json", "./override.json"] },
-        },
-        DEFAULT_BASE_PATH,
-        resolver,
-      ),
-    ).toEqual({ agents: { mode: "override" } });
+    const { result, events } = resolveWithEvents(
+      {
+        agents: { $include: ["./delegating.json", "./override.json"] },
+      },
+      files,
+    );
+    expect(result).toEqual({ agents: { mode: "override" } });
     expect(
       events.map(({ path: logicalPath, kind, targetPath, targetPaths }) => ({
         path: logicalPath,
@@ -202,34 +218,25 @@ describe("resolveConfigIncludes", () => {
   });
 
   it("throws CircularIncludeError for circular includes", () => {
-    const aPath = configPath("a.json");
-    const bPath = configPath("b.json");
-    const resolver: IncludeResolver = {
-      readFile: (filePath: string) => {
-        if (filePath === aPath) {
-          return JSON.stringify({ $include: "./b.json" });
-        }
-        if (filePath === bPath) {
-          return JSON.stringify({ $include: "./a.json" });
-        }
-        throw new Error(`Unknown file: ${filePath}`);
-      },
-      parseJson: JSON.parse,
-    };
-    const obj = { $include: "./a.json" };
-    try {
-      resolveConfigIncludes(obj, DEFAULT_BASE_PATH, resolver);
-      throw new Error("expected circular include error");
-    } catch (err) {
-      expect(err).toBeInstanceOf(CircularIncludeError);
-      const circular = err as CircularIncludeError;
-      expect(circular.chain).toContain(DEFAULT_BASE_PATH);
-      expect(circular.chain).toContain(aPath);
-      expect(circular.chain).toContain(bPath);
-      expect(circular.message).toMatch(/Circular include detected/);
-      expect(circular.message).toContain("a.json");
-      expect(circular.message).toContain("b.json");
-    }
+    const aPath = configPath("a.json"),
+      bPath = configPath("b.json");
+    const circular = expectResolveIncludeError(
+      () =>
+        resolve(
+          { $include: "./a.json" },
+          {
+            [aPath]: { $include: "./b.json" },
+            [bPath]: { $include: "./a.json" },
+          },
+        ),
+      /Circular include detected/,
+    );
+    expect(circular).toBeInstanceOf(CircularIncludeError);
+    expect(circular).toMatchObject({
+      chain: expect.arrayContaining([DEFAULT_BASE_PATH, aPath, bPath]),
+    });
+    expect(circular.message).toContain("a.json");
+    expect(circular.message).toContain("b.json");
   });
 
   it.each([
@@ -249,24 +256,9 @@ describe("resolveConfigIncludes", () => {
   });
 
   it("allows depth 10 but rejects depth 11", () => {
-    const okFiles: Record<string, unknown> = {};
-    for (let i = 0; i < 9; i++) {
-      okFiles[configPath(`ok${i}.json`)] = { $include: `./ok${i + 1}.json` };
-    }
-    okFiles[configPath("ok9.json")] = { done: true };
-    expect(resolve({ $include: "./ok0.json" }, okFiles)).toEqual({
-      done: true,
-    });
-
-    const failFiles: Record<string, unknown> = {};
-    for (let i = 0; i < 10; i++) {
-      failFiles[configPath(`fail${i}.json`)] = {
-        $include: `./fail${i + 1}.json`,
-      };
-    }
-    failFiles[configPath("fail10.json")] = { done: true };
+    expect(resolve({ $include: "./chain0.json" }, includeChain(10))).toEqual({ done: true });
     expectResolveIncludeError(
-      () => resolve({ $include: "./fail0.json" }, failFiles),
+      () => resolve({ $include: "./chain0.json" }, includeChain(11)),
       /Maximum include depth/,
     );
   });
@@ -281,16 +273,12 @@ describe("collectIncludePathsRecursive", () => {
         const safeIncludePath = path.join(configDir, "safe.json5");
         const outsideIncludePath = path.join(tempRoot, "outside.json5");
         const symlinkPath = path.join(configDir, "outside-link.json5");
-        await fs.mkdir(configDir, { recursive: true });
-        await fs.writeFile(safeIncludePath, "{ safe: true }\n", "utf-8");
-        await fs.writeFile(outsideIncludePath, "{ outside: true }\n", "utf-8");
+        await writeFixture(safeIncludePath, { safe: true });
+        await writeFixture(outsideIncludePath, { outside: true });
         await fs.symlink(outsideIncludePath, symlinkPath);
 
-        const includePaths = await collectIncludePathsRecursive({
-          configPath: path.join(configDir, "openclaw.json"),
-          parsed: {
-            $include: ["./safe.json5", "../outside.json5", "./outside-link.json5"],
-          },
+        const includePaths = await scan(configDir, {
+          $include: ["./safe.json5", "../outside.json5", "./outside-link.json5"],
         });
 
         expect(includePaths).toEqual([await fs.realpath(safeIncludePath)]);
@@ -305,15 +293,9 @@ describe("collectIncludePathsRecursive", () => {
         const trustedDir = path.join(tempRoot, "trusted");
         const outsideDir = path.join(tempRoot, "outside");
         const configLink = path.join(tempRoot, "config-link");
-        await fs.mkdir(trustedDir, { recursive: true });
-        await fs.mkdir(outsideDir, { recursive: true });
-        await fs.writeFile(
-          path.join(trustedDir, "outer.json5"),
-          '{ "$include": "./nested.json5" }\n',
-          "utf-8",
-        );
-        await fs.writeFile(path.join(trustedDir, "nested.json5"), "{ trusted: true }\n", "utf-8");
-        await fs.writeFile(path.join(outsideDir, "nested.json5"), "{ escaped: true }\n", "utf-8");
+        await writeFixture(path.join(trustedDir, "outer.json5"), { $include: "./nested.json5" });
+        await writeFixture(path.join(trustedDir, "nested.json5"), { trusted: true });
+        await writeFixture(path.join(outsideDir, "nested.json5"), { escaped: true });
         await fs.symlink(trustedDir, configLink);
 
         let swapped = false;
@@ -347,14 +329,9 @@ describe("collectIncludePathsRecursive", () => {
       const sharedDir = path.join(tempRoot, "shared");
       const sharedIncludePath = path.join(sharedDir, "shared.json5");
       await fs.mkdir(configDir, { recursive: true });
-      await fs.mkdir(sharedDir, { recursive: true });
-      await fs.writeFile(sharedIncludePath, "{ shared: true }\n", "utf-8");
+      await writeFixture(sharedIncludePath, "{ shared: true }\n", true);
 
-      const includePaths = await collectIncludePathsRecursive({
-        configPath: path.join(configDir, "openclaw.json"),
-        parsed: { $include: sharedIncludePath },
-        allowedRoots: [sharedDir],
-      });
+      const includePaths = await scan(configDir, { $include: sharedIncludePath }, [sharedDir]);
 
       expect(includePaths).toEqual([await fs.realpath(sharedIncludePath)]);
     });
@@ -363,23 +340,14 @@ describe("collectIncludePathsRecursive", () => {
   it("continues past rejected nested includes to later safe siblings", async () => {
     await withTestDir({ prefix: "openclaw-include-scan-nested-" }, async (tempRoot) => {
       const configDir = path.join(tempRoot, "config");
-      const nestedDir = path.join(configDir, "nested");
-      const outerIncludePath = path.join(nestedDir, "outer.json5");
+      const outerIncludePath = path.join(configDir, "nested", "outer.json5");
       const safeIncludePath = path.join(configDir, "safe.json5");
       const escapedIncludePath = path.join(tempRoot, "escaped.json5");
-      await fs.mkdir(nestedDir, { recursive: true });
-      await fs.writeFile(
-        outerIncludePath,
-        '{ "$include": ["../../escaped.json5", "../safe.json5"] }\n',
-        "utf-8",
-      );
-      await fs.writeFile(safeIncludePath, "{ safe: true }\n", "utf-8");
-      await fs.writeFile(escapedIncludePath, "{ escaped: true }\n", "utf-8");
+      await writeFixture(outerIncludePath, { $include: ["../../escaped.json5", "../safe.json5"] });
+      await writeFixture(safeIncludePath, { safe: true });
+      await writeFixture(escapedIncludePath, { escaped: true });
 
-      const includePaths = await collectIncludePathsRecursive({
-        configPath: path.join(configDir, "openclaw.json"),
-        parsed: { $include: "./nested/outer.json5" },
-      });
+      const includePaths = await scan(configDir, { $include: "./nested/outer.json5" });
 
       expect(includePaths).toEqual([
         await fs.realpath(outerIncludePath),
@@ -393,22 +361,16 @@ describe("collectIncludePathsRecursive", () => {
       const configDir = path.join(tempRoot, "config");
       const sharedIncludePath = path.join(configDir, "shared.json5");
       const leafIncludePath = path.join(configDir, "leaf.json5");
-      await fs.mkdir(configDir, { recursive: true });
       for (let index = 0; index < MAX_INCLUDE_DEPTH - 1; index += 1) {
         const nextInclude =
           index === MAX_INCLUDE_DEPTH - 2 ? "./shared.json5" : `./chain-${index + 1}.json5`;
-        await fs.writeFile(
-          path.join(configDir, `chain-${index}.json5`),
-          `{ "$include": ${JSON.stringify(nextInclude)} }\n`,
-          "utf-8",
-        );
+        await writeFixture(path.join(configDir, `chain-${index}.json5`), { $include: nextInclude });
       }
-      await fs.writeFile(sharedIncludePath, '{ "$include": "./leaf.json5" }\n', "utf-8");
-      await fs.writeFile(leafIncludePath, "{ leaf: true }\n", "utf-8");
+      await writeFixture(sharedIncludePath, { $include: "./leaf.json5" });
+      await writeFixture(leafIncludePath, { leaf: true });
 
-      const includePaths = await collectIncludePathsRecursive({
-        configPath: path.join(configDir, "openclaw.json"),
-        parsed: { $include: ["./chain-0.json5", "./shared.json5"] },
+      const includePaths = await scan(configDir, {
+        $include: ["./chain-0.json5", "./shared.json5"],
       });
 
       expect(includePaths).toContain(await fs.realpath(leafIncludePath));
@@ -417,54 +379,37 @@ describe("collectIncludePathsRecursive", () => {
 });
 
 describe("real-world config patterns", () => {
-  it.each([
-    {
-      name: "per-client agent includes",
-      files: {
-        [configPath("clients", "mueller.json")]: {
-          agents: [
-            {
-              id: "mueller-screenshot",
-              workspace: "~/clients/mueller/screenshot",
-            },
-            {
-              id: "mueller-transcribe",
-              workspace: "~/clients/mueller/transcribe",
-            },
-          ],
-          broadcast: {
-            "group-mueller": ["mueller-screenshot", "mueller-transcribe"],
-          },
-        },
-        [configPath("clients", "schmidt.json")]: {
-          agents: [
-            {
-              id: "schmidt-screenshot",
-              workspace: "~/clients/schmidt/screenshot",
-            },
-          ],
-          broadcast: { "group-schmidt": ["schmidt-screenshot"] },
-        },
+  it("supports per-client agent includes", () => {
+    const agent = (id: string, workspace: string) => ({ id, workspace });
+    const screenshot = agent("mueller-screenshot", "~/clients/mueller/screenshot");
+    const transcribe = agent("mueller-transcribe", "~/clients/mueller/transcribe");
+    const schmidt = agent("schmidt-screenshot", "~/clients/schmidt/screenshot");
+    const files = {
+      [configPath("clients", "mueller.json")]: {
+        agents: [screenshot, transcribe],
+        broadcast: { "group-mueller": ["mueller-screenshot", "mueller-transcribe"] },
       },
-      obj: {
-        gateway: { port: 18789 },
-        $include: ["./clients/mueller.json", "./clients/schmidt.json"],
+      [configPath("clients", "schmidt.json")]: {
+        agents: [schmidt],
+        broadcast: { "group-schmidt": ["schmidt-screenshot"] },
       },
-      expected: {
-        gateway: { port: 18789 },
-        agents: [
-          { id: "mueller-screenshot", workspace: "~/clients/mueller/screenshot" },
-          { id: "mueller-transcribe", workspace: "~/clients/mueller/transcribe" },
-          { id: "schmidt-screenshot", workspace: "~/clients/schmidt/screenshot" },
-        ],
-        broadcast: {
-          "group-mueller": ["mueller-screenshot", "mueller-transcribe"],
-          "group-schmidt": ["schmidt-screenshot"],
+    };
+    expect(
+      resolve(
+        {
+          gateway: { port: 18789 },
+          $include: ["./clients/mueller.json", "./clients/schmidt.json"],
         },
+        files,
+      ),
+    ).toEqual({
+      gateway: { port: 18789 },
+      agents: [screenshot, transcribe, schmidt],
+      broadcast: {
+        "group-mueller": ["mueller-screenshot", "mueller-transcribe"],
+        "group-schmidt": ["schmidt-screenshot"],
       },
-    },
-  ] as const)("supports common modular include layouts: $name", ({ obj, files, expected }) => {
-    expect(resolve(obj, files)).toEqual(expected);
+    });
   });
 });
 describe("security: path traversal protection (CWE-22)", () => {
@@ -544,10 +489,9 @@ describe("security: path traversal protection (CWE-22)", () => {
         const configDir = path.join(tempRoot, "config");
         const outsideDir = path.join(tempRoot, "outside");
         await fs.mkdir(configDir, { recursive: true });
-        await fs.mkdir(outsideDir, { recursive: true });
         const includePath = path.join(configDir, "extra.json5");
         const outsidePath = path.join(outsideDir, "secret.json5");
-        await fs.writeFile(outsidePath, '{"logging":{"redactSensitive":"tools"}}\n', "utf-8");
+        await writeFixture(outsidePath, { logging: { redactSensitive: "tools" } });
         try {
           await fs.link(outsidePath, includePath);
         } catch (err) {
@@ -569,12 +513,9 @@ describe("security: path traversal protection (CWE-22)", () => {
     it("rejects include files larger than the guarded read limit", async () => {
       await withTestDir({ prefix: "openclaw-includes-big-" }, async (tempRoot) => {
         const configDir = path.join(tempRoot, "config");
-        await fs.mkdir(configDir, { recursive: true });
-        await fs.writeFile(
-          path.join(configDir, "big.json5"),
-          `{"blob":"${"a".repeat(2 * 1024 * 1024 + 1)}"}`,
-          "utf-8",
-        );
+        await writeFixture(path.join(configDir, "big.json5"), {
+          blob: "a".repeat(2 * 1024 * 1024 + 1),
+        });
 
         expect(() =>
           resolveConfigIncludes({ $include: "./big.json5" }, path.join(configDir, "openclaw.json")),
@@ -601,9 +542,8 @@ describe("OPENCLAW_INCLUDE_ROOTS allowlist", () => {
       const offRootDir = path.join(tempRoot, "off-limits");
       await fs.mkdir(configDir, { recursive: true });
       await fs.mkdir(allowedDir, { recursive: true });
-      await fs.mkdir(offRootDir, { recursive: true });
       const offRootTarget = path.join(offRootDir, "secret.json5");
-      await fs.writeFile(offRootTarget, "{ leaked: true }\n", "utf-8");
+      await writeFixture(offRootTarget, { leaked: true });
       const linkInConfig = path.join(configDir, "secret.json5");
       try {
         await fs.symlink(

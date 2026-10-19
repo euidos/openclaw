@@ -12,6 +12,10 @@ import {
   setConfigResolutionFacts,
 } from "./resolution-facts.js";
 
+function secretRef(id: string) {
+  return { source: "env", provider: "default", id };
+}
+
 it("resolves string templates, escapes and defaults without warnings", () => {
   const cases: Array<[string, Record<string, string>, string]> = [
     ["${FOO}", { FOO: "bar" }, "bar"],
@@ -104,40 +108,29 @@ it("resolves nested containers and preserves non-string values", () => {
 });
 
 it("reports missing and empty variables at canonical config paths", () => {
-  const cases: Array<[unknown, string, Record<string, string>?]> = [
-    [{ key: "${MISSING}" }, "key"],
-    [{ key: "${MISSING}" }, "key", { MISSING: "" }],
-    [{ outer: { inner: { key: "${MISSING}" } } }, "outer.inner.key"],
-    [{ items: ["ok", "${MISSING}"] }, "items[1]"],
-    [
-      { plugins: { entries: { "foo.config.bar": { token: "${MISSING}" } } } },
-      'plugins.entries["foo.config.bar"].token',
-    ],
-    [
-      { plugins: { entries: { fixture: { config: { headers: { "X.Trace": "${MISSING}" } } } } } },
-      'plugins.entries.fixture.config.headers["X.Trace"]',
-    ],
-    [
-      {
-        plugins: { entries: { fixture: { config: { headers: { X: { Trace: "${MISSING}" } } } } } },
-      },
-      "plugins.entries.fixture.config.headers.X.Trace",
-    ],
-    [
-      { plugins: { entries: { fixture: { config: { headers: { "0": "${MISSING}" } } } } } },
-      'plugins.entries.fixture.config.headers["0"]',
-    ],
-    [{ "root.key": "${MISSING}" }, '["root.key"]'],
-    [
-      { plugins: { entries: { fixture: { config: { headers: ["${MISSING}"] } } } } },
-      "plugins.entries.fixture.config.headers[0]",
-    ],
-    [
-      { providers: { "vercel-gateway": { apiKey: "${MISSING}" } } },
-      "providers.vercel-gateway.apiKey",
-    ],
+  const headers = ["plugins", "entries", "fixture", "config", "headers"];
+  const cases: Array<[Array<string | number>, string, Record<string, string>?]> = [
+    [["key"], "key"],
+    [["key"], "key", { MISSING: "" }],
+    [["outer", "inner", "key"], "outer.inner.key"],
+    [["items", 1], "items[1]"],
+    [["plugins", "entries", "foo.config.bar", "token"], 'plugins.entries["foo.config.bar"].token'],
+    [[...headers, "X.Trace"], 'plugins.entries.fixture.config.headers["X.Trace"]'],
+    [[...headers, "X", "Trace"], "plugins.entries.fixture.config.headers.X.Trace"],
+    [[...headers, "0"], 'plugins.entries.fixture.config.headers["0"]'],
+    [["root.key"], '["root.key"]'],
+    [[...headers, 0], "plugins.entries.fixture.config.headers[0]"],
+    [["providers", "vercel-gateway", "apiKey"], "providers.vercel-gateway.apiKey"],
   ];
-  for (const [config, configPath, env = {}] of cases) {
+  for (const [segments, configPath, env = {}] of cases) {
+    const config = segments.reduceRight<unknown>((value, key) => {
+      if (typeof key === "string") {
+        return { [key]: value };
+      }
+      const items: unknown[] = Array.from({ length: key + 1 }, () => "ok");
+      items[key] = value;
+      return items;
+    }, "${MISSING}");
     try {
       resolveConfigEnvVars(config, env);
       expect.fail("expected MissingEnvVarError");
@@ -228,58 +221,38 @@ it("keeps pending and resolved SecretRef provenance distinct across config paths
   ]);
   expect([...resolvedEnvSecretRefs]).toEqual([["resolved", "RESOLVED_SECRET"]]);
   for (const [configPath, id] of pendingEnvSecretRefs) {
-    expect(getAuthoredConfigSecretRef(config, configPath), configPath).toEqual({
-      source: "env",
-      provider: "default",
-      id,
-    });
+    expect(getAuthoredConfigSecretRef(config, configPath), configPath).toEqual(secretRef(id));
   }
   expect(getAuthoredConfigSecretRef(config, "resolved")).toBeNull();
-  expect(getResolvedConfigEnvSecretRef(config, "resolved")).toEqual({
-    source: "env",
-    provider: "default",
-    id: "RESOLVED_SECRET",
-  });
+  expect(getResolvedConfigEnvSecretRef(config, "resolved")).toEqual(secretRef("RESOLVED_SECRET"));
 });
 
 it("detects only unescaped supported env references", () => {
-  const cases: Array<[boolean, string[]]> = [
-    [
-      true,
-      [
-        "${FOO}",
-        "prefix-${VAR}-suffix",
-        "${A}/${B}",
-        "${_UNDERSCORE}",
-        "${VAR_WITH_123}",
-        "$${ESCAPED} ${REAL}",
-        "${REAL} $${ESCAPED}",
-        "${VAR:-x}",
-        "prefix-${VAR:-x}",
-        "${VAR:-}",
-      ],
-    ],
-    [
-      false,
-      [
-        "no-refs-here",
-        "$VAR",
-        "${lowercase}",
-        "${MixedCase}",
-        "${123INVALID}",
-        "",
-        "$${ESCAPED}",
-        "prefix-$${ESCAPED}-suffix",
-        "$${VAR:-x}",
-        "${VAR:=x}",
-        "${VAR-x}",
-        "${lowercase:-x}",
-      ],
-    ],
+  const cases: Array<[string, boolean]> = [
+    ["${FOO}", true],
+    ["prefix-${VAR}-suffix", true],
+    ["${A}/${B}", true],
+    ["${_UNDERSCORE}", true],
+    ["${VAR_WITH_123}", true],
+    ["$${ESCAPED} ${REAL}", true],
+    ["${REAL} $${ESCAPED}", true],
+    ["${VAR:-x}", true],
+    ["prefix-${VAR:-x}", true],
+    ["${VAR:-}", true],
+    ["no-refs-here", false],
+    ["$VAR", false],
+    ["${lowercase}", false],
+    ["${MixedCase}", false],
+    ["${123INVALID}", false],
+    ["", false],
+    ["$${ESCAPED}", false],
+    ["prefix-$${ESCAPED}-suffix", false],
+    ["$${VAR:-x}", false],
+    ["${VAR:=x}", false],
+    ["${VAR-x}", false],
+    ["${lowercase:-x}", false],
   ];
-  for (const [expected, inputs] of cases) {
-    for (const input of inputs) {
-      expect(containsEnvVarReference(input), input).toBe(expected);
-    }
+  for (const [input, expected] of cases) {
+    expect(containsEnvVarReference(input), input).toBe(expected);
   }
 });
