@@ -3,6 +3,30 @@ import { isJsonObject, type JsonObject } from "./protocol.js";
 
 export type ProviderKind = "openai" | "azure" | "other";
 
+type InferenceRouteIdentity = Pick<CodexInferenceProxy, "baseUrl" | "upstream">;
+export type CodexThreadFingerprintInference = {
+  inferenceRoute?: InferenceRouteIdentity;
+  inferenceProviderRoutes?: ReadonlyMap<string, InferenceRouteIdentity>;
+};
+
+/** Hash the owned upstream, not the process-local relay address and capability token. */
+export function resolveCodexThreadFingerprintConfig(
+  config: JsonObject,
+  inference?: CodexThreadFingerprintInference,
+): JsonObject {
+  if (!inference) {
+    return config;
+  }
+  let normalized = config;
+  for (const provider of configuredProviders(config)) {
+    const route = inference.inferenceProviderRoutes?.get(provider) ?? inference.inferenceRoute;
+    if (route && readProviderBaseUrl(config, provider) === route.baseUrl) {
+      normalized = withProviderBaseUrl(normalized, provider, route.upstream);
+    }
+  }
+  return normalized;
+}
+
 export function providerKind(name: unknown): ProviderKind | undefined {
   if (name === "Amazon Bedrock" || name === "Amazon Bedrock Runtime") {
     return undefined;
