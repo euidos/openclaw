@@ -698,6 +698,7 @@ describe("post-activation failure settlement without inference", () => {
         receipt === "migration-verified" ||
         receipt === "current-core-parked" ||
         receipt === "current-core-rollback-refused";
+      params.opts.run!.env!.OPENCLAW_PROFILE = recovered ? "work" : undefined;
       let agentVersion = receipt === "migration-verified" ? 23 : 21;
       const doctor = vi.spyOn(freshDoctor, "runUpdateFinalizationDoctorInFreshProcess");
       if (migration) {
@@ -988,9 +989,12 @@ describe("post-activation failure settlement without inference", () => {
         expect(rendered).toContain("openclaw doctor --fix");
         expect(rendered).toContain("openclaw gateway start");
       }
-      if (receipt === "settled") {
-        expect(rendered).toContain("openclaw update repair");
-        expect(report?.origin.nextAction).toContain("candidate Gateway is healthy");
+      if (recovered) {
+        expect(rendered).toContain("openclaw --profile work update repair");
+        expect(report?.origin.nextAction).toContain("installed Gateway is healthy");
+        expect(report?.origin.nextAction).toContain("running on the retained state");
+        expect(report?.origin.nextAction).toContain("openclaw --profile work gateway stop");
+        expect(report?.origin.nextAction).not.toContain("migrated state");
       }
       if (receipt === "unsettled") {
         expect(mocks.rollback).not.toHaveBeenCalled();
