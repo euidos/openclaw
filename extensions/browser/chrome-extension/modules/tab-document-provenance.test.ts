@@ -28,7 +28,7 @@ type TabDocumentProvenance = Pick<TabAccessPolicy, "forwardDocumentEvent" | "nav
 // Browser-serialized modules remain plain JavaScript. Keep test-only typing local
 // so direct owner coverage does not alter the packaged resolution topology.
 const { createTabDocumentProvenance } = await vi.importActual<{
-  createTabDocumentProvenance(options: { access: TabDocumentAccess }): TabDocumentProvenance;
+  createTabDocumentProvenance: (options: { access: TabDocumentAccess }) => TabDocumentProvenance;
 }>("./tab-document-provenance.js");
 
 const originalUrl = "https://example.com/existing";

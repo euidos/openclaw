@@ -34,6 +34,7 @@ function createHarness(
     }),
     renewTabAccess: vi.fn(() => {
       revision += 1;
+      return makeEpoch(revision);
     }),
     forwardDocumentEvent: vi.fn((event, emit) => emit(event)),
     invalidateGroup: vi.fn(() => {

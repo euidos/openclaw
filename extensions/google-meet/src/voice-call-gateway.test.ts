@@ -79,6 +79,9 @@ beforeEach(() => {
   mocks.startClient.mockReset().mockResolvedValue({
     ready: true,
     aborted: false,
+    elapsedMs: 0,
+    maxDriftMs: 0,
+    checks: 1,
   });
   mocks.autoHello = true;
   mocks.clientOptions = undefined;
@@ -182,7 +185,14 @@ it.each([
   [
     "readiness",
     "gateway event loop readiness timeout",
-    () => mocks.startClient.mockResolvedValueOnce({ ready: false, aborted: false }),
+    () =>
+      mocks.startClient.mockResolvedValueOnce({
+        ready: false,
+        aborted: false,
+        elapsedMs: 0,
+        maxDriftMs: 0,
+        checks: 1,
+      }),
     () => {},
   ],
   [

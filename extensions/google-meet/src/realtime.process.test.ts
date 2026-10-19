@@ -53,7 +53,7 @@ function createTransport(
 
 function expectSignals(child: ChildProcess, signals: NodeJS.Signals[]) {
   for (const signal of signals) {
-    expect(vi.mocked(child.kill).mock.calls.filter(([sent]) => sent === signal)).toHaveLength(1);
+    expect(vi.mocked(child).kill.mock.calls.filter(([sent]) => sent === signal)).toHaveLength(1);
   }
 }
 

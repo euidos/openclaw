@@ -203,7 +203,11 @@ describe("prepareExecApprovalPresentation", () => {
 
   it("keeps an emoji that fits within the title limit intact", () => {
     const title = `${"a".repeat(78)}\u{1F600}`;
-    const presentation = buildSystemAgentPresentation({ title, description: "d" });
+    const presentation = prepare(
+      "system-agent",
+      { title, description: "d", proposalHash: "a".repeat(64) },
+      allowedDecisions,
+    );
     expect(presentation).toMatchObject({ kind: "system-agent", title });
   });
 });

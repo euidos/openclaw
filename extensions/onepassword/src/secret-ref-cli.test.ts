@@ -3,12 +3,23 @@ import os from "node:os";
 import path from "node:path";
 import { Command } from "commander";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/plugin-entry";
-import { tryReadSecretFileSync } from "openclaw/plugin-sdk/secret-file-runtime";
+import {
+  tryReadSecretFileSync,
+  type SecretFileReadOptions,
+} from "openclaw/plugin-sdk/secret-file-runtime";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { resolveTrustedOnePasswordCli } from "../onepassword-op-path.js";
 import { registerOnePasswordSecretRefCommands } from "./secret-ref-cli.js";
 
-const readTokenFileMock = vi.hoisted(() => vi.fn<typeof tryReadSecretFileSync>());
+const readTokenFileMock = vi.hoisted(() =>
+  vi.fn<
+    (
+      filePath: string | undefined,
+      label: string,
+      options?: SecretFileReadOptions,
+    ) => string | undefined
+  >(),
+);
 const tokenFile = path.join(os.tmpdir(), "openclaw-onepassword-missing-token");
 const pluginIntegration = { pluginId: "onepassword", integrationId: "onepassword" };
 const provider = { source: "exec", pluginIntegration } as const;

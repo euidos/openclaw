@@ -76,7 +76,7 @@ function replacementAlias() {
 
 async function withoutMainThreadSql<T>(run: () => Promise<T>): Promise<T> {
   const sql = observeMainThreadSql();
-  using _ = { [Symbol.dispose]: sql.restore };
+  using _ = { [Symbol.dispose]: () => sql.restore() };
   const result = await run();
   sql.expectIdle();
   return result;

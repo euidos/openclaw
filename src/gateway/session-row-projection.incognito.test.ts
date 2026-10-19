@@ -24,7 +24,11 @@ afterEach(() => memorySessionActorOwners.reset());
 const cfg = { agents: { entries: { main: {} } } };
 const sessionScope = { agentId: "main", sessionKey: "agent:main:dashboard:incognito-test" };
 const rowQuery = { agentId: sessionScope.agentId, key: sessionScope.sessionKey };
-const baseEntry = { sessionId: "private-original", updatedAt: 1, incognito: true };
+const baseEntry = {
+  sessionId: "private-original",
+  updatedAt: 1,
+  incognito: true,
+} satisfies InternalSessionEntry;
 function writePrivate(target: SessionEntryReadScope, patch: Partial<InternalSessionEntry> = {}) {
   return sessions.replaceSessionEntry(target, { ...baseEntry, ...patch });
 }

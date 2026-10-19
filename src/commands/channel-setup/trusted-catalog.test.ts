@@ -1,13 +1,14 @@
+// Trusted channel catalog tests cover workspace shadow filtering and plugin auto-enable trust resolution.
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import { makeMeta } from "../../flows/channel-setup.test-helpers.js";
 
 const getChannelPluginCatalogEntry = vi.hoisted(() => vi.fn());
 const listRawChannelPluginCatalogEntries = vi.hoisted(() => vi.fn());
 
 vi.mock("../../channels/plugins/catalog.js", () => ({
-  getChannelPluginCatalogEntry,
-  listRawChannelPluginCatalogEntries,
+  getChannelPluginCatalogEntry: (...args: unknown[]) =>
+    getChannelPluginCatalogEntry(...(args as [string, Record<string, unknown>])),
+  listRawChannelPluginCatalogEntries: (options?: unknown) =>
+    listRawChannelPluginCatalogEntries(options),
 }));
 
 import {
@@ -38,23 +39,16 @@ function createCatalogEntry(params: {
     id: params.id,
     pluginId: params.pluginId,
     origin: params.origin,
-    meta: makeMeta(params.id, params.label, {
+    meta: {
+      id: params.id,
+      label: params.label,
+      selectionLabel: params.label,
+      docsPath: `/channels/${params.id}`,
       blurb:
         params.blurb ?? (params.origin === "bundled" ? "bundled entry" : `${params.origin} shadow`),
-    }),
+    },
     install: { localPath: params.localPath, defaultChoice: "local" },
   };
-}
-
-const load = { paths: ["/tmp/load-path-a"] };
-const context = { workspaceDir: "/tmp/workspace", cfg: { plugins: { load } } };
-
-function expectTrusted(pluginId: string, cfg: OpenClawConfig, id = "telegram") {
-  expect(getTrustedChannelPluginCatalogEntry(id, { ...context, cfg })).toMatchObject({
-    id,
-    pluginId,
-    origin: "bundled",
-  });
 }
 
 function mockCatalogFallback(params: {
@@ -84,8 +78,10 @@ function mockTelegramShadowFallback(params: {
   mockCatalogFallback({
     rejected: createCatalogEntry({
       id: "telegram",
+      pluginId: params.pluginId,
+      origin: params.origin,
       label: "Telegram Shadow",
-      ...params,
+      localPath: params.localPath,
     }),
     fallback: createCatalogEntry({
       id: "telegram",
@@ -238,7 +234,22 @@ describe("trusted-catalog load-path discovery", () => {
       }),
     });
 
-    expectTrusted("telegram", context.cfg);
+    expect(
+      getTrustedChannelPluginCatalogEntry("telegram", {
+        cfg: {
+          plugins: {
+            load: {
+              paths: ["/tmp/load-path-a"],
+            },
+          },
+        },
+        workspaceDir: "/tmp/workspace",
+      }),
+    ).toMatchObject({
+      id: "telegram",
+      pluginId: "telegram",
+      origin: "bundled",
+    });
     expect(getChannelPluginCatalogEntry).toHaveBeenNthCalledWith(2, "telegram", {
       excludePluginRefs: [{ pluginId: "telegram", origin: "config" }],
       env: undefined,
@@ -258,7 +269,18 @@ describe("trusted-catalog load-path discovery", () => {
     listRawChannelPluginCatalogEntries.mockReturnValue([rejected]);
     mockCatalogFallback({ rejected, expectedExtraPaths: ["/tmp/load-path-a"] });
 
-    expect(listSetupDiscoveryChannelPluginCatalogEntries(context)).toHaveLength(1);
+    expect(
+      listSetupDiscoveryChannelPluginCatalogEntries({
+        cfg: {
+          plugins: {
+            load: {
+              paths: ["/tmp/load-path-a"],
+            },
+          },
+        },
+        workspaceDir: "/tmp/workspace",
+      }),
+    ).toHaveLength(1);
     expect(getChannelPluginCatalogEntry).toHaveBeenNthCalledWith(1, "e2e-load-paths", {
       excludePluginRefs: [{ pluginId: "config-shadow", origin: "config" }],
       env: undefined,
@@ -270,13 +292,24 @@ describe("trusted-catalog load-path discovery", () => {
   it("falls back past a denylisted config-origin shadow even when it is explicitly allowed", () => {
     mockTeamsConfigFallback();
 
-    expectTrusted(
-      "bundled-msteams",
-      {
-        plugins: { allow: ["config-shadow"], deny: ["config-shadow"], load },
-      },
-      "msteams",
-    );
+    expect(
+      getTrustedChannelPluginCatalogEntry("msteams", {
+        cfg: {
+          plugins: {
+            allow: ["config-shadow"],
+            deny: ["config-shadow"],
+            load: {
+              paths: ["/tmp/load-path-a"],
+            },
+          },
+        },
+        workspaceDir: "/tmp/workspace",
+      }),
+    ).toMatchObject({
+      id: "msteams",
+      pluginId: "bundled-msteams",
+      origin: "bundled",
+    });
   });
 
   it("falls back past an auto-enabled config-origin shadow", () => {
@@ -286,9 +319,26 @@ describe("trusted-catalog load-path discovery", () => {
       localPath: "./plugins/telegram-shadow",
     });
 
-    expectTrusted("@openclaw/telegram", {
-      channels: { telegram: { enabled: true } },
-      plugins: { load },
+    expect(
+      getTrustedChannelPluginCatalogEntry("telegram", {
+        cfg: {
+          channels: {
+            telegram: {
+              enabled: true,
+            },
+          },
+          plugins: {
+            load: {
+              paths: ["/tmp/load-path-a"],
+            },
+          },
+        },
+        workspaceDir: "/tmp/workspace",
+      }),
+    ).toMatchObject({
+      id: "telegram",
+      pluginId: "@openclaw/telegram",
+      origin: "bundled",
     });
   });
 
@@ -322,8 +372,22 @@ describe("trusted-catalog load-path discovery", () => {
       localPath: "./workspace/telegram",
     });
 
-    expectTrusted("@openclaw/telegram", {
-      plugins: { allow: ["workspace-shadow"], entries: { "workspace-shadow": { enabled: false } } },
+    expect(
+      getTrustedChannelPluginCatalogEntry("telegram", {
+        cfg: {
+          plugins: {
+            allow: ["workspace-shadow"],
+            entries: {
+              "workspace-shadow": { enabled: false },
+            },
+          },
+        },
+        workspaceDir: "/tmp/workspace",
+      }),
+    ).toMatchObject({
+      id: "telegram",
+      pluginId: "@openclaw/telegram",
+      origin: "bundled",
     });
   });
 
