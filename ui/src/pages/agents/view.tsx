@@ -21,6 +21,7 @@ import {
 import { t } from "../../lib/reactive/i18n.ts";
 import { ReasonedDisabledControl } from "../plugins/reasoned-disabled-control.tsx";
 import type { AgentConfigActions } from "./config-actions.tsx";
+import type { AgentMemoryTarget } from "./memory/memory-panel-state.ts";
 import { AgentMemoryPanel } from "./memory/memory-panel.tsx";
 import { AgentFiles } from "./panels-files.tsx";
 import { AgentOverview } from "./panels-overview.tsx";
@@ -44,6 +45,7 @@ export type AgentsProps = {
   error: string | null;
   agentsList: AgentsListResult | null;
   selectedAgentId: string | null;
+  memoryTarget: AgentMemoryTarget;
   activePanel: AgentsPanel;
   config: Pick<
     RuntimeConfigState,
@@ -332,7 +334,7 @@ export function Agents(props: AgentsProps) {
                         onClick={() => props.onOpenMemoryImport?.()}
                       />
                     </div>
-                    <AgentMemoryPanel agentId={agent().id} />
+                    <AgentMemoryPanel initialAgentTarget={props.memoryTarget} />
                   </Match>
                 </Switch>
               </div>
