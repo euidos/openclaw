@@ -12,36 +12,36 @@ import {
   buildGatewayStatusJsonPayload,
 } from "./format.js";
 
+function row(item: string, overrides: Parameters<typeof getStatusOverviewRowValue>[1]) {
+  return expect(getStatusOverviewRowValue(item, overrides));
+}
+
 describe("status-all format", () => {
   it("formats gateway self summary consistently", () => {
-    expect(
-      getStatusOverviewRowValue("Gateway self", {
-        gatewaySelf: {
-          host: "gateway-host",
-          ip: "100.64.0.1",
-          version: "1.2.3",
-          platform: "linux",
-        },
-      }),
-    ).toBe("gateway-host (100.64.0.1) app 1.2.3 linux");
-    expect(getStatusOverviewRowValue("Gateway self", { gatewaySelf: null })).toBeUndefined();
+    row("Gateway self", {
+      gatewaySelf: {
+        host: "gateway-host",
+        ip: "100.64.0.1",
+        version: "1.2.3",
+        platform: "linux",
+      },
+    }).toBe("gateway-host (100.64.0.1) app 1.2.3 linux");
+    row("Gateway self", { gatewaySelf: null }).toBe(undefined);
   });
 
   it("builds gateway summary parts for fallback remote targets", () => {
-    expect(
-      getStatusOverviewRowValue("Gateway", {
-        gatewaySelf: null,
-        gatewayMode: "remote",
-        remoteUrlMissing: true,
-        gatewayConnection: {
-          url: "ws://127.0.0.1:18789",
-          urlSource: "missing gateway.remote.url (fallback local)",
-        },
-        gatewayReachable: false,
-        gatewayProbe: null,
-        gatewayProbeAuth: { token: "tok" },
-      }),
-    ).toBe(
+    row("Gateway", {
+      gatewaySelf: null,
+      gatewayMode: "remote",
+      remoteUrlMissing: true,
+      gatewayConnection: {
+        url: "ws://127.0.0.1:18789",
+        urlSource: "missing gateway.remote.url (fallback local)",
+      },
+      gatewayReachable: false,
+      gatewayProbe: null,
+      gatewayProbeAuth: { token: "tok" },
+    }).toBe(
       "remote (remote.url missing) · fallback ws://127.0.0.1:18789 (missing gateway.remote.url (fallback local)) · misconfigured (remote.url missing)",
     );
   });
@@ -71,20 +71,9 @@ describe("status-all format", () => {
       buildStatusUpdateSurface({
         updateConfigChannel: "stable",
         update: {
-          installKind: "git",
-          git: {
-            branch: "main",
-            tag: "v1.2.3",
-            upstream: "origin/main",
-            dirty: false,
-            behind: 2,
-            ahead: 0,
-            fetchOk: true,
-          },
-          registry: {
-            latestVersion: newerRegistryVersion,
-          },
-        } as never,
+          ...baseStatusOverviewSurface.update,
+          registry: { latestVersion: newerRegistryVersion },
+        },
       }),
     ).toEqual({
       channelInfo: baseStatusExpectedUpdateChannelInfo,
@@ -96,60 +85,37 @@ describe("status-all format", () => {
   });
 
   it("resolves dashboard urls from gateway config", () => {
-    expect(
-      getStatusOverviewRowValue("Dashboard", {
-        cfg: {
-          gateway: {
-            bind: "loopback",
-            controlUi: { enabled: true, basePath: "/ui" },
-          },
-        },
-      }),
-    ).toBe("http://127.0.0.1:18789/ui/");
-    expect(
-      getStatusOverviewRowValue("Dashboard", {
-        cfg: {
-          gateway: {
-            bind: "loopback",
-            tls: { enabled: true },
-          },
-        },
-      }),
-    ).toBe("https://127.0.0.1:18789/");
-    expect(
-      getStatusOverviewRowValue("Dashboard", {
-        cfg: {
-          gateway: {
-            controlUi: { enabled: false },
-          },
-        },
-      }),
-    ).toBe("disabled");
+    const dashboard = (
+      gateway: NonNullable<
+        NonNullable<Parameters<typeof getStatusOverviewRowValue>[1]>["cfg"]
+      >["gateway"],
+      value: string,
+    ) => row("Dashboard", { cfg: { gateway } }).toBe(value);
+    dashboard(
+      { bind: "loopback", controlUi: { enabled: true, basePath: "/ui" } },
+      "http://127.0.0.1:18789/ui/",
+    );
+    dashboard({ bind: "loopback", tls: { enabled: true } }, "https://127.0.0.1:18789/");
+    dashboard({ controlUi: { enabled: false } }, "disabled");
   });
 
   it("formats tailscale values for terse and detailed views", () => {
-    expect(
-      getStatusOverviewRowValue("Tailscale exposure", {
-        tailscaleMode: "serve",
-        tailscaleDns: "box.tail.ts.net",
-        tailscaleHttpsUrl: "https://box.tail.ts.net",
-      }),
-    ).toBe("serve · box.tail.ts.net · https://box.tail.ts.net");
-    expect(
-      getStatusOverviewRowValue("Tailscale exposure", {
-        tailscaleMode: "funnel",
-        tailscaleDns: null,
-        tailscaleHttpsUrl: null,
-        includeBackendStateWhenOn: true,
-      }),
-    ).toBe("funnel · unknown · magicdns unknown");
-    expect(
-      getStatusOverviewRowValue("Tailscale exposure", {
-        tailscaleMode: "off",
-        tailscaleDns: "box.tail.ts.net",
-        includeDnsNameWhenOff: true,
-      }),
-    ).toBe("off · box.tail.ts.net");
+    row("Tailscale exposure", {
+      tailscaleMode: "serve",
+      tailscaleDns: "box.tail.ts.net",
+      tailscaleHttpsUrl: "https://box.tail.ts.net",
+    }).toBe("serve · box.tail.ts.net · https://box.tail.ts.net");
+    row("Tailscale exposure", {
+      tailscaleMode: "funnel",
+      tailscaleDns: null,
+      tailscaleHttpsUrl: null,
+      includeBackendStateWhenOn: true,
+    }).toBe("funnel · unknown · magicdns unknown");
+    row("Tailscale exposure", {
+      tailscaleMode: "off",
+      tailscaleDns: "box.tail.ts.net",
+      includeDnsNameWhenOff: true,
+    }).toBe("off · box.tail.ts.net");
   });
 
   it("formats service values across short and detailed runtime surfaces", () => {
@@ -257,22 +223,16 @@ describe("status-all format", () => {
       urlSource: "cli --url",
     };
 
-    const summary = getStatusOverviewRowValue("Gateway", {
+    const params = {
       gatewayMode: "remote",
       remoteUrlMissing: false,
       gatewayConnection,
       gatewayReachable: false,
       gatewayProbe: { error: "unreachable" },
       gatewayProbeAuth: null,
-    });
-    const json = buildGatewayStatusJsonPayload({
-      gatewayMode: "remote",
-      gatewayConnection,
-      remoteUrlMissing: false,
-      gatewayReachable: false,
-      gatewayProbe: { error: "unreachable" },
-      gatewaySelf: null,
-    });
+    } as const;
+    const summary = getStatusOverviewRowValue("Gateway", params);
+    const json = buildGatewayStatusJsonPayload({ ...params, gatewaySelf: null });
     const output = JSON.stringify({ summary, json });
 
     expect(summary).toContain("gateway.example/ws");
@@ -382,9 +342,9 @@ describe("status-all format", () => {
         nodeOnlyGateway: {
           gatewayValue: "node → remote.example:18789 · no local gateway",
         },
-      }).filter((row) =>
+      }).filter((entry) =>
         ["Dashboard", "Gateway", "Gateway self", "Gateway service", "Node service"].includes(
-          row.Item,
+          entry.Item,
         ),
       ),
     ).toEqual([

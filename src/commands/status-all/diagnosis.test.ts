@@ -2,7 +2,6 @@
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
-import type { ProgressReporter } from "../../cli/progress.js";
 import { buildWorkspaceSkillReadiness } from "../../skills/discovery/status.js";
 import { createCanonicalFixtureSkill } from "../../skills/test-support/test-helpers.js";
 
@@ -47,26 +46,17 @@ import { appendStatusAllDiagnosis, readStatusAllLogTails } from "./diagnosis.js"
 type DiagnosisParams = Parameters<typeof appendStatusAllDiagnosis>[0];
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
-function createProgressReporter(): ProgressReporter {
-  return {
-    setLabel: () => {},
-    setPercent: () => {},
-    tick: () => {},
-    done: () => {},
-  };
-}
-
 function availableDiagnostics(value: unknown) {
   return { ok: true as const, value };
 }
 
 function createBaseParams(
-  listeners: NonNullable<DiagnosisParams["portUsage"]>["listeners"],
+  listeners: NonNullable<DiagnosisParams["portUsage"]>["listeners"] = [],
 ): DiagnosisParams {
   return {
     logTails: null,
     lines: [] as string[],
-    progress: createProgressReporter(),
+    progress: { setLabel() {}, setPercent() {}, tick() {}, done() {} },
     muted: (text: string) => text,
     ok: (text: string) => text,
     warn: (text: string) => text,
@@ -94,6 +84,34 @@ function createBaseParams(
   };
 }
 
+function diagnose(overrides: Partial<DiagnosisParams> = {}) {
+  const params = { ...createBaseParams(), ...overrides };
+  appendStatusAllDiagnosis(params);
+  return params.lines.join("\n");
+}
+
+function deliveryParams(
+  [received, started, completed, turns, processed]: [number, number, number, number, number],
+  type: string,
+  ageMs: number,
+) {
+  const params = createBaseParams();
+  params.gatewayReachable = true;
+  params.deliveryDiagnostics = availableDiagnostics({
+    summary: {
+      byType: {
+        "message.received": received,
+        "message.dispatch.started": started,
+        "message.dispatch.completed": completed,
+        "session.turn.created": turns,
+        "message.processed": processed,
+      },
+    },
+    events: [{ type, ts: Date.now() - ageMs }],
+  });
+  return params;
+}
+
 describe("status-all diagnosis port checks", () => {
   beforeEach(() => {
     restartLogMocks.resolveGatewayLogPaths.mockImplementation(() => {
@@ -108,7 +126,7 @@ describe("status-all diagnosis port checks", () => {
   });
 
   it("keeps first config issue locations and exact pairs before applying the display cap", () => {
-    const params = createBaseParams([]);
+    const params = createBaseParams();
     const first = { path: "a", message: "b:c", sourceFile: "legacy.json", line: 7 };
     const repeated = { ...first, sourceFile: "current.json", line: 9 };
     params.snap = {
@@ -158,7 +176,7 @@ describe("status-all diagnosis port checks", () => {
   ] as const)("reports skill readiness for $state", ({ state, eligible, missing }) => {
     const workspaceDir = tempDirs.make("openclaw-status-skills-");
     const baseDir = path.join(workspaceDir, "skills", "fixture");
-    const params = createBaseParams([]);
+    const params = createBaseParams();
     params.skillReadiness = buildWorkspaceSkillReadiness(workspaceDir, {
       managedSkillsDir: path.join(workspaceDir, "managed"),
       agentId: "qa",
@@ -197,7 +215,7 @@ describe("status-all diagnosis port checks", () => {
   });
 
   it("retains queue warnings from a successful gateway health snapshot", () => {
-    const params = createBaseParams([]);
+    const params = createBaseParams();
     params.health = {
       ok: true,
       ts: 0,
@@ -225,9 +243,7 @@ describe("status-all diagnosis port checks", () => {
       },
     };
 
-    appendStatusAllDiagnosis(params);
-
-    const output = params.lines.join("\n");
+    const output = diagnose(params);
     expect(output).toContain("Delivery queue: warning");
     expect(output).toContain("outbound: 2");
     expect(output).toContain(
@@ -236,33 +252,19 @@ describe("status-all diagnosis port checks", () => {
   });
 
   it("keeps a failed health request visible in the complete report", () => {
-    const params = createBaseParams([]);
-    params.health = { error: "health request timed out" };
-
-    appendStatusAllDiagnosis(params);
-
-    const output = params.lines.join("\n");
+    const output = diagnose({ health: { error: "health request timed out" } });
     expect(output).toContain("Gateway health:\n  health request timed out");
     expect(output).toContain("Pasteable debug report. Auth tokens redacted.");
   });
 
   it("keeps DNS context while daemon state remains unobserved", () => {
-    const params = createBaseParams([]);
-    params.tailscaleDns = "box.tail.ts.net";
-
-    appendStatusAllDiagnosis(params);
-
-    const output = params.lines.join("\n");
+    const output = diagnose({ tailscaleDns: "box.tail.ts.net" });
     expect(output).toContain("✓ Tailscale exposure: off · daemon unknown · box.tail.ts.net");
     expect(output).not.toContain("Tailscale: off");
   });
 
   it("does not warn about an unavailable Tailscale daemon when exposure is disabled", () => {
-    const params = createBaseParams([]);
-
-    appendStatusAllDiagnosis(params);
-
-    expect(params.lines.join("\n")).toContain("✓ Tailscale exposure: off · daemon unknown");
+    expect(diagnose()).toContain("✓ Tailscale exposure: off · daemon unknown");
   });
 
   it("treats same-process dual-stack loopback listeners as healthy", () => {
@@ -271,9 +273,7 @@ describe("status-all diagnosis port checks", () => {
       { pid: 5001, commandLine: "openclaw-gateway", address: "[::1]:18789" },
     ]);
 
-    appendStatusAllDiagnosis(params);
-
-    const output = params.lines.join("\n");
+    const output = diagnose(params);
     expect(output).toContain("✓ Port 18789");
     expect(output).toContain("Detected dual-stack loopback listeners");
     expect(output).not.toContain("Port 18789 is already in use.");
@@ -284,9 +284,7 @@ describe("status-all diagnosis port checks", () => {
       { pid: 5001, commandLine: "openclaw-gateway", address: "0.0.0.0:18789" },
     ]);
 
-    appendStatusAllDiagnosis(params);
-
-    const output = params.lines.join("\n");
+    const output = diagnose(params);
     expect(output).toContain("✓ Port 18789");
     expect(output).toContain("Detected OpenClaw Gateway listener on the configured port.");
     expect(output).not.toContain("Port 18789 is already in use.");
@@ -298,9 +296,7 @@ describe("status-all diagnosis port checks", () => {
       { pid: 5002, commandLine: "openclaw-gateway", address: "[::1]:18789" },
     ]);
 
-    appendStatusAllDiagnosis(params);
-
-    const output = params.lines.join("\n");
+    const output = diagnose(params);
     expect(output).toContain("! Port 18789");
     expect(output).toContain("2 OpenClaw gateway processes appear to be listening on port 18789");
     expect(output).toContain("Port 18789 is already in use.");
@@ -312,9 +308,7 @@ describe("status-all diagnosis port checks", () => {
     ]);
     params.portUsage!.status = "unknown";
 
-    appendStatusAllDiagnosis(params);
-
-    const output = params.lines.join("\n");
+    const output = diagnose(params);
     expect(output).toContain("! Port 18789");
     expect(output).toContain("Port 18789 availability could not be determined.");
     expect(output).not.toContain("Detected OpenClaw Gateway listener");
@@ -336,7 +330,7 @@ describe("status-all diagnosis port checks", () => {
   ] as const)(
     "includes the shared update report for $status sentinels",
     ({ status, reason, headline, hint }) => {
-      const params = createBaseParams([]);
+      const params = createBaseParams();
       params.sentinel = {
         payload: {
           kind: "update",
@@ -345,8 +339,7 @@ describe("status-all diagnosis port checks", () => {
           stats: { mode: "npm", reason, steps: [] },
         },
       };
-      appendStatusAllDiagnosis(params);
-      const output = params.lines.join("\n");
+      const output = diagnose(params);
       expect(output).toContain(`Update restart: ${headline}`);
       expect(output).toContain(hint);
       expect(output).not.toContain("run openclaw gateway restart");
@@ -354,58 +347,37 @@ describe("status-all diagnosis port checks", () => {
   );
 
   it("emits a soft warning when no agent sessions were active in the last 30m", () => {
-    const params = createBaseParams([]);
-    params.agentStatus = {
-      totalSessions: 2,
-      agents: [
-        { id: "main", lastActiveAgeMs: 31 * 60_000 },
-        { id: "worker", lastActiveAgeMs: null },
-      ],
-    };
-
-    appendStatusAllDiagnosis(params);
-
-    const output = params.lines.join("\n");
+    const output = diagnose({
+      agentStatus: {
+        totalSessions: 2,
+        agents: [
+          { id: "main", lastActiveAgeMs: 31 * 60_000 },
+          { id: "worker", lastActiveAgeMs: null },
+        ],
+      },
+    });
     expect(output).toContain("! Agent activity: 0 active in 30m · 2 sessions");
     expect(output).toContain("verify inbound dispatch and turn creation");
   });
 
   it("keeps agent activity healthy when a session was recently updated", () => {
-    const params = createBaseParams([]);
-    params.agentStatus = {
-      totalSessions: 2,
-      agents: [
-        { id: "main", lastActiveAgeMs: 5 * 60_000 },
-        { id: "worker", lastActiveAgeMs: 45 * 60_000 },
-      ],
-    };
-
-    appendStatusAllDiagnosis(params);
-
-    const output = params.lines.join("\n");
+    const output = diagnose({
+      agentStatus: {
+        totalSessions: 2,
+        agents: [
+          { id: "main", lastActiveAgeMs: 5 * 60_000 },
+          { id: "worker", lastActiveAgeMs: 45 * 60_000 },
+        ],
+      },
+    });
     expect(output).toContain("✓ Agent activity: 1 active in 30m · 2 sessions");
     expect(output).not.toContain("verify inbound dispatch and turn creation");
   });
 
   it("summarizes inbound delivery telemetry proof counters", () => {
-    const params = createBaseParams([]);
-    params.gatewayReachable = true;
-    params.deliveryDiagnostics = availableDiagnostics({
-      summary: {
-        byType: {
-          "message.received": 2,
-          "message.dispatch.started": 2,
-          "message.dispatch.completed": 2,
-          "session.turn.created": 2,
-          "message.processed": 2,
-        },
-      },
-      events: [{ type: "session.turn.created", ts: Date.now() - 60_000 }],
-    });
+    const params = deliveryParams([2, 2, 2, 2, 2], "session.turn.created", 60_000);
 
-    appendStatusAllDiagnosis(params);
-
-    const output = params.lines.join("\n");
+    const output = diagnose(params);
     expect(output).toContain(
       "✓ Inbound delivery telemetry: received 2 · dispatch 2/2 · turns 2 · processed 2",
     );
@@ -413,7 +385,7 @@ describe("status-all diagnosis port checks", () => {
   });
 
   it("renders the shared redacted telemetry exporter summary", () => {
-    const params = createBaseParams([]);
+    const params = createBaseParams();
     params.exporterDiagnostics = availableDiagnostics({
       events: [
         {
@@ -432,9 +404,7 @@ describe("status-all diagnosis port checks", () => {
       ],
     });
 
-    appendStatusAllDiagnosis(params);
-
-    const output = params.lines.join("\n");
+    const output = diagnose(params);
     expect(output).toContain("! Telemetry exporters");
     expect(output).toContain(
       "diagnostics-otel · traces · failed · OTLP/HTTP protobuf (explicit endpoint) · export failed",
@@ -445,7 +415,7 @@ describe("status-all diagnosis port checks", () => {
   });
 
   it("renders failed diagnostics as unavailable instead of empty", () => {
-    const params = createBaseParams([]);
+    const params = createBaseParams();
     params.gatewayReachable = true;
     const failedProbe = {
       ok: false as const,
@@ -455,9 +425,7 @@ describe("status-all diagnosis port checks", () => {
     params.deliveryDiagnostics = failedProbe;
     params.exporterDiagnostics = failedProbe;
 
-    appendStatusAllDiagnosis(params);
-
-    const output = params.lines.join("\n");
+    const output = diagnose(params);
     expect(output).toContain("! Telemetry exporters: unavailable");
     expect(output).toContain(
       "Exporter diagnostics failed: Error: diagnostics probe timed out at wss://***:***@gateway.example/socket?token=***",
@@ -475,24 +443,9 @@ describe("status-all diagnosis port checks", () => {
   });
 
   it("keeps handled terminal delivery paths healthy without dispatch starts", () => {
-    const params = createBaseParams([]);
-    params.gatewayReachable = true;
-    params.deliveryDiagnostics = availableDiagnostics({
-      summary: {
-        byType: {
-          "message.received": 1,
-          "message.dispatch.started": 0,
-          "message.dispatch.completed": 0,
-          "session.turn.created": 0,
-          "message.processed": 1,
-        },
-      },
-      events: [{ type: "message.processed", ts: Date.now() - 30_000 }],
-    });
+    const params = deliveryParams([1, 0, 0, 0, 1], "message.processed", 30_000);
 
-    appendStatusAllDiagnosis(params);
-
-    const output = params.lines.join("\n");
+    const output = diagnose(params);
     expect(output).toContain(
       "✓ Inbound delivery telemetry: received 1 · dispatch 0/0 · turns 0 · processed 1",
     );
@@ -500,24 +453,9 @@ describe("status-all diagnosis port checks", () => {
   });
 
   it("keeps handled terminal dispatches healthy without agent turns", () => {
-    const params = createBaseParams([]);
-    params.gatewayReachable = true;
-    params.deliveryDiagnostics = availableDiagnostics({
-      summary: {
-        byType: {
-          "message.received": 1,
-          "message.dispatch.started": 1,
-          "message.dispatch.completed": 1,
-          "session.turn.created": 0,
-          "message.processed": 1,
-        },
-      },
-      events: [{ type: "message.processed", ts: Date.now() - 30_000 }],
-    });
+    const params = deliveryParams([1, 1, 1, 0, 1], "message.processed", 30_000);
 
-    appendStatusAllDiagnosis(params);
-
-    const output = params.lines.join("\n");
+    const output = diagnose(params);
     expect(output).toContain(
       "✓ Inbound delivery telemetry: received 1 · dispatch 1/1 · turns 0 · processed 1",
     );
@@ -525,24 +463,9 @@ describe("status-all diagnosis port checks", () => {
   });
 
   it("warns when received messages never reach agent turn creation", () => {
-    const params = createBaseParams([]);
-    params.gatewayReachable = true;
-    params.deliveryDiagnostics = availableDiagnostics({
-      summary: {
-        byType: {
-          "message.received": 3,
-          "message.dispatch.started": 3,
-          "message.dispatch.completed": 1,
-          "session.turn.created": 0,
-          "message.processed": 1,
-        },
-      },
-      events: [{ type: "message.dispatch.started", ts: Date.now() - 120_000 }],
-    });
+    const params = deliveryParams([3, 3, 1, 0, 1], "message.dispatch.started", 120_000);
 
-    appendStatusAllDiagnosis(params);
-
-    const output = params.lines.join("\n");
+    const output = diagnose(params);
     expect(output).toContain(
       "! Inbound delivery telemetry: received 3 · dispatch 3/1 · turns 0 · processed 1",
     );
@@ -551,7 +474,7 @@ describe("status-all diagnosis port checks", () => {
   });
 
   it("avoids unreachable gateway diagnosis in node-only mode", () => {
-    const params = createBaseParams([]);
+    const params = createBaseParams();
     params.connectionDetailsForReport = [
       "Node-only mode detected",
       "Local gateway: not expected on this machine",
@@ -576,9 +499,7 @@ describe("status-all diagnosis port checks", () => {
     params.deliveryDiagnostics = failedProbe;
     params.exporterDiagnostics = failedProbe;
 
-    appendStatusAllDiagnosis(params);
-
-    const output = params.lines.join("\n");
+    const output = diagnose(params);
     expect(output).toContain("Node-only mode detected");
     expect(output).toContain(
       "Channel issues skipped (node-only mode; query gateway.example.com:19000)",
@@ -591,11 +512,7 @@ describe("status-all diagnosis port checks", () => {
   });
 
   it("preserves startup phase in channel diagnosis", () => {
-    const params = createBaseParams([]);
-    params.gatewayStartupPhase = "plugins";
-    appendStatusAllDiagnosis(params);
-
-    const output = params.lines.join("\n");
+    const output = diagnose({ gatewayStartupPhase: "plugins" });
     expect(output).toContain("Channel issues skipped (gateway still starting (phase plugins))");
     expect(output).not.toContain("gateway unreachable");
     expect(output).not.toContain("Gateway health:");
@@ -622,12 +539,10 @@ describe("status-all diagnosis port checks", () => {
         }
         return [];
       });
-      const params = createBaseParams([]);
+      const params = createBaseParams();
       params.logTails = await readStatusAllLogTails();
 
-      appendStatusAllDiagnosis(params);
-
-      const output = params.lines.join("\n");
+      const output = diagnose(params);
       expect(gatewayMocks.readFileTailLines).not.toHaveBeenCalledWith(
         "/Users/test/Library/Logs/openclaw/gateway.err.log",
         40,

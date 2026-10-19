@@ -147,22 +147,41 @@ vi.mock("../../daemon/restart-logs.js", () => ({
 import { statusAllCommand } from "../status-all.js";
 import * as statusDiagnosis from "./diagnosis.js";
 
+const localGatewaySnapshot = {
+  gatewayReachable: false,
+  gatewayProbe: null,
+  gatewayCallOverrides: undefined,
+  gatewayConnection: {},
+  remoteUrlMissing: false,
+};
+function localOverview() {
+  return {
+    cfg: {},
+    gatewaySnapshot: { ...localGatewaySnapshot },
+    secretDiagnostics: [],
+    tailscaleMode: "off",
+    tailscaleDns: null,
+    agentStatus: { agents: [], defaultId: null },
+    channels: { rows: [], details: [] },
+    channelIssues: [],
+    osSummary: { label: "test" },
+  };
+}
+
 async function runStatusAllReport(params: {
   overview: Awaited<ReturnType<typeof collectStatusScanOverview>>;
-  daemon: Awaited<ReturnType<typeof resolveStatusServiceSummaries>>[0];
-  nodeService: Awaited<ReturnType<typeof resolveStatusServiceSummaries>>[1];
-  nodeOnlyGateway: Awaited<ReturnType<typeof resolveNodeOnlyGatewayInfo>>;
-  timeoutMs?: number;
-  gatewayProbeDeadlineMs: number;
+  daemon?: Awaited<ReturnType<typeof resolveStatusServiceSummaries>>[0];
+  nodeService?: Awaited<ReturnType<typeof resolveStatusServiceSummaries>>[1];
+  nodeOnlyGateway?: Awaited<ReturnType<typeof resolveNodeOnlyGatewayInfo>>;
 }) {
   mocks.collectStatusScanOverview.mockResolvedValueOnce(params.overview);
-  mocks.resolveStatusServiceSummaries.mockResolvedValueOnce([params.daemon, params.nodeService]);
-  mocks.resolveNodeOnlyGatewayInfo.mockResolvedValueOnce(params.nodeOnlyGateway);
+  mocks.resolveStatusServiceSummaries.mockResolvedValueOnce([
+    params.daemon ?? {},
+    params.nodeService ?? {},
+  ]);
+  mocks.resolveNodeOnlyGatewayInfo.mockResolvedValueOnce(params.nodeOnlyGateway ?? null);
   const log = vi.fn();
-  await statusAllCommand(
-    { log, error: vi.fn(), exit: vi.fn() },
-    { timeoutMs: params.timeoutMs, gatewayProbeDeadlineMs: params.gatewayProbeDeadlineMs },
-  );
+  await statusAllCommand({ log, error: vi.fn(), exit: vi.fn() }, createStatusGatewayProbeBudget());
   expect(log).toHaveBeenCalledOnce();
   return stripAnsi(String(log.mock.calls[0]?.[0])).split("\n");
 }
@@ -277,10 +296,9 @@ describe("statusAllCommand local diagnosis", () => {
         });
       }
       const report = await runStatusAllReport({
-        ...createStatusGatewayProbeBudget(),
         overview: {
           ...baseStatusOverviewSurface,
-          cfg: {},
+          ...localOverview(),
           update: {
             ...baseStatusOverviewSurface.update,
             registry: { latestVersion: "9999.1.1" },
@@ -296,17 +314,10 @@ describe("statusAllCommand local diagnosis", () => {
             remoteUrlMissing: false,
             localGatewayHealthy: history === "failed-healthy",
           },
-          secretDiagnostics: [],
-          tailscaleMode: "off",
-          tailscaleDns: null,
           agentStatus: { agents: [], defaultId: null, totalSessions: 0, bootstrapPendingCount: 0 },
-          channels: { rows: [], details: [] },
-          channelIssues: [],
-          osSummary: { label: "test" },
         } as never,
         daemon: baseStatusOverviewSurface.gatewayService as never,
         nodeService: baseStatusOverviewSurface.nodeService as never,
-        nodeOnlyGateway: null,
       });
 
       expect(report.find((line) => line.startsWith("Update: "))).toContain("npm update 9999.1.1");
@@ -348,28 +359,15 @@ describe("statusAllCommand local diagnosis", () => {
     "collects stability projections only after readiness (starting: %s)",
     async (starting) => {
       const report = await runStatusAllReport({
-        ...createStatusGatewayProbeBudget(),
         overview: {
-          cfg: {},
+          ...localOverview(),
           gatewaySnapshot: {
+            ...localGatewaySnapshot,
             gatewayReachable: !starting,
             gatewayProbe: { error: null, ...(starting ? { startupPhase: "plugins" } : {}) },
-            gatewayCallOverrides: undefined,
-            gatewayConnection: {},
-            remoteUrlMissing: false,
           },
-          secretDiagnostics: [],
-          tailscaleMode: "off",
-          tailscaleDns: null,
-          agentStatus: { agents: [], defaultId: null },
-          channels: { rows: [], details: [] },
-          channelIssues: [],
           runtimeDegradation: { degradedSecretOwners: [], degradedPlugins: [] },
-          osSummary: { label: "test" },
         } as never,
-        daemon: {} as never,
-        nodeService: {} as never,
-        nodeOnlyGateway: null,
       });
 
       if (starting) {
@@ -435,8 +433,8 @@ describe("statusAllCommand local diagnosis", () => {
     );
     mocks.buildWorkspaceSkillReadiness.mockImplementation(actual.buildWorkspaceSkillReadiness);
     const params = {
-      ...createStatusGatewayProbeBudget(),
       overview: {
+        ...localOverview(),
         cfg: {
           plugins: { enabled: false },
           skills: { allowBundled: ["other"], entries: { disabled: { enabled: false } } },
@@ -449,16 +447,6 @@ describe("statusAllCommand local diagnosis", () => {
             },
           },
         },
-        gatewaySnapshot: {
-          gatewayReachable: false,
-          gatewayProbe: null,
-          gatewayCallOverrides: undefined,
-          gatewayConnection: {},
-          remoteUrlMissing: false,
-        },
-        secretDiagnostics: [],
-        tailscaleMode: "off",
-        tailscaleDns: null,
         agentStatus: {
           agents: [
             {
@@ -478,13 +466,7 @@ describe("statusAllCommand local diagnosis", () => {
           totalSessions: 0,
           bootstrapPendingCount: 0,
         },
-        channels: { rows: [], details: [] },
-        channelIssues: [],
-        osSummary: { label: "test" },
       } as never,
-      daemon: {} as never,
-      nodeService: {} as never,
-      nodeOnlyGateway: null,
     };
     await withEnvAsync(
       { OPENCLAW_BUNDLED_SKILLS_DIR: bundledDir, PATH: binDir, PATHEXT: ".CMD" },
@@ -524,8 +506,8 @@ describe("statusAllCommand local diagnosis", () => {
 
   it("does not inspect the first workspace when an explicit fleet has no owner", async () => {
     await runStatusAllReport({
-      ...createStatusGatewayProbeBudget(),
       overview: {
+        ...localOverview(),
         cfg: {
           agents: {
             ownership: "explicit",
@@ -535,16 +517,6 @@ describe("statusAllCommand local diagnosis", () => {
             },
           },
         },
-        gatewaySnapshot: {
-          gatewayReachable: false,
-          gatewayProbe: null,
-          gatewayCallOverrides: undefined,
-          gatewayConnection: {},
-          remoteUrlMissing: false,
-        },
-        secretDiagnostics: [],
-        tailscaleMode: "off",
-        tailscaleDns: null,
         agentStatus: {
           agents: [
             { id: "alpha", workspaceDir: "/tmp/alpha" },
@@ -552,12 +524,7 @@ describe("statusAllCommand local diagnosis", () => {
           ],
           defaultId: null,
         },
-        channels: { rows: [], details: [] },
-        channelIssues: [],
-        osSummary: { label: "test" },
       } as never,
-      daemon: {} as never,
-      nodeService: {} as never,
       nodeOnlyGateway: {} as never,
     });
 
@@ -599,10 +566,8 @@ describe("statusAllCommand local diagnosis", () => {
       runtimeShort: "not loaded",
     } satisfies Awaited<ReturnType<typeof resolveStatusServiceSummaries>>[0];
     const lines = await runStatusAllReport({
-      ...createStatusGatewayProbeBudget(),
       daemon: service,
       nodeService: service,
-      nodeOnlyGateway: null,
       overview: {
         ...scan,
         coldStart: false,
