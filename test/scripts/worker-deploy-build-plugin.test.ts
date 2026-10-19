@@ -175,15 +175,12 @@ export { loadActivatedBundledPluginPublicSurfaceModuleSync, listImportedBundledP
 export { setRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
 export { getFsSafeNativeConfig } from "@openclaw/fs-safe/config";
 export { getNativeFallbackDiagnostic } from ${JSON.stringify(pathToFileURL(fs.realpathSync(path.resolve("node_modules/@openclaw/fs-safe/dist/native.js"))).href)};
-<<<<<<< HEAD
 import { readOwnerAndDaclBatch as readBatch } from "@openclaw/fs-safe/permissions";
 export function readOwnerAndDaclBatch(paths: readonly string[]) {
   return readBatch(paths);
-}`;
-=======
-export { inspectDarwinAcl, readOwnerAndDaclBatch } from "@openclaw/fs-safe/permissions";
+}
+export { inspectDarwinAcl } from "@openclaw/fs-safe/permissions";
 export { loadOrCreateDeviceIdentity } from "../infra/device-identity.js";`;
->>>>>>> bcce65fbb93 (feat(state): local client credential cutover (R0 PR1b))
               }
               if (id === highlightSource) {
                 return `globalThis[Symbol.for("worker-highlight-initializations")] = (globalThis[Symbol.for("worker-highlight-initializations")] ?? 0) + 1;\n${code}`;
