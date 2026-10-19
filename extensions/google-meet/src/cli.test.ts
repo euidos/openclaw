@@ -1,4 +1,4 @@
-import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { GoogleMeetRuntime } from "./runtime.js";
 import {
   captureStdout,
@@ -9,8 +9,27 @@ import {
   setupCli,
 } from "./test-support/cli-harness.js";
 
+const doctorSession = {
+  id: "meet_1",
+  url: "https://meet.google.com/abc-defg-hij",
+  state: "active",
+  transport: "chrome-node",
+  mode: "agent",
+  agentId: "main",
+  participantIdentity: "signed-in Google Chrome profile on a paired node",
+  createdAt: "2026-04-25T00:00:00.000Z",
+  updatedAt: "2026-04-25T00:00:01.000Z",
+  realtime: { enabled: true, provider: "openai", toolPolicy: "safe-read-only" },
+  notes: [],
+} satisfies NonNullable<Awaited<ReturnType<GoogleMeetRuntime["status"]>>["session"]>;
+
 describe("google-meet CLI", () => {
+  let stdout: ReturnType<typeof captureStdout>;
+  beforeEach(() => {
+    stdout = captureStdout();
+  });
   afterEach(() => {
+    stdout.restore();
     vi.unstubAllGlobals();
   });
 
@@ -29,147 +48,111 @@ describe("google-meet CLI", () => {
         connectionDetails: { url: "ws://127.0.0.1:18789" },
       });
     });
-    const stdout = captureStdout();
-    try {
-      await setupCli({
-        runtime: { status },
-        callGatewayFromCli,
-      }).parseAsync(["googlemeet", "doctor", "meet_missing", ...(json ? ["--json"] : [])], {
-        from: "user",
-      });
-      if (json) {
-        expect(parseStdoutJson(stdout)).toEqual({ found: false });
-      } else {
-        expect(stdout.output()).toBe("Google Meet session: not found\n");
-      }
-      expect(callGatewayFromCli.mock.calls).toEqual([
-        [
-          "googlemeet.status",
-          { json: true, timeout: "5000" },
-          { sessionId: "meet_missing" },
-          { progress: false },
-        ],
-      ]);
-      expect(status.mock.calls).toEqual([["meet_missing"]]);
-    } finally {
-      stdout.restore();
+    await setupCli({
+      runtime: { status },
+      callGatewayFromCli,
+    }).parseAsync(["googlemeet", "doctor", "meet_missing", ...(json ? ["--json"] : [])], {
+      from: "user",
+    });
+    if (json) {
+      expect(parseStdoutJson(stdout)).toEqual({ found: false });
+    } else {
+      expect(stdout.output()).toBe("Google Meet session: not found\n");
     }
+    expect(callGatewayFromCli.mock.calls).toEqual([
+      [
+        "googlemeet.status",
+        { json: true, timeout: "5000" },
+        { sessionId: "meet_missing" },
+        { progress: false },
+      ],
+    ]);
+    expect(status.mock.calls).toEqual([["meet_missing"]]);
   });
 
   it("preserves the original gateway doctor error without output", async () => {
     const error = new Error("gateway failed");
-    const stdout = captureStdout();
-    try {
-      await expect(
-        setupCli({
-          runtime: { status: vi.fn().mockRejectedValue(error) },
-          callGatewayFromCli: vi.fn().mockRejectedValue(error),
-        }).parseAsync(["googlemeet", "doctor", "meet_missing"], { from: "user" }),
-      ).rejects.toBe(error);
-      expect(stdout.output()).toBe("");
-    } finally {
-      stdout.restore();
-    }
+    await expect(
+      setupCli({
+        runtime: { status: vi.fn().mockRejectedValue(error) },
+        callGatewayFromCli: vi.fn().mockRejectedValue(error),
+      }).parseAsync(["googlemeet", "doctor", "meet_missing"], { from: "user" }),
+    ).rejects.toBe(error);
+    expect(stdout.output()).toBe("");
   });
 
   it("prints human-readable session doctor output", async () => {
-    const stdout = captureStdout();
-    try {
-      await setupCli({
-        runtime: {
-          status: async () => ({
-            found: true,
-            session: {
-              id: "meet_1",
-              url: "https://meet.google.com/abc-defg-hij",
-              state: "active",
-              transport: "chrome-node",
-              mode: "agent",
-              agentId: "main",
-              participantIdentity: "signed-in Google Chrome profile on a paired node",
-              createdAt: "2026-04-25T00:00:00.000Z",
-              updatedAt: "2026-04-25T00:00:01.000Z",
-              realtime: { enabled: true, provider: "openai", toolPolicy: "safe-read-only" },
-              chrome: {
-                audioBackend: "blackhole-2ch",
-                launched: true,
-                nodeId: "node-1",
-                audioBridge: { type: "node-command-pair", provider: "openai" },
-                health: {
-                  inCall: true,
-                  captioning: true,
-                  transcriptLines: 2,
-                  lastCaptionAt: "2026-04-25T00:00:03.000Z",
-                  lastCaptionSpeaker: "Alice",
-                  lastCaptionText: "Can everyone hear OpenClaw?",
-                  providerConnected: true,
-                  realtimeReady: true,
-                  audioInputActive: true,
-                  audioOutputActive: false,
-                  lastInputAt: "2026-04-25T00:00:02.000Z",
-                  lastInputBytes: 160,
-                  lastOutputBytes: 0,
-                },
+    await setupCli({
+      runtime: {
+        status: async () => ({
+          found: true,
+          session: {
+            ...doctorSession,
+            chrome: {
+              audioBackend: "blackhole-2ch",
+              launched: true,
+              nodeId: "node-1",
+              audioBridge: { type: "node-command-pair", provider: "openai" },
+              health: {
+                inCall: true,
+                captioning: true,
+                transcriptLines: 2,
+                lastCaptionAt: "2026-04-25T00:00:03.000Z",
+                lastCaptionSpeaker: "Alice",
+                lastCaptionText: "Can everyone hear OpenClaw?",
+                providerConnected: true,
+                realtimeReady: true,
+                audioInputActive: true,
+                audioOutputActive: false,
+                lastInputAt: "2026-04-25T00:00:02.000Z",
+                lastInputBytes: 160,
+                lastOutputBytes: 0,
               },
-              notes: [],
             },
-          }),
-        },
-      }).parseAsync(["googlemeet", "doctor", "meet_1"], { from: "user" });
-      expect(stdout.output()).toContain("session: meet_1");
-      expect(stdout.output()).toContain("node: node-1");
-      expect(stdout.output()).toContain("provider connected: yes");
-      expect(stdout.output()).toContain("captioning: yes");
-      expect(stdout.output()).toContain("transcript lines: 2");
-      expect(stdout.output()).toContain("last caption text: Alice: Can everyone hear OpenClaw?");
-      expect(stdout.output()).toContain("audio input active: yes");
-      expect(stdout.output()).toContain("audio output active: no");
-    } finally {
-      stdout.restore();
-    }
+            notes: [],
+          },
+        }),
+      },
+    }).parseAsync(["googlemeet", "doctor", "meet_1"], { from: "user" });
+    expect(stdout.output()).toContain("session: meet_1");
+    expect(stdout.output()).toContain("node: node-1");
+    expect(stdout.output()).toContain("provider connected: yes");
+    expect(stdout.output()).toContain("captioning: yes");
+    expect(stdout.output()).toContain("transcript lines: 2");
+    expect(stdout.output()).toContain("last caption text: Alice: Can everyone hear OpenClaw?");
+    expect(stdout.output()).toContain("audio input active: yes");
+    expect(stdout.output()).toContain("audio output active: no");
   });
 
   it("prints Twilio session doctor output", async () => {
-    const stdout = captureStdout();
-    try {
-      await setupCli({
-        runtime: {
-          status: async () => ({
-            found: true,
-            session: {
-              id: "meet_1",
-              url: "https://meet.google.com/abc-defg-hij",
-              state: "active",
-              transport: "twilio",
-              mode: "agent",
-              agentId: "main",
-              participantIdentity: "Twilio phone participant",
-              createdAt: "2026-04-25T00:00:00.000Z",
-              updatedAt: "2026-04-25T00:00:01.000Z",
-              realtime: { enabled: true, provider: "openai", toolPolicy: "safe-read-only" },
-              twilio: {
-                dialInNumber: "+15551234567",
-                pinProvided: true,
-                dtmfSequence: "ww123456#",
-                voiceCallId: "call-1",
-                dtmfSent: true,
-                introSent: true,
-              },
-              notes: [],
+    await setupCli({
+      runtime: {
+        status: async () => ({
+          found: true,
+          session: {
+            ...doctorSession,
+            transport: "twilio",
+            participantIdentity: "Twilio phone participant",
+            twilio: {
+              dialInNumber: "+15551234567",
+              pinProvided: true,
+              dtmfSequence: "ww123456#",
+              voiceCallId: "call-1",
+              dtmfSent: true,
+              introSent: true,
             },
-          }),
-        },
-      }).parseAsync(["googlemeet", "doctor", "meet_1"], { from: "user" });
-      expect(stdout.output()).toContain("session: meet_1");
-      expect(stdout.output()).toContain("transport: twilio");
-      expect(stdout.output()).toContain("twilio dial-in: +15551234567");
-      expect(stdout.output()).toContain("voice call id: call-1");
-      expect(stdout.output()).toContain("dtmf sent: yes");
-      expect(stdout.output()).toContain("intro sent: yes");
-      expect(stdout.output()).not.toContain("audio input active:");
-    } finally {
-      stdout.restore();
-    }
+            notes: [],
+          },
+        }),
+      },
+    }).parseAsync(["googlemeet", "doctor", "meet_1"], { from: "user" });
+    expect(stdout.output()).toContain("session: meet_1");
+    expect(stdout.output()).toContain("transport: twilio");
+    expect(stdout.output()).toContain("twilio dial-in: +15551234567");
+    expect(stdout.output()).toContain("voice call id: call-1");
+    expect(stdout.output()).toContain("dtmf sent: yes");
+    expect(stdout.output()).toContain("intro sent: yes");
+    expect(stdout.output()).not.toContain("audio input active:");
   });
 
   it("can prove Google Meet API create access", async () => {
@@ -191,78 +174,67 @@ describe("google-meet CLI", () => {
       return new Response("not found", { status: 404 });
     });
     vi.stubGlobal("fetch", fetchMock);
-    const stdout = captureStdout();
-
-    try {
-      await setupCli({
-        config: {
-          oauth: {
-            clientId: "client-id",
-            clientSecret: "client-secret",
-            refreshToken: "rt-secret",
-          },
+    await setupCli({
+      config: {
+        oauth: {
+          clientId: "client-id",
+          clientSecret: "client-secret",
+          refreshToken: "rt-secret",
         },
-      }).parseAsync(["googlemeet", "doctor", "--oauth", "--create-space", "--json"], {
-        from: "user",
-      });
-      const output = stdout.output();
-      expect(output).not.toContain("new-access-token");
-      expect(output).not.toContain("rt-secret");
-      expect(output).not.toContain("client-secret");
-      const payload = parseStdoutJson(stdout);
-      expectFields(payload, {
-        ok: true,
-        tokenSource: "refresh-token",
-        createdSpace: "spaces/new-space",
-        meetingUri: "https://meet.google.com/new-abcd-xyz",
-      });
-      const checks = payload.checks as unknown[];
-      expectFields(checks[0], { id: "oauth-config", ok: true });
-      expectFields(checks[1], { id: "oauth-token", ok: true });
-      expectFields(checks[2], { id: "meet-spaces-create", ok: true });
-      expect(fetchMock).toHaveBeenCalledWith("https://meet.googleapis.com/v2/spaces", {
-        method: "POST",
-        headers: {
-          Authorization: "Bearer new-access-token",
-          Accept: "application/json",
-          "Content-Type": "application/json",
-        },
-        body: "{}",
-      });
-    } finally {
-      stdout.restore();
-    }
+      },
+    }).parseAsync(["googlemeet", "doctor", "--oauth", "--create-space", "--json"], {
+      from: "user",
+    });
+    const output = stdout.output();
+    expect(output).not.toContain("new-access-token");
+    expect(output).not.toContain("rt-secret");
+    expect(output).not.toContain("client-secret");
+    const payload = parseStdoutJson(stdout);
+    expectFields(payload, {
+      ok: true,
+      tokenSource: "refresh-token",
+      createdSpace: "spaces/new-space",
+      meetingUri: "https://meet.google.com/new-abcd-xyz",
+    });
+    const checks = payload.checks as unknown[];
+    expectFields(checks[0], { id: "oauth-config", ok: true });
+    expectFields(checks[1], { id: "oauth-token", ok: true });
+    expectFields(checks[2], { id: "meet-spaces-create", ok: true });
+    expect(fetchMock).toHaveBeenCalledWith("https://meet.googleapis.com/v2/spaces", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer new-access-token",
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: "{}",
+    });
   });
 
   it("recovers and summarizes an existing Meet tab", async () => {
-    const stdout = captureStdout();
-    try {
-      await setupCli({
-        config: { defaultTransport: "chrome-node" },
-        runtime: {
-          recoverCurrentTab: async () => ({
-            transport: "chrome-node",
-            nodeId: "node-1",
-            found: true,
-            targetId: "tab-1",
-            tab: { targetId: "tab-1", url: "https://meet.google.com/abc-defg-hij" },
-            browser: {
-              inCall: false,
-              manualAction: {
-                reason: "meet-admission-required",
-                message: "Admit the OpenClaw browser participant in Google Meet.",
-              },
-              browserUrl: "https://meet.google.com/abc-defg-hij",
+    await setupCli({
+      config: { defaultTransport: "chrome-node" },
+      runtime: {
+        recoverCurrentTab: async () => ({
+          transport: "chrome-node",
+          nodeId: "node-1",
+          found: true,
+          targetId: "tab-1",
+          tab: { targetId: "tab-1", url: "https://meet.google.com/abc-defg-hij" },
+          browser: {
+            inCall: false,
+            manualAction: {
+              reason: "meet-admission-required",
+              message: "Admit the OpenClaw browser participant in Google Meet.",
             },
-            message: "Admit the OpenClaw browser participant in Google Meet.",
-          }),
-        },
-      }).parseAsync(["googlemeet", "recover-tab"], { from: "user" });
-      expect(stdout.output()).toContain("Google Meet current tab: found");
-      expect(stdout.output()).toContain("target: tab-1");
-      expect(stdout.output()).toContain("manual reason: meet-admission-required");
-    } finally {
-      stdout.restore();
-    }
+            browserUrl: "https://meet.google.com/abc-defg-hij",
+          },
+          message: "Admit the OpenClaw browser participant in Google Meet.",
+        }),
+      },
+    }).parseAsync(["googlemeet", "recover-tab"], { from: "user" });
+    expect(stdout.output()).toContain("Google Meet current tab: found");
+    expect(stdout.output()).toContain("target: tab-1");
+    expect(stdout.output()).toContain("manual reason: meet-admission-required");
   });
 });

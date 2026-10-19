@@ -33,6 +33,38 @@ const GOOGLE_MEET_ENGINE_BINDINGS = {
   handleToolCall: async () => {},
 };
 
+function makeLogger() {
+  return { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+}
+
+function createTransport(
+  script: string,
+  overrides: Partial<Parameters<typeof createLocalMeetingRealtimeAudioTransport>[0]> = {},
+) {
+  return createLocalMeetingRealtimeAudioTransport({
+    inputCommand: [process.execPath, script, "capture"],
+    outputCommand: [process.execPath, script, "play"],
+    bargeInRmsThreshold: 10,
+    bargeInPeakThreshold: 10,
+    bargeInCooldownMs: 1,
+    logger: makeLogger(),
+    logScope: "[google-meet]",
+    spawn: makeRecordingSpawn(),
+    ...overrides,
+  });
+}
+
+function spyKill(child: ChildProcess) {
+  const kill = child.kill.bind(child);
+  return vi.spyOn(child, "kill").mockImplementation((signal) => kill(signal));
+}
+
+function expectSignals(spy: ReturnType<typeof spyKill>, signals: NodeJS.Signals[]) {
+  for (const signal of signals) {
+    expect(spy.mock.calls.filter(([sent]) => sent === signal)).toHaveLength(1);
+  }
+}
+
 function mockTransport() {
   return {
     onFatal: vi.fn(),
@@ -98,16 +130,20 @@ function engineOptions(
     runtime: {} as never,
     ...GOOGLE_MEET_ENGINE_BINDINGS,
     meetingSessionId,
-    logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+    logger: makeLogger(),
   };
 }
 
-function writeBridgeCommand(): string {
+function writeCommand(source: string): string {
   const dir = mkdtempSync(path.join(tmpdir(), "openclaw-google-meet-bridge-"));
   tempDirs.push(dir);
   const scriptPath = path.join(dir, "bridge-command.mjs");
-  writeFileSync(
-    scriptPath,
+  writeFileSync(scriptPath, source, { mode: 0o755 });
+  return scriptPath;
+}
+
+function writeBridgeCommand(): string {
+  return writeCommand(
     [
       "process.on('SIGTERM', () => {",
       "  process.exit(0);",
@@ -116,17 +152,11 @@ function writeBridgeCommand(): string {
       "setInterval(() => {}, 1000);",
       "",
     ].join("\n"),
-    { mode: 0o755 },
   );
-  return scriptPath;
 }
 
 function writeSigtermResistantBridgeCommand(): string {
-  const dir = mkdtempSync(path.join(tmpdir(), "openclaw-google-meet-resistant-bridge-"));
-  tempDirs.push(dir);
-  const scriptPath = path.join(dir, "bridge-command.mjs");
-  writeFileSync(
-    scriptPath,
+  return writeCommand(
     [
       "process.stderr.write(`starting:${process.argv[2]}\\n`);",
       "process.stdin.resume();",
@@ -139,9 +169,7 @@ function writeSigtermResistantBridgeCommand(): string {
       "setInterval(() => {}, 1000);",
       "",
     ].join("\n"),
-    { mode: 0o755 },
   );
-  return scriptPath;
 }
 
 async function waitForBridgeReady(
@@ -190,21 +218,10 @@ describe("local Meet realtime transport process stream errors", () => {
     const sttSession = mockTranscriptionSession();
     sttSession.connect.mockReturnValue(connectGate);
     const provider = transcriptionProvider(() => sttSession);
-    const logger = {
-      debug: vi.fn(),
-      error: vi.fn(),
-      info: vi.fn(),
-      warn: vi.fn(),
-    };
-    const transport = createLocalMeetingRealtimeAudioTransport({
+    const logger = makeLogger();
+    const transport = createTransport(bridgeScript, {
       inputCommand: [path.join(path.dirname(bridgeScript), "missing-capture")],
-      outputCommand: [process.execPath, bridgeScript, "play"],
-      bargeInRmsThreshold: 10,
-      bargeInPeakThreshold: 10,
-      bargeInCooldownMs: 1,
       logger,
-      logScope: "[google-meet]",
-      spawn: makeRecordingSpawn(),
     });
     const config = resolveGoogleMeetConfig({
       chrome: { audioFormat: "pcm16-24khz" },
@@ -243,29 +260,21 @@ describe("local Meet realtime transport process stream errors", () => {
     const bridgeScript = writeBridgeCommand();
     const sttSession = mockTranscriptionSession(true);
     const provider = transcriptionProvider(() => sttSession);
-    const logger = {
-      debug: vi.fn(),
-      info: vi.fn(),
-      warn: vi.fn(),
-    };
+    const logger = makeLogger();
 
     const config = resolveGoogleMeetConfig({
       chrome: { audioFormat: "pcm16-24khz" },
       realtime: { provider: "openai", agentId: "jay", introMessage: "" },
     });
-    const transport = createLocalMeetingRealtimeAudioTransport({
-      inputCommand: [process.execPath, bridgeScript, "capture"],
-      outputCommand: [process.execPath, bridgeScript, "play"],
+    const transport = createTransport(bridgeScript, {
       bargeInRmsThreshold: config.chrome.bargeInRmsThreshold,
       bargeInPeakThreshold: config.chrome.bargeInPeakThreshold,
       bargeInCooldownMs: config.chrome.bargeInCooldownMs,
-      logger: logger as never,
-      logScope: "[google-meet]",
-      spawn: makeRecordingSpawn(),
+      logger,
     });
     const handle = await startMeetingAgentRealtimeEngine({
       ...engineOptions(config, "meet-1"),
-      logger: logger as never,
+      logger,
       providers: [provider],
       transport,
     });
@@ -275,14 +284,8 @@ describe("local Meet realtime transport process stream errors", () => {
     }
     const inputClosed = once(inputProcess, "close");
     const outputClosed = once(outputProcess, "close");
-    const originalInputKill = inputProcess.kill.bind(inputProcess);
-    const originalOutputKill = outputProcess.kill.bind(outputProcess);
-    const inputKillSpy = vi
-      .spyOn(inputProcess, "kill")
-      .mockImplementation((signal) => originalInputKill(signal));
-    const outputKillSpy = vi
-      .spyOn(outputProcess, "kill")
-      .mockImplementation((signal) => originalOutputKill(signal));
+    const inputKillSpy = spyKill(inputProcess);
+    const outputKillSpy = spyKill(outputProcess);
 
     inputProcess.stdout?.destroy(new Error("EPIPE from real bridge input stdout"));
     await new Promise<void>((resolve) => {
@@ -296,29 +299,15 @@ describe("local Meet realtime transport process stream errors", () => {
     );
     expect(handle.getHealth().bridgeClosed).toBe(true);
     expect(sttSession.close).toHaveBeenCalledTimes(1);
-    expect(inputKillSpy.mock.calls.filter(([signal]) => signal === "SIGTERM")).toHaveLength(1);
-    expect(outputKillSpy.mock.calls.filter(([signal]) => signal === "SIGTERM")).toHaveLength(1);
-    console.info(
-      `[proof] local command-pair substitute stopped after forced input stdout stream error; inputPid=${
-        inputProcess.pid ?? "unknown"
-      } outputPid=${outputProcess.pid ?? "unknown"}`,
-    );
+    expectSignals(inputKillSpy, ["SIGTERM"]);
+    expectSignals(outputKillSpy, ["SIGTERM"]);
   });
 
   it.skipIf(process.platform === "win32")(
     "waits for SIGTERM-resistant bridge processes and shares the stop promise",
     async ({ signal: testSignal }) => {
       const bridgeScript = writeSigtermResistantBridgeCommand();
-      const transport = createLocalMeetingRealtimeAudioTransport({
-        inputCommand: [process.execPath, bridgeScript, "capture"],
-        outputCommand: [process.execPath, bridgeScript, "play"],
-        bargeInRmsThreshold: 10,
-        bargeInPeakThreshold: 10,
-        bargeInCooldownMs: 1,
-        logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
-        logScope: "[google-meet]",
-        spawn: makeRecordingSpawn(),
-      });
+      const transport = createTransport(bridgeScript);
       const [outputProcess, inputProcess] = spawnedChildren;
       if (!inputProcess || !outputProcess || !inputProcess.stderr || !outputProcess.stderr) {
         throw new Error("Expected Google Meet bridge to spawn stderr-backed child processes");
@@ -327,14 +316,8 @@ describe("local Meet realtime transport process stream errors", () => {
         waitForBridgeReady(inputProcess.stderr, "capture", testSignal),
         waitForBridgeReady(outputProcess.stderr, "play", testSignal),
       ]);
-      const originalInputKill = inputProcess.kill.bind(inputProcess);
-      const originalOutputKill = outputProcess.kill.bind(outputProcess);
-      const inputKillSpy = vi
-        .spyOn(inputProcess, "kill")
-        .mockImplementation((signal) => originalInputKill(signal));
-      const outputKillSpy = vi
-        .spyOn(outputProcess, "kill")
-        .mockImplementation((signal) => originalOutputKill(signal));
+      const inputKillSpy = spyKill(inputProcess);
+      const outputKillSpy = spyKill(outputProcess);
 
       const startedAt = Date.now();
       const firstStop = transport.stop();
@@ -345,10 +328,8 @@ describe("local Meet realtime transport process stream errors", () => {
       const elapsedMs = Date.now() - startedAt;
       expect(elapsedMs).toBeGreaterThanOrEqual(900);
       expect(elapsedMs).toBeLessThan(5_000);
-      expect(inputKillSpy.mock.calls.filter(([signal]) => signal === "SIGTERM")).toHaveLength(1);
-      expect(inputKillSpy.mock.calls.filter(([signal]) => signal === "SIGKILL")).toHaveLength(1);
-      expect(outputKillSpy.mock.calls.filter(([signal]) => signal === "SIGTERM")).toHaveLength(1);
-      expect(outputKillSpy.mock.calls.filter(([signal]) => signal === "SIGKILL")).toHaveLength(1);
+      expectSignals(inputKillSpy, ["SIGTERM", "SIGKILL"]);
+      expectSignals(outputKillSpy, ["SIGTERM", "SIGKILL"]);
     },
   );
 });
@@ -454,12 +435,7 @@ describe("Google Meet realtime model logs", () => {
     const bridge = mockVoiceBridge();
     const provider = voiceProvider(() => bridge, providerId);
     const transport = mockTransport();
-    const logger = {
-      debug: vi.fn(),
-      error: vi.fn(),
-      info: vi.fn(),
-      warn: vi.fn(),
-    };
+    const logger = makeLogger();
     const handle = await startMeetingRealtimeEngine({
       ...engineOptions(
         resolveGoogleMeetConfig({ realtime: { strategy: "native", provider: providerId } }),
