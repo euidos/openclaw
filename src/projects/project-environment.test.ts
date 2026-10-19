@@ -135,10 +135,6 @@ it.each(
     await withMockedPlatform("win32", async () => {
       vi.clearAllMocks();
       const supplied: NodeJS.ProcessEnv = {
-        HOME: path.resolve("/synthetic-home"),
-        USERPROFILE: path.resolve("/synthetic-home"),
-        NODE_ENV: "test",
-        OPENCLAW_TEST_FAST: "1",
         OpenClaw_State_Dir: root,
         OpenClaw_Supervisor_Mode: "external",
       };
@@ -215,9 +211,7 @@ it.each(
           expect(context.environment).toEqual(environmentSnapshot);
         }
         for (const [, captured] of mocks.checkout.mock.calls) {
-          expect(captured.path).toBe(databasePath);
-          expect(captured.env.OPENCLAW_STATE_DIR).toBe(root);
-          expect(captured.env.OPENCLAW_SUPERVISOR_MODE).toBe("external");
+          expect(captured).toMatchObject({ path: databasePath, env: environmentSnapshot });
           expect(captured.env).not.toBe(caller);
         }
         if (operation === "materialize") {
