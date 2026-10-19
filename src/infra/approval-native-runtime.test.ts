@@ -1,5 +1,4 @@
 // Covers native approval runtime delivery and resolution.
-import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ChannelApprovalNativeAdapter } from "../channels/plugins/types.adapters.js";
 import { createChannelNativeApprovalRuntime as createChannelNativeApprovalRuntimeRaw } from "./approval-native-runtime.js";
@@ -15,10 +14,7 @@ const hoisted = vi.hoisted(() => ({
       };
     },
   ),
-  startGatewayClientWhenEventLoopReady: vi.fn(async () => ({
-    ready: true,
-    aborted: false,
-  })),
+  startGatewayClientWhenEventLoopReady: vi.fn(async () => ({ ready: true, aborted: false })),
 }));
 
 vi.mock("../gateway/call.js", () => ({
@@ -35,21 +31,49 @@ vi.mock("../../packages/gateway-client/src/readiness.js", () => ({
 
 const execRequest = {
   id: "approval-1",
-  request: {
-    command: "uname -a",
-  },
+  request: { command: "uname -a" },
   createdAtMs: 0,
   expiresAtMs: 120_000,
 };
 
 const approvalRuntimes: Array<ReturnType<typeof createChannelNativeApprovalRuntimeRaw>> = [];
+type RuntimeOptions = Parameters<typeof createChannelNativeApprovalRuntimeRaw>[0];
 
-function createChannelNativeApprovalRuntime(
-  params: Parameters<typeof createChannelNativeApprovalRuntimeRaw>[0],
-) {
-  const runtime = createChannelNativeApprovalRuntimeRaw(params);
+function createChannelNativeApprovalRuntime(params: Partial<RuntimeOptions>) {
+  const runtime = createChannelNativeApprovalRuntimeRaw({
+    label: "test/native-runtime",
+    clientDisplayName: "Test",
+    cfg: {},
+    isConfigured: () => true,
+    shouldHandle: () => true,
+    buildPendingContent: () => "pending exec",
+    prepareTarget: ({ plannedTarget }) => ({
+      dedupeKey: plannedTarget.target.to,
+      target: { chatId: plannedTarget.target.to },
+    }),
+    deliverTarget: async () => null,
+    finalizeResolved: async () => {},
+    ...params,
+  });
   approvalRuntimes.push(runtime);
   return runtime;
+}
+
+function dmAdapter(
+  overrides: Partial<ChannelApprovalNativeAdapter> = {},
+  notifyOriginWhenDmOnly = false,
+): ChannelApprovalNativeAdapter {
+  return {
+    describeDeliveryCapabilities: () => ({
+      enabled: true,
+      preferredSurface: "approver-dm",
+      supportsOriginSurface: notifyOriginWhenDmOnly,
+      supportsApproverDmSurface: true,
+      notifyOriginWhenDmOnly,
+    }),
+    resolveApproverDmTargets: async () => [{ to: "approver-1" }, { to: "approver-2" }],
+    ...overrides,
+  };
 }
 
 afterEach(async () => {
@@ -60,60 +84,32 @@ afterEach(async () => {
   vi.useRealTimers();
 });
 
-const requireRecord = createRequireRecord("record", "expected-non-array-record");
-
-function mockCallArg(mock: ReturnType<typeof vi.fn>, index = 0): Record<string, unknown> {
-  const arg = mock.mock.calls[index]?.[0];
-  return requireRecord(arg);
-}
-
 describe("createChannelNativeApprovalRuntime", () => {
   it("dedupes converged prepared targets", async () => {
     vi.useFakeTimers();
-    const adapter: ChannelApprovalNativeAdapter = {
-      describeDeliveryCapabilities: () => ({
-        enabled: true,
-        preferredSurface: "approver-dm",
-        supportsOriginSurface: true,
-        supportsApproverDmSurface: true,
-        notifyOriginWhenDmOnly: true,
+    const adapter = dmAdapter(
+      {
+        resolveOriginTarget: async () => ({ to: "origin-room" }),
+      },
+      true,
+    );
+    const prepareTarget = vi.fn(
+      async ({ plannedTarget }: { plannedTarget: { target: { to: string } } }) => ({
+        dedupeKey: "shared-dm",
+        target: { channelId: "shared-dm", recipientId: plannedTarget.target.to },
       }),
-      resolveOriginTarget: async () => ({ to: "origin-room" }),
-      resolveApproverDmTargets: async () => [{ to: "approver-1" }, { to: "approver-2" }],
-    };
-    const prepareTarget = vi
-      .fn()
-      .mockImplementation(
-        async ({ plannedTarget }: { plannedTarget: { target: { to: string } } }) =>
-          plannedTarget.target.to === "approver-1"
-            ? {
-                dedupeKey: "shared-dm",
-                target: { channelId: "shared-dm", recipientId: "approver-1" },
-              }
-            : {
-                dedupeKey: "shared-dm",
-                target: { channelId: "shared-dm", recipientId: "approver-2" },
-              },
-      );
-    const deliverTarget = vi
-      .fn()
-      .mockImplementation(
-        async ({ preparedTarget }: { preparedTarget: { channelId: string } }) => ({
-          channelId: preparedTarget.channelId,
-        }),
-      );
+    );
+    const deliverTarget = vi.fn(
+      async ({ preparedTarget }: { preparedTarget: { channelId: string } }) => ({
+        channelId: preparedTarget.channelId,
+      }),
+    );
     const onDuplicateSkipped = vi.fn();
     const finalizeResolved = vi.fn(async () => undefined);
 
     const runtime = createChannelNativeApprovalRuntime({
-      label: "test/native-runtime-dedupe",
-      clientDisplayName: "Test",
-      cfg: {} as never,
       nowMs: () => 0,
       nativeAdapter: adapter,
-      isConfigured: () => true,
-      shouldHandle: () => true,
-      buildPendingContent: () => "pending exec",
       prepareTarget,
       deliverTarget,
       onDuplicateSkipped,
@@ -132,15 +128,6 @@ describe("createChannelNativeApprovalRuntime", () => {
 
   it("continues after per-target delivery failures", async () => {
     vi.useFakeTimers();
-    const adapter: ChannelApprovalNativeAdapter = {
-      describeDeliveryCapabilities: () => ({
-        enabled: true,
-        preferredSurface: "approver-dm",
-        supportsOriginSurface: false,
-        supportsApproverDmSurface: true,
-      }),
-      resolveApproverDmTargets: async () => [{ to: "approver-1" }, { to: "approver-2" }],
-    };
     const onDeliveryError = vi.fn();
     const finalizeResolved = vi.fn(async () => undefined);
     const deliverTarget = vi
@@ -153,14 +140,8 @@ describe("createChannelNativeApprovalRuntime", () => {
       });
 
     const runtime = createChannelNativeApprovalRuntime({
-      label: "test/native-runtime-delivery-failure",
-      clientDisplayName: "Test",
-      cfg: {} as never,
       nowMs: () => 0,
-      nativeAdapter: adapter,
-      isConfigured: () => true,
-      shouldHandle: () => true,
-      buildPendingContent: () => "pending exec",
+      nativeAdapter: dmAdapter(),
       prepareTarget: ({ plannedTarget }) => ({
         dedupeKey: plannedTarget.target.to,
         target: { channelId: plannedTarget.target.to },
@@ -182,11 +163,8 @@ describe("createChannelNativeApprovalRuntime", () => {
     const deliverTarget = vi.fn().mockResolvedValue({ chatId: "123", messageId: "m1" });
     const finalizeExpired = vi.fn().mockResolvedValue(undefined);
     const runtime = createChannelNativeApprovalRuntime({
-      label: "test/system-agent-native-runtime",
-      clientDisplayName: "Test",
       channel: "telegram",
       channelLabel: "Telegram",
-      cfg: {} as never,
       accountId: "default",
       eventKinds: ["system-agent"],
       nativeAdapter: {
@@ -198,15 +176,9 @@ describe("createChannelNativeApprovalRuntime", () => {
         }),
         resolveOriginTarget: () => ({ to: "123" }),
       },
-      isConfigured: () => true,
       shouldHandle: vi.fn().mockReturnValue(true),
       buildPendingContent: vi.fn().mockResolvedValue({ text: "pending" }),
-      prepareTarget: ({ plannedTarget }) => ({
-        dedupeKey: plannedTarget.target.to,
-        target: { chatId: plannedTarget.target.to },
-      }),
       deliverTarget,
-      finalizeResolved: vi.fn().mockResolvedValue(undefined),
       finalizeExpired,
     });
 
@@ -339,24 +311,15 @@ describe("createChannelNativeApprovalRuntime", () => {
     const resolveApprovalKind = vi.fn().mockReturnValue("exec");
     const buildPendingContent = vi.fn().mockResolvedValue("pending");
     const runtime = createChannelNativeApprovalRuntime({
-      label: "test/native-runtime-legacy-kind",
-      clientDisplayName: "Test",
-      cfg: {} as never,
       resolveApprovalKind,
-      isConfigured: () => true,
-      shouldHandle: () => true,
       buildPendingContent,
       prepareTarget: async () => null,
       deliverTarget: async () => null,
-      finalizeResolved: async () => {},
     });
 
     const request = {
       id: "legacy-owned-id",
-      request: {
-        title: "Plugin approval",
-        description: "Allow access",
-      },
+      request: { title: "Plugin approval", description: "Allow access" },
       createdAtMs: 0,
       expiresAtMs: 60_000,
     } as const;
@@ -371,35 +334,18 @@ describe("createChannelNativeApprovalRuntime", () => {
 
   it("sends route notices over least-privilege gateway calls", async () => {
     const runtime = createChannelNativeApprovalRuntime({
-      label: "test/native-runtime-route-notice",
-      clientDisplayName: "Test",
       channel: "slack",
       channelLabel: "Slack",
-      cfg: { gateway: { auth: { token: "configured-token" } } } as never,
       accountId: "default",
-      nativeAdapter: {
-        describeDeliveryCapabilities: () => ({
-          enabled: true,
-          preferredSurface: "approver-dm",
-          supportsOriginSurface: true,
-          supportsApproverDmSurface: true,
-          notifyOriginWhenDmOnly: true,
-        }),
-        resolveOriginTarget: async () => ({
-          to: "channel:C123",
-          threadId: "1712345678.123456",
-        }),
-        resolveApproverDmTargets: async () => [{ to: "user:owner" }],
-      },
-      isConfigured: () => true,
-      shouldHandle: () => true,
-      buildPendingContent: async () => "pending exec",
-      prepareTarget: async ({ plannedTarget }) => ({
-        dedupeKey: plannedTarget.target.to,
-        target: { chatId: plannedTarget.target.to },
-      }),
+      cfg: { gateway: { auth: { token: "configured-token" } } },
+      nativeAdapter: dmAdapter(
+        {
+          resolveOriginTarget: async () => ({ to: "channel:C123", threadId: "1712345678.123456" }),
+          resolveApproverDmTargets: async () => [{ to: "user:owner" }],
+        },
+        true,
+      ),
       deliverTarget: async () => ({ chatId: "user:owner", messageId: "m1" }),
-      finalizeResolved: async () => {},
     });
 
     await runtime.start();
@@ -442,47 +388,34 @@ describe("createChannelNativeApprovalRuntime", () => {
     vi.useFakeTimers();
     const finalizeExpired = vi.fn().mockResolvedValue(undefined);
     const runtime = createChannelNativeApprovalRuntime({
-      label: "test/native-runtime-expiry",
-      clientDisplayName: "Test",
       channel: "telegram",
       channelLabel: "Telegram",
-      cfg: {} as never,
       nowMs: Date.now,
-      nativeAdapter: {
-        describeDeliveryCapabilities: () => ({
-          enabled: true,
-          preferredSurface: "approver-dm",
-          supportsOriginSurface: false,
-          supportsApproverDmSurface: true,
-        }),
+      nativeAdapter: dmAdapter({
         resolveApproverDmTargets: async () => [{ to: "owner" }],
-      },
-      isConfigured: () => true,
-      shouldHandle: () => true,
-      buildPendingContent: async () => "pending exec",
+      }),
       prepareTarget: async () => ({
         dedupeKey: "dm:owner",
         target: { chatId: "owner" },
       }),
       deliverTarget: async () => ({ chatId: "owner", messageId: "m1" }),
-      finalizeResolved: async () => {},
       finalizeExpired,
     });
 
     await runtime.handleRequested({
       id: "req-1",
-      request: {
-        command: "echo hi",
-      },
+      request: { command: "echo hi" },
       createdAtMs: 0,
       expiresAtMs: Date.now() + 60_000,
     });
 
     await vi.advanceTimersByTimeAsync(60_000);
 
-    const expiredCall = mockCallArg(finalizeExpired);
-    expect(requireRecord(expiredCall.request).id).toBe("req-1");
-    expect(expiredCall.entries).toEqual([{ chatId: "owner", messageId: "m1" }]);
-    vi.useRealTimers();
+    expect(finalizeExpired).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        request: expect.objectContaining({ id: "req-1" }),
+        entries: [{ chatId: "owner", messageId: "m1" }],
+      }),
+    );
   });
 });

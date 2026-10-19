@@ -39,19 +39,17 @@ async function configGraph(state: OpenClawTestState) {
   const include = `{ "$include": "./leaf.json5" }\n`;
   const leaf = `// keep comments and placeholders\n{ gateway: { mode: "local", auth: { mode: "token", token: "\${BACKUP_INCLUDE_PLACEHOLDER}" } } }\n`;
   await fs.mkdir(path.dirname(includePath), { recursive: true });
-  await fs.writeFile(state.configPath, root);
-  await fs.writeFile(includePath, include);
-  await fs.writeFile(leafPath, leaf);
+  const files = new Map([
+    [state.configPath, root],
+    [includePath, include],
+    [leafPath, leaf],
+  ]);
+  for (const [file, raw] of files) {
+    await fs.writeFile(file, raw);
+  }
   const snapshot = await createConfigIO({ observe: false }).readConfigFileSnapshot();
   expect(snapshot.issues).toEqual([]);
-  return {
-    leafPath,
-    files: new Map([
-      [state.configPath, root],
-      [includePath, include],
-      [leafPath, leaf],
-    ]),
-  };
+  return { leafPath, files };
 }
 
 async function restore(state: OpenClawTestState, output: string, includeWorkspace = true) {
@@ -69,6 +67,41 @@ async function restore(state: OpenClawTestState, output: string, includeWorkspac
   return { archive, restoredPath };
 }
 
+async function expectMissing(file: string) {
+  await expect(fs.stat(file)).rejects.toMatchObject({ code: "ENOENT" });
+}
+
+async function expectText(file: string, text: string | undefined) {
+  expect(await fs.readFile(file, "utf8")).toBe(text);
+}
+
+async function expectRefused(state: OpenClawTestState) {
+  const output = state.path("refused.tar.gz");
+  await expect(createBackupArchive({ output, includeWorkspace: false })).rejects.toThrow(
+    /required config file .*retry backup/s,
+  );
+  await expectMissing(output);
+}
+
+function afterDiscovery(run: () => Promise<void>) {
+  const resolve = backupShared.resolveBackupPlanFromDisk;
+  vi.spyOn(backupShared, "resolveBackupPlanFromDisk").mockImplementationOnce(async (options) => {
+    const plan = await resolve(options);
+    await run();
+    return plan;
+  });
+}
+
+function beforeDatabaseCapture(run: () => Promise<void>) {
+  const capture = sqliteCapture.createBackupSqliteSnapshotPlan;
+  vi.spyOn(sqliteCapture, "createBackupSqliteSnapshotPlan").mockImplementationOnce(
+    async (params) => {
+      await run();
+      return capture(params);
+    },
+  );
+}
+
 describe("full backup config include capture", () => {
   it.each([
     { name: "external config", layout: "split", rootLink: false, invalid: false },
@@ -80,9 +113,9 @@ describe("full backup config include capture", () => {
     async ({ layout, rootLink, invalid }) => {
       await withOpenClawTestState({ layout }, async (state) => {
         vi.stubEnv("BACKUP_INCLUDE_PLACEHOLDER", "must-not-be-expanded");
-        const graph = await configGraph(state);
+        const { files } = await configGraph(state);
         if (invalid) {
-          const raw = graph.files
+          const raw = files
             .get(state.configPath)!
             .replace('ownership: "explicit"', "defaults: { workspace: 42 }");
           await fs.writeFile(state.configPath, raw);
@@ -106,12 +139,10 @@ describe("full backup config include capture", () => {
         );
         const entries = await listArchiveEntries(archive.archivePath);
         expect(new Set(entries).size).toBe(entries.length);
-        for (const [source, raw] of graph.files) {
-          expect(await fs.readFile(restoredPath(source), "utf8")).toBe(raw);
+        for (const [source, raw] of files) {
+          await expectText(restoredPath(source), raw);
         }
-        expect(await fs.readFile(restoredPath(state.statePath("ordinary.txt")), "utf8")).toBe(
-          "ordinary",
-        );
+        await expectText(restoredPath(state.statePath("ordinary.txt")), "ordinary");
         // Remove only this fixture's source lookup, so parsing cannot succeed by
         // accidentally reading the originals instead of the restored graph.
         await fs.rename(
@@ -122,11 +153,13 @@ describe("full backup config include capture", () => {
           configPath: restoredPath(state.configPath),
           observe: false,
         }).readConfigFileSnapshot();
-        expect(snapshot.valid).toBe(true);
+        expect(snapshot).toMatchObject({
+          valid: true,
+          issues: [],
+          config: { gateway: { mode: "local" } },
+        });
         expect(snapshot.includeProvenance).toBeDefined();
-        expect(snapshot.issues.map((issue) => issue.path)).toEqual([]);
         expect(archive.skipped.some(({ reason }) => reason === "unresolved")).toBe(false);
-        expect(snapshot.config.gateway?.mode).toBe("local");
       });
     },
   );
@@ -166,24 +199,20 @@ describe("full backup config include capture", () => {
     "refuses an indeterminate %s graph before publication",
     async (kind) => {
       await withOpenClawTestState({ layout: "split" }, async (state) => {
-        const graph = await configGraph(state);
+        const { leafPath } = await configGraph(state);
         if (kind === "missing") {
-          await fs.unlink(graph.leafPath);
+          await fs.unlink(leafPath);
         }
         if (kind === "alias") {
           const moved = path.join(path.dirname(state.configPath), "real-parts");
-          await fs.rename(path.dirname(graph.leafPath), moved);
+          await fs.rename(path.dirname(leafPath), moved);
           await fs.symlink(
             moved,
-            path.dirname(graph.leafPath),
+            path.dirname(leafPath),
             process.platform === "win32" ? "junction" : "dir",
           );
         }
-        const output = state.path("refused.tar.gz");
-        await expect(createBackupArchive({ output, includeWorkspace: false })).rejects.toThrow(
-          /required config file .*retry backup/s,
-        );
-        await expect(fs.stat(output)).rejects.toMatchObject({ code: "ENOENT" });
+        await expectRefused(state);
         // Even an unresolved graph can still be exported explicitly as root-only.
         const rootOnly = await createBackupArchive({
           output: state.path("root-only.tar.gz"),
@@ -198,45 +227,31 @@ describe("full backup config include capture", () => {
     "refuses %s changes after discovery without overwriting sources",
     async (kind) => {
       await withOpenClawTestState({ layout: "split" }, async (state) => {
-        const graph = await configGraph(state);
-        const resolve = backupShared.resolveBackupPlanFromDisk;
-        vi.spyOn(backupShared, "resolveBackupPlanFromDisk").mockImplementationOnce(
-          async (options) => {
-            const plan = await resolve(options);
-            if (kind === "leaf") {
-              const stat = await fs.stat(graph.leafPath);
-              await fs.writeFile(
-                graph.leafPath,
-                graph.files.get(graph.leafPath)!.replace("local", "other"),
-              );
-              await fs.utimes(graph.leafPath, stat.atime, stat.mtime);
-            } else if (kind === "replacement") {
-              await fs.rename(graph.leafPath, `${graph.leafPath}.original`);
-              await fs.writeFile(graph.leafPath, graph.files.get(graph.leafPath)!);
-            } else {
-              const open = fs.open;
-              vi.spyOn(fs, "open").mockImplementation(async (...args) => {
-                if (args[0] === graph.leafPath) {
-                  throw Object.assign(new Error("denied"), { code: "EACCES" });
-                }
-                return open(...args);
-              });
-            }
-            return plan;
-          },
-        );
-        const output = state.path("refused.tar.gz");
-        await expect(createBackupArchive({ output, includeWorkspace: false })).rejects.toThrow(
-          /required config file .*retry backup/s,
-        );
-        await expect(fs.stat(output)).rejects.toMatchObject({ code: "ENOENT" });
+        const { leafPath, files } = await configGraph(state);
+        afterDiscovery(async () => {
+          if (kind === "leaf") {
+            const stat = await fs.stat(leafPath);
+            await fs.writeFile(leafPath, files.get(leafPath)!.replace("local", "other"));
+            await fs.utimes(leafPath, stat.atime, stat.mtime);
+          } else if (kind === "replacement") {
+            await fs.rename(leafPath, `${leafPath}.original`);
+            await fs.writeFile(leafPath, files.get(leafPath)!);
+          } else {
+            const open = fs.open;
+            vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+              if (args[0] === leafPath) {
+                throw Object.assign(new Error("denied"), { code: "EACCES" });
+              }
+              return open(...args);
+            });
+          }
+        });
+        await expectRefused(state);
         if (kind === "leaf") {
-          expect(await fs.readFile(graph.leafPath, "utf8")).toContain('mode: "other"');
+          expect(await fs.readFile(leafPath, "utf8")).toContain('mode: "other"');
         }
         if (kind === "replacement") {
-          expect(await fs.readFile(`${graph.leafPath}.original`, "utf8")).toBe(
-            graph.files.get(graph.leafPath),
-          );
+          await expectText(`${leafPath}.original`, files.get(leafPath));
         }
       });
     },
@@ -244,7 +259,7 @@ describe("full backup config include capture", () => {
 
   it("uses sealed config even if sources change before database capture and tar traversal", async () => {
     await withOpenClawTestState({ layout: "state-only" }, async (state) => {
-      const graph = await configGraph(state);
+      const { leafPath, files } = await configGraph(state);
       const { DatabaseSync } = requireNodeSqlite();
       const dbPath = resolveOpenClawStateSqlitePath(state.env);
       openOpenClawStateDatabase({ env: state.env });
@@ -258,7 +273,7 @@ describe("full backup config include capture", () => {
       vi.spyOn(sqliteCapture, "createBackupSqliteSnapshotPlan").mockImplementationOnce(
         async (params) => {
           const snapshot = await snapshotSqlite(params);
-          await fs.writeFile(graph.leafPath, '{ gateway: { mode: "remote" } }');
+          await fs.writeFile(leafPath, '{ gateway: { mode: "remote" } }');
           db.exec("INSERT INTO proof VALUES ('later')");
           return snapshot;
         },
@@ -277,10 +292,8 @@ describe("full backup config include capture", () => {
         } finally {
           copy.close();
         }
-        expect(await fs.readFile(graph.leafPath, "utf8")).toContain('mode: "remote"');
-        expect(await fs.readFile(restoredPath(graph.leafPath), "utf8")).toBe(
-          graph.files.get(graph.leafPath),
-        );
+        expect(await fs.readFile(leafPath, "utf8")).toContain('mode: "remote"');
+        await expectText(restoredPath(leafPath), files.get(leafPath));
       } finally {
         db.close();
       }
@@ -291,40 +304,29 @@ describe("full backup config include capture", () => {
     "refuses a config replaced by a FIFO at open without dispatching a blocking read",
     async () => {
       await withOpenClawTestState({ layout: "split" }, async (state) => {
-        const graph = await configGraph(state);
-        const resolve = backupShared.resolveBackupPlanFromDisk;
+        const { leafPath, files } = await configGraph(state);
         let replaced = false;
         let blockingOpen = false;
-        vi.spyOn(backupShared, "resolveBackupPlanFromDisk").mockImplementationOnce(
-          async (options) => {
-            const plan = await resolve(options);
-            const open = fs.open;
-            vi.spyOn(fs, "open").mockImplementation(async (...args) => {
-              if (!replaced && args[0] === graph.leafPath) {
-                replaced = true;
-                await fs.rename(graph.leafPath, `${graph.leafPath}.original`);
-                execFileSync("mkfifo", [graph.leafPath]);
-                const flags = args[1];
-                if (typeof flags !== "number" || !(flags & fsSync.constants.O_NONBLOCK)) {
-                  blockingOpen = true;
-                  throw new Error("refusing a blocking FIFO open in the test");
-                }
+        afterDiscovery(async () => {
+          const open = fs.open;
+          vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+            if (!replaced && args[0] === leafPath) {
+              replaced = true;
+              await fs.rename(leafPath, `${leafPath}.original`);
+              execFileSync("mkfifo", [leafPath]);
+              const flags = args[1];
+              if (typeof flags !== "number" || !(flags & fsSync.constants.O_NONBLOCK)) {
+                blockingOpen = true;
+                throw new Error("refusing a blocking FIFO open in the test");
               }
-              return open(...args);
-            });
-            return plan;
-          },
-        );
-        const output = state.path("refused.tar.gz");
-        await expect(createBackupArchive({ output, includeWorkspace: false })).rejects.toThrow(
-          /required config file .*retry backup/s,
-        );
+            }
+            return open(...args);
+          });
+        });
+        await expectRefused(state);
         expect(replaced).toBe(true);
         expect(blockingOpen).toBe(false);
-        await expect(fs.stat(output)).rejects.toMatchObject({ code: "ENOENT" });
-        expect(await fs.readFile(`${graph.leafPath}.original`, "utf8")).toBe(
-          graph.files.get(graph.leafPath),
-        );
+        await expectText(`${leafPath}.original`, files.get(leafPath));
       });
     },
   );
@@ -335,30 +337,20 @@ describe("full backup config include capture", () => {
       await withOpenClawTestState(
         { layout: initial === "present" ? "split" : "state-only" },
         async (state) => {
-          const graph = await configGraph(state);
+          const { files } = await configGraph(state);
           const plain = "{ agents: { entries: { main: {} } } }\n";
           if (initial === "present") {
             await fs.writeFile(state.configPath, plain);
           } else {
             await fs.unlink(state.configPath);
           }
-          const snapshotSqlite = sqliteCapture.createBackupSqliteSnapshotPlan;
-          vi.spyOn(sqliteCapture, "createBackupSqliteSnapshotPlan").mockImplementationOnce(
-            async (params) => {
-              await fs.writeFile(state.configPath, graph.files.get(state.configPath)!);
-              return snapshotSqlite(params);
-            },
-          );
+          beforeDatabaseCapture(() => fs.writeFile(state.configPath, files.get(state.configPath)!));
           const { restoredPath } = await restore(state, state.path("plain.tar.gz"));
-          expect(await fs.readFile(state.configPath, "utf8")).toBe(
-            graph.files.get(state.configPath),
-          );
+          await expectText(state.configPath, files.get(state.configPath));
           if (initial === "present") {
-            expect(await fs.readFile(restoredPath(state.configPath), "utf8")).toBe(plain);
+            await expectText(restoredPath(state.configPath), plain);
           } else {
-            await expect(fs.stat(restoredPath(state.configPath))).rejects.toMatchObject({
-              code: "ENOENT",
-            });
+            await expectMissing(restoredPath(state.configPath));
           }
         },
       );
@@ -372,17 +364,13 @@ describe("full backup config include capture", () => {
       await fs.writeFile(first, "{}");
       await fs.writeFile(second, "{}");
       await fs.symlink(first, state.configPath);
-      const snapshotSqlite = sqliteCapture.createBackupSqliteSnapshotPlan;
-      vi.spyOn(sqliteCapture, "createBackupSqliteSnapshotPlan").mockImplementationOnce(
-        async (params) => {
-          await fs.unlink(state.configPath);
-          await fs.symlink(second, state.configPath);
-          return snapshotSqlite(params);
-        },
-      );
+      beforeDatabaseCapture(async () => {
+        await fs.unlink(state.configPath);
+        await fs.symlink(second, state.configPath);
+      });
       const output = state.path("retargeted.tar.gz");
       await expect(createBackupArchive({ output })).rejects.toThrow(/config alias changed/);
-      await expect(fs.stat(output)).rejects.toMatchObject({ code: "ENOENT" });
+      await expectMissing(output);
       expect(await fs.realpath(state.configPath)).toBe(second);
       expect(
         (await fs.readdir(state.root)).filter((name) => name.startsWith(".openclaw-backup-")),
@@ -392,7 +380,7 @@ describe("full backup config include capture", () => {
 
   it("preserves staging ENOSPC and leaves no published archive", async () => {
     await withOpenClawTestState({ layout: "split" }, async (state) => {
-      const graph = await configGraph(state);
+      const { files } = await configGraph(state);
       const write = fs.writeFile;
       const diskFull = Object.assign(new Error("synthetic staging disk full"), { code: "ENOSPC" });
       vi.spyOn(fs, "writeFile").mockImplementation(async (...args) => {
@@ -403,9 +391,9 @@ describe("full backup config include capture", () => {
       });
       const output = state.path("refused.tar.gz");
       await expect(createBackupArchive({ output, includeWorkspace: false })).rejects.toBe(diskFull);
-      await expect(fs.stat(output)).rejects.toMatchObject({ code: "ENOENT" });
-      for (const [source, raw] of graph.files) {
-        expect(await fs.readFile(source, "utf8")).toBe(raw);
+      await expectMissing(output);
+      for (const [source, raw] of files) {
+        await expectText(source, raw);
       }
     });
   });
