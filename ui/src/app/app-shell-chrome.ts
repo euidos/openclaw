@@ -74,6 +74,7 @@ import {
   navDrawerFocusableElements,
   visibleNavDrawerToggle,
   type ShellNavigationElements,
+  type ShellNavigationSurfaces,
 } from "./navigation-surface.ts";
 import { isCustodianPanelAvailable, isHomePanelAvailable } from "./panel-availability.ts";
 import { NAV_WIDTH_MAX, NAV_WIDTH_MIN } from "./settings.ts";
@@ -82,7 +83,7 @@ import { retryStaleChunkReloadWhenReachable } from "./stale-chunk-reload.ts";
 let nativeCommandsOwner: (() => void)[] | undefined;
 
 export interface ShellChromeHost
-  extends ShellNewSessionHost, ShellPanelHost, ShellNavigationElements {
+  extends ShellNewSessionHost, ShellPanelHost, ShellNavigationElements, ShellNavigationSurfaces {
   readonly elements: ShellOwnedElements;
   readonly element: HTMLElement;
   readonly isConnected: boolean;
@@ -91,7 +92,6 @@ export interface ShellChromeHost
   readonly commandPaletteElement: OptionalCustomElement;
   readonly execApprovalElement: OptionalCustomElement;
   readonly queryRenderedElement: (tagName: string) => Element | null;
-  readonly navigationSidebar: HTMLElement;
   navDrawerOpen: boolean;
   desktopNavigationExpanded: boolean;
   navDrawerTrigger: HTMLElement | null;
@@ -368,8 +368,7 @@ export class ShellChromeOwner {
     }
   };
 
-  dismissSidebarTransientMenus = (): boolean =>
-    dismissNavigationTransientSurfaces(this.host.element);
+  dismissSidebarTransientMenus = (): boolean => dismissNavigationTransientSurfaces(this.host);
 
   private readonly handleDocumentKeydownBubble = (event: KeyboardEvent): void => {
     const host = this.host;
