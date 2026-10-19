@@ -13,6 +13,40 @@ function tempRoot() {
   return root;
 }
 
+function writeDriver(lines: string[], root = tempRoot()) {
+  const scriptPath = path.join(root, "user-driver.py");
+  fs.writeFileSync(
+    scriptPath,
+    [
+      "import json",
+      "import sys",
+      "print(json.dumps({'type':'ready','chatId':-1001,'user':{'id':100}}), flush=True)",
+      ...lines,
+    ].join("\n"),
+  );
+  return scriptPath;
+}
+
+function startDriver(
+  userDriverPath: string,
+  options: Partial<Parameters<typeof TelegramUserbotDriver.start>[0]> = {},
+) {
+  return TelegramUserbotDriver.start({
+    chatId: "-1001",
+    driverEnv: {},
+    leaseHealth: { assertHealthy() {}, whenUnhealthy: new Promise<Error>(() => {}) },
+    onUpdate() {},
+    ...options,
+    userDriverPath,
+  });
+}
+
+const entity = (offset: number, length: number, type = "textEntityTypeCode") => ({
+  offset,
+  length,
+  type: { "@type": type },
+});
+
 afterEach(() => {
   for (const root of tempRoots.splice(0)) {
     fs.rmSync(root, { recursive: true, force: true });
@@ -21,17 +55,16 @@ afterEach(() => {
 
 describe("Telegram userbot driver runtime", () => {
   it("keeps one process for commands and streamed formatting edits", async () => {
-    const scriptPath = path.join(tempRoot(), "fake-user-driver.py");
     const text = "😀 a   b x";
     const entities = [
-      { offset: 3, length: 5, type: { "@type": "textEntityTypeCode" } },
+      entity(3, 5),
       {
         offset: 9,
         length: 1,
         type: { "@type": "textEntityTypeTextUrl", url: "https://example.com/qa" },
       },
     ];
-    const editedEntities = [{ offset: 3, length: 5, type: { "@type": "textEntityTypeBold" } }];
+    const editedEntities = [entity(3, 5, "textEntityTypeBold")];
     const richMessage = {
       "@type": "richMessage",
       is_full: true,
@@ -47,39 +80,28 @@ describe("Telegram userbot driver runtime", () => {
         },
       ],
     };
-    fs.writeFileSync(
-      scriptPath,
-      [
-        "import json",
-        "import sys",
-        `entities = json.loads(${JSON.stringify(JSON.stringify(entities))})`,
-        `edited_entities = json.loads(${JSON.stringify(JSON.stringify(editedEntities))})`,
-        `rich_message = json.loads(${JSON.stringify(JSON.stringify(richMessage))})`,
-        "print(json.dumps({'type':'ready','chatId':-1001,'user':{'id':100}}), flush=True)",
-        "for line in sys.stdin:",
-        "    request = json.loads(line)",
-        "    assert request['chatId'] == '-2002' and request['forumTopicId'] == 42",
-        "    message_id = 10 + int(request['id'])",
-        "    update = {'kind':'message','chatId':-1001,'messageId':message_id + 1,'senderId':200,'timestamp':1000,'text':request['text'],'entities':entities,'contentType':'messagePhoto'}",
-        "    print(json.dumps({'type':'update','update':update}), flush=True)",
-        "    for replacement in [edited_entities, []]:",
-        "        update = {**update, 'kind':'edit', 'entities':replacement, 'contentType':'messageVideo'}",
-        "        print(json.dumps({'type':'update','update':update}), flush=True)",
-        "    for rich in [rich_message, {**rich_message, 'is_full':False}, None]:",
-        "        update = {**update, 'richMessage':rich, 'text':'x', 'entities':[], 'contentType':'messageRichMessage' if rich else 'messageText'}",
-        "        print(json.dumps({'type':'update','update':update}), flush=True)",
-        "    result = {'chatId':-1001,'messageId':message_id,'senderId':100,'timestamp':1000,'text':request['text'],'entities':entities,'contentType':'messageText','forumTopicId':request['forumTopicId']}",
-        "    print(json.dumps({'type':'response','id':request['id'],'result':result}), flush=True)",
-      ].join("\n"),
-    );
+    const scriptPath = writeDriver([
+      `entities = json.loads(${JSON.stringify(JSON.stringify(entities))})`,
+      `edited_entities = json.loads(${JSON.stringify(JSON.stringify(editedEntities))})`,
+      `rich_message = json.loads(${JSON.stringify(JSON.stringify(richMessage))})`,
+      "for line in sys.stdin:",
+      "    request = json.loads(line)",
+      "    assert request['chatId'] == '-2002' and request['forumTopicId'] == 42",
+      "    message_id = 10 + int(request['id'])",
+      "    update = {'kind':'message','chatId':-1001,'messageId':message_id + 1,'senderId':200,'timestamp':1000,'text':request['text'],'entities':entities,'contentType':'messagePhoto'}",
+      "    print(json.dumps({'type':'update','update':update}), flush=True)",
+      "    for replacement in [edited_entities, []]:",
+      "        update = {**update, 'kind':'edit', 'entities':replacement, 'contentType':'messageVideo'}",
+      "        print(json.dumps({'type':'update','update':update}), flush=True)",
+      "    for rich in [rich_message, {**rich_message, 'is_full':False}, None]:",
+      "        update = {**update, 'richMessage':rich, 'text':'x', 'entities':[], 'contentType':'messageRichMessage' if rich else 'messageText'}",
+      "        print(json.dumps({'type':'update','update':update}), flush=True)",
+      "    result = {'chatId':-1001,'messageId':message_id,'senderId':100,'timestamp':1000,'text':request['text'],'entities':entities,'contentType':'messageText','forumTopicId':request['forumTopicId']}",
+      "    print(json.dumps({'type':'response','id':request['id'],'result':result}), flush=True)",
+    ]);
     const updates: TelegramUserbotUpdate[] = [];
-    const leaseFailure = new Promise<Error>(() => {});
-    const driver = await TelegramUserbotDriver.start({
-      chatId: "-1001",
+    const driver = await startDriver(scriptPath, {
       expectedUserId: "100",
-      driverEnv: {},
-      leaseHealth: { assertHealthy() {}, whenUnhealthy: leaseFailure },
-      userDriverPath: scriptPath,
       onUpdate(update) {
         updates.push(update);
       },
@@ -96,6 +118,8 @@ describe("Telegram userbot driver runtime", () => {
         },
       );
       await vi.waitFor(() => expect(updates).toHaveLength(6));
+      const edit = { kind: "edit", messageId: 12, contentType: "messageVideo", text };
+      const richEdit = { kind: "edit", messageId: 12, contentType: "messageRichMessage" };
       expect(updates).toMatchObject([
         {
           kind: "message",
@@ -105,21 +129,10 @@ describe("Telegram userbot driver runtime", () => {
           text,
           entities,
         },
-        {
-          kind: "edit",
-          messageId: 12,
-          contentType: "messageVideo",
-          text,
-          entities: editedEntities,
-        },
-        { kind: "edit", messageId: 12, contentType: "messageVideo", text, entities: [] },
-        { kind: "edit", messageId: 12, contentType: "messageRichMessage", richMessage },
-        {
-          kind: "edit",
-          messageId: 12,
-          contentType: "messageRichMessage",
-          richMessage: { ...richMessage, is_full: false },
-        },
+        { ...edit, entities: editedEntities },
+        { ...edit, entities: [] },
+        { ...richEdit, richMessage },
+        { ...richEdit, richMessage: { ...richMessage, is_full: false } },
         { kind: "edit", messageId: 12, contentType: "messageText", text: "x", entities: [] },
       ]);
       expect(updates[5]).not.toHaveProperty("richMessage");
@@ -133,43 +146,18 @@ describe("Telegram userbot driver runtime", () => {
     { name: "missing entities", entities: undefined, streamed: false },
     { name: "non-array entities", entities: {}, streamed: false },
     { name: "non-object entity", entities: [null], streamed: false },
-    {
-      name: "negative offset",
-      entities: [{ offset: -1, length: 1, type: { "@type": "textEntityTypeCode" } }],
-      streamed: false,
-    },
-    {
-      name: "fractional length",
-      entities: [{ offset: 3, length: 1.5, type: { "@type": "textEntityTypeCode" } }],
-      streamed: false,
-    },
-    {
-      name: "empty range",
-      entities: [{ offset: 3, length: 0, type: { "@type": "textEntityTypeCode" } }],
-      streamed: false,
-    },
-    {
-      name: "range past the text",
-      entities: [{ offset: 3, length: 8, type: { "@type": "textEntityTypeCode" } }],
-      streamed: true,
-    },
-    {
-      name: "start inside a surrogate pair",
-      entities: [{ offset: 1, length: 1, type: { "@type": "textEntityTypeCode" } }],
-      streamed: true,
-    },
-    {
-      name: "end inside a surrogate pair",
-      entities: [{ offset: 0, length: 1, type: { "@type": "textEntityTypeCode" } }],
-      streamed: false,
-    },
+    { name: "negative offset", entities: [entity(-1, 1)], streamed: false },
+    { name: "fractional length", entities: [entity(3, 1.5)], streamed: false },
+    { name: "empty range", entities: [entity(3, 0)], streamed: false },
+    { name: "range past the text", entities: [entity(3, 8)], streamed: true },
+    { name: "start inside a surrogate pair", entities: [entity(1, 1)], streamed: true },
+    { name: "end inside a surrogate pair", entities: [entity(0, 1)], streamed: false },
     {
       name: "missing entity type",
       entities: [{ offset: 3, length: 1, type: {} }],
       streamed: true,
     },
   ])("rejects $name at the child protocol boundary", async ({ entities, streamed }) => {
-    const scriptPath = path.join(tempRoot(), "invalid-entity-driver.py");
     const message = {
       chatId: -1001,
       messageId: 11,
@@ -178,32 +166,20 @@ describe("Telegram userbot driver runtime", () => {
       text: "😀 a   b x",
       entities,
     };
-    fs.writeFileSync(
-      scriptPath,
-      [
-        "import json",
-        "import sys",
-        `result = json.loads(${JSON.stringify(JSON.stringify(message))})`,
-        "print(json.dumps({'type':'ready','chatId':-1001,'user':{'id':100}}), flush=True)",
-        "for line in sys.stdin:",
-        "    request = json.loads(line)",
-        ...(streamed
-          ? [
-              "    print(json.dumps({'type':'update','update':{**result, 'kind':'message'}}), flush=True)",
-              "    result = {**result, 'entities':[]}",
-            ]
-          : []),
-        "    print(json.dumps({'type':'response','id':request['id'],'result':result}), flush=True)",
-      ].join("\n"),
-    );
+    const scriptPath = writeDriver([
+      `result = json.loads(${JSON.stringify(JSON.stringify(message))})`,
+      "for line in sys.stdin:",
+      "    request = json.loads(line)",
+      ...(streamed
+        ? [
+            "    print(json.dumps({'type':'update','update':{**result, 'kind':'message'}}), flush=True)",
+            "    result = {**result, 'entities':[]}",
+          ]
+        : []),
+      "    print(json.dumps({'type':'response','id':request['id'],'result':result}), flush=True)",
+    ]);
     const onUpdate = vi.fn();
-    const driver = await TelegramUserbotDriver.start({
-      chatId: "-1001",
-      driverEnv: {},
-      leaseHealth: { assertHealthy() {}, whenUnhealthy: new Promise<Error>(() => {}) },
-      userDriverPath: scriptPath,
-      onUpdate,
-    });
+    const driver = await startDriver(scriptPath, { onUpdate });
     try {
       await expect(driver.send({ text: message.text })).rejects.toThrow(/invalid entit/u);
       expect(onUpdate).not.toHaveBeenCalled();
@@ -215,31 +191,23 @@ describe("Telegram userbot driver runtime", () => {
   it("stops a delayed TDLib send before its final effect after lease loss", async () => {
     const root = tempRoot();
     const markerPath = path.join(root, "sent.txt");
-    const scriptPath = path.join(root, "delayed-user-driver.py");
-    fs.writeFileSync(
-      scriptPath,
+    const scriptPath = writeDriver(
       [
-        "import json",
         "import pathlib",
-        "import sys",
         "import time",
-        "print(json.dumps({'type':'ready','chatId':-1001,'user':{'id':100}}), flush=True)",
         "for line in sys.stdin:",
         "    request = json.loads(line)",
         "    time.sleep(1)",
         `    pathlib.Path(${JSON.stringify(markerPath)}).write_text('sent')`,
-      ].join("\n"),
+      ],
+      root,
     );
     let revoke: (error: Error) => void = () => {};
     const whenUnhealthy = new Promise<Error>((resolve) => {
       revoke = resolve;
     });
-    const driver = await TelegramUserbotDriver.start({
-      chatId: "-1001",
-      driverEnv: {},
+    const driver = await startDriver(scriptPath, {
       leaseHealth: { assertHealthy() {}, whenUnhealthy },
-      userDriverPath: scriptPath,
-      onUpdate() {},
     });
 
     const sending = driver.send({ text: "must not send" });

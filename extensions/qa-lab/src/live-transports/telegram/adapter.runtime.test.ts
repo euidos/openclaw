@@ -61,6 +61,36 @@ import { runQaSuiteRoundTripProbe } from "../../suite-round-trip.js";
 import { createTelegramQaTransportAdapter } from "./adapter.runtime.js";
 
 type AdapterContext = Parameters<typeof createTelegramQaTransportAdapter>[0];
+type Adapter = Awaited<ReturnType<typeof createTelegramQaTransportAdapter>>;
+
+const lease = (payload: unknown) => ({
+  payload,
+  heartbeat: mocks.leaseHeartbeat,
+  release: mocks.leaseRelease,
+});
+
+async function cleanup(adapter: Pick<Adapter, "cleanup" | "cleanupAfterGatewayStop">) {
+  await adapter.cleanup?.();
+  await adapter.cleanupAfterGatewayStop?.();
+}
+
+function inbound(
+  id: string,
+  text: string,
+  options: Partial<Parameters<Adapter["sendInbound"]>[0]> = {},
+) {
+  return { conversation: { id, kind: "group" as const }, senderId: "primary", text, ...options };
+}
+
+function observeParticipants<T>(sends: T[]) {
+  const updates: Array<(update: unknown) => Promise<void>> = [];
+  mocks.userbotStart.mockImplementation(async (params) => {
+    const index = updates.length;
+    updates.push(params.onUpdate);
+    return driver(sends[index]);
+  });
+  return updates;
+}
 
 function createAdapter(
   messages: Partial<AdapterContext["messages"]> = {},
@@ -175,10 +205,8 @@ describe("Telegram QA transport adapter", () => {
     mocks.createStateRoot.mockReturnValue(stateRoot);
     mocks.readTelegramPrivateProductionDescriptor.mockReturnValue(undefined);
     mocks.acquireQaCredentialLease.mockResolvedValue({
-      payload: credential,
+      ...lease(credential),
       source: "convex",
-      heartbeat: mocks.leaseHeartbeat,
-      release: mocks.leaseRelease,
     });
     mocks.loadTelegramUserbotSkillRuntime.mockResolvedValue({
       userDriverPath: "/skill/user-driver.py",
@@ -213,12 +241,7 @@ describe("Telegram QA transport adapter", () => {
       const state = createQaBusState();
       const threadId = "threadId" in route ? route.threadId : undefined;
       const conversation = { id: route.id, kind: route.kind };
-      mocks.acquireQaCredentialLease.mockResolvedValueOnce({
-        payload: identityCredential,
-        heartbeat: mocks.leaseHeartbeat,
-        release: mocks.leaseRelease,
-      });
-      const updates: Array<(update: unknown) => Promise<void>> = [];
+      mocks.acquireQaCredentialLease.mockResolvedValueOnce(lease(identityCredential));
       let nextNativeId = 10;
       const sends = [100, 101].map((senderId) =>
         vi.fn(async (input) => {
@@ -245,11 +268,7 @@ describe("Telegram QA transport adapter", () => {
           };
         }),
       );
-      mocks.userbotStart.mockImplementation(async (params) => {
-        const index = updates.length;
-        updates.push(params.onUpdate);
-        return driver(sends[index]);
-      });
+      const updates = observeParticipants(sends);
       const definition = await createAdapter(
         state,
         route.kind === "direct" ? { transportPolicy: { directMessageOnly: true } } : {},
@@ -317,8 +336,7 @@ describe("Telegram QA transport adapter", () => {
           expect.objectContaining({ conversation, threadId, senderId: "100" }),
         ]);
       } finally {
-        await transport.cleanup?.();
-        await transport.cleanupAfterGatewayStop?.();
+        await cleanup(transport);
         state.reset(true);
       }
     },
@@ -334,8 +352,7 @@ describe("Telegram QA transport adapter", () => {
     expect(() => leaseHealth.assertHealthy()).toThrow("lease revoked");
     expect(mocks.proxyDrainUpdates).toHaveBeenCalledTimes(1);
 
-    await adapter.cleanup?.();
-    await adapter.cleanupAfterGatewayStop?.();
+    await cleanup(adapter);
   });
 
   it("maps sends, replies, messages, and formatting edits through one userbot process", async () => {
@@ -375,11 +392,9 @@ describe("Telegram QA transport adapter", () => {
         apiRoot: "http://127.0.0.1:3210",
         groups: { "-100123": { allowFrom: ["100"], requireMention: true } },
       });
-      await adapter.sendInbound?.({
-        conversation: { id: "logical-room", kind: "group" },
-        senderId: "driver",
-        text: "@openclaw reply exactly: QA-MARKER",
-      });
+      await adapter.sendInbound(
+        inbound("logical-room", "@openclaw reply exactly: QA-MARKER", { senderId: "driver" }),
+      );
       expect(mocks.userbotSend).toHaveBeenCalledWith({
         text: "@sut_bot reply exactly: QA-MARKER",
         chatId: "-100123",
@@ -401,12 +416,9 @@ describe("Telegram QA transport adapter", () => {
       firstSnapshot[0].entities[0].type["@type"] = "textEntityTypeBold";
       expect(readMessages()).toEqual([preview]);
 
-      await adapter.sendInbound?.({
-        conversation: { id: "logical-room", kind: "group" },
-        senderId: "driver",
-        text: "follow-up",
-        replyToId: "out-1",
-      });
+      await adapter.sendInbound(
+        inbound("logical-room", "follow-up", { senderId: "driver", replyToId: "out-1" }),
+      );
       expect(mocks.userbotSend).toHaveBeenLastCalledWith({
         text: "follow-up",
         chatId: "-100123",
@@ -435,8 +447,7 @@ describe("Telegram QA transport adapter", () => {
       });
       expect(() => readMessages()).toThrow("Telegram userbot is closed.");
     } finally {
-      await adapter.cleanup?.();
-      await adapter.cleanupAfterGatewayStop?.();
+      await cleanup(adapter);
     }
   });
 
@@ -471,18 +482,12 @@ describe("Telegram QA transport adapter", () => {
       expect(adapter.describeTransportState?.()).toContain("updates=0");
       expect(readMessages()).toEqual([]);
     } finally {
-      await adapter.cleanup?.();
-      await adapter.cleanupAfterGatewayStop?.();
+      await cleanup(adapter);
     }
   });
 
   it("keeps DM, group, forum, and mixed leased participants distinct", async () => {
-    mocks.acquireQaCredentialLease.mockResolvedValueOnce({
-      payload: identityCredential,
-      heartbeat: mocks.leaseHeartbeat,
-      release: mocks.leaseRelease,
-    });
-    const updates: Array<(update: unknown) => Promise<void>> = [];
+    mocks.acquireQaCredentialLease.mockResolvedValueOnce(lease(identityCredential));
     const sends = [100, 101].map((senderId) =>
       vi.fn(async (input) => ({
         messageId: 10,
@@ -491,11 +496,7 @@ describe("Telegram QA transport adapter", () => {
         forumTopicId: input.forumTopicId,
       })),
     );
-    mocks.userbotStart.mockImplementation(async (params) => {
-      const index = updates.length;
-      updates.push(params.onUpdate);
-      return driver(sends[index]);
-    });
+    const updates = observeParticipants(sends);
     let nextId = 0;
     const addInboundMessage = vi.fn().mockImplementation(async () => ({ id: `in-${++nextId}` }));
     const addOutboundMessage = vi.fn().mockImplementation(async () => ({ id: `out-${++nextId}` }));
@@ -518,27 +519,12 @@ describe("Telegram QA transport adapter", () => {
         allowFrom: ["100", "101"],
         groups: { "-100456": { allowFrom: ["100", "101"] } },
       });
-      await adapter.sendInbound({
-        conversation: { id: "dm", kind: "direct" },
-        senderId: "primary",
-        text: "dm",
-      });
-      await adapter.sendInbound({
-        conversation: { id: "room", kind: "group" },
-        senderId: "primary",
-        text: "group",
-      });
-      await adapter.sendInbound({
-        conversation: { id: "room", kind: "group" },
-        senderId: "second",
-        text: "mixed",
-      });
-      await adapter.sendInbound({
-        conversation: { id: "forum", kind: "group" },
-        threadId: "42",
-        senderId: "second",
-        text: "forum",
-      });
+      await adapter.sendInbound(
+        inbound("dm", "dm", { conversation: { id: "dm", kind: "direct" } }),
+      );
+      await adapter.sendInbound(inbound("room", "group"));
+      await adapter.sendInbound(inbound("room", "mixed", { senderId: "second" }));
+      await adapter.sendInbound(inbound("forum", "forum", { threadId: "42", senderId: "second" }));
       expect(sends.map((send) => send.mock.calls.map(([input]) => input.chatId))).toEqual([
         ["200", "-100123"],
         ["-100123", "-100456"],
@@ -582,27 +568,16 @@ describe("Telegram QA transport adapter", () => {
       expect(editMessage).toHaveBeenCalledWith(
         expect.objectContaining({ messageId: "out-5", text: "dm edit" }),
       );
+      await expect(adapter.sendInbound(inbound("other-room", "remap"))).rejects.toThrow(
+        "another logical conversation",
+      );
       await expect(
-        adapter.sendInbound({
-          conversation: { id: "other-room", kind: "group" },
-          senderId: "primary",
-          text: "remap",
-        }),
-      ).rejects.toThrow("another logical conversation");
-      await expect(
-        adapter.sendInbound({
-          conversation: { id: "room", kind: "group" },
-          senderId: "missing",
-          text: "impersonate",
-        }),
+        adapter.sendInbound(inbound("room", "impersonate", { senderId: "missing" })),
       ).rejects.toThrow("named leased participant");
       await expect(
-        adapter.sendInbound({
-          conversation: { id: "room", kind: "group" },
-          senderId: "second",
-          replyToId: "out-6",
-          text: "wrong observer",
-        }),
+        adapter.sendInbound(
+          inbound("room", "wrong observer", { senderId: "second", replyToId: "out-6" }),
+        ),
       ).rejects.toThrow("observed by this participant");
       expect(adapter.buildAgentDelivery({ target: "group:forum", threadId: "42" })).toEqual({
         channel: "telegram",
@@ -612,8 +587,7 @@ describe("Telegram QA transport adapter", () => {
         threadId: "42",
       });
     } finally {
-      await adapter.cleanup?.();
-      await adapter.cleanupAfterGatewayStop?.();
+      await cleanup(adapter);
     }
     expect(mocks.userbotClose).toHaveBeenCalledTimes(2);
     expect(mocks.leaseRelease).toHaveBeenCalledOnce();
@@ -653,12 +627,12 @@ describe("Telegram QA transport adapter", () => {
       });
       expect(sutConfig(adapter)).not.toHaveProperty("apiRoot");
 
-      await adapter.sendInbound({
-        conversation: { id: "forum", kind: "group" },
-        senderId: "second",
-        threadId: "42",
-        text: "@openclaw Reply exactly: synthetic-marker",
-      });
+      await adapter.sendInbound(
+        inbound("forum", "@openclaw Reply exactly: synthetic-marker", {
+          senderId: "second",
+          threadId: "42",
+        }),
+      );
       expect(mocks.requestTelegramPrivateAppTurn).toHaveBeenCalledWith({
         descriptor,
         destination: "forum-topic",
@@ -675,8 +649,7 @@ describe("Telegram QA transport adapter", () => {
       );
       expect(mocks.userbotSend).not.toHaveBeenCalled();
     } finally {
-      await adapter.cleanup?.();
-      await adapter.cleanupAfterGatewayStop?.();
+      await cleanup(adapter);
     }
     expect(mocks.userbotStart).not.toHaveBeenCalled();
     expect(mocks.leaseRelease).not.toHaveBeenCalled();
@@ -685,11 +658,9 @@ describe("Telegram QA transport adapter", () => {
   it.each(["participants", "forumGroupId", "forumTopicId"] as const)(
     "fails the cataloged identity scenario clearly when the lease lacks %s",
     async (missing) => {
-      mocks.acquireQaCredentialLease.mockResolvedValueOnce({
-        payload: { ...identityCredential, [missing]: undefined },
-        heartbeat: mocks.leaseHeartbeat,
-        release: mocks.leaseRelease,
-      });
+      mocks.acquireQaCredentialLease.mockResolvedValueOnce(
+        lease({ ...identityCredential, [missing]: undefined }),
+      );
       const adapter = await createAdapter();
       try {
         const scenario = readQaScenarioById("telegram-participant-identity-inspection");
@@ -698,8 +669,7 @@ describe("Telegram QA transport adapter", () => {
         );
         expect(mocks.userbotSend).not.toHaveBeenCalled();
       } finally {
-        await adapter.cleanup?.();
-        await adapter.cleanupAfterGatewayStop?.();
+        await cleanup(adapter);
       }
       expect(mocks.leaseRelease).toHaveBeenCalledOnce();
     },
@@ -710,17 +680,12 @@ describe("Telegram QA transport adapter", () => {
     const addInboundMessage = vi.fn();
     const adapter = await createAdapter({ addInboundMessage });
     try {
-      await expect(
-        adapter.sendInbound({
-          conversation: { id: "room", kind: "group" },
-          senderId: "primary",
-          text: "identity",
-        }),
-      ).rejects.toThrow("send receipt");
+      await expect(adapter.sendInbound(inbound("room", "identity"))).rejects.toThrow(
+        "send receipt",
+      );
       expect(addInboundMessage).not.toHaveBeenCalled();
     } finally {
-      await adapter.cleanup?.();
-      await adapter.cleanupAfterGatewayStop?.();
+      await cleanup(adapter);
     }
   });
 

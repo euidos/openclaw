@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   createTelegramQaTransportAdapter: vi.fn(),
@@ -50,39 +50,37 @@ import { runQaTelegramCommand, runQaTelegramSuite } from "./cli.runtime.js";
 const SUT_COMMAND_ENV = "OPENCLAW_QA_TELEGRAM_SUT_OPENCLAW_COMMAND";
 
 describe("Telegram live QA scenario gate", () => {
-  const originalSutCommand = process.env[SUT_COMMAND_ENV];
   let previousExitCode: typeof process.exitCode;
   let tempRoot: string;
   let summaryPath: string;
 
   function writeSummary(status: string) {
     const skipped = status === "skip" || status === "skipped";
-    const counts =
-      status === "pass" || status === "fail" || skipped
-        ? {
-            total: 1,
-            passed: status === "pass" ? 1 : 0,
-            failed: status === "fail" ? 1 : 0,
-            skipped: skipped ? 1 : 0,
-          }
-        : { total: 1 };
-    writeFileSync(
-      summaryPath,
-      JSON.stringify({
-        run: { status: "completed" },
-        counts,
-        scenarios: [{ name: "channel-canary", status }],
-      }),
-      "utf8",
-    );
+    writeSummaryData({
+      run: { status: "completed" },
+      counts: {
+        total: 1,
+        passed: Number(status === "pass"),
+        failed: Number(status === "fail"),
+        skipped: Number(skipped),
+      },
+      scenarios: [{ name: "channel-canary", status }],
+    });
   }
+
+  function writeSummaryData(summary: unknown) {
+    writeFileSync(summaryPath, JSON.stringify(summary), "utf8");
+  }
+
+  const runSuite = (allowFailures = false) =>
+    runQaTelegramSuite({ repoRoot: "/repo", providerMode: "mock-openai", allowFailures });
 
   beforeEach(() => {
     previousExitCode = process.exitCode;
     // Bun does not clear a previous failure when assigned undefined.
     process.exitCode = 0;
     vi.clearAllMocks();
-    delete process.env[SUT_COMMAND_ENV];
+    vi.stubEnv(SUT_COMMAND_ENV, undefined);
     tempRoot = mkdtempSync(path.join(tmpdir(), "openclaw-qa-telegram-gate-"));
     summaryPath = path.join(tempRoot, "qa-suite-summary.json");
     writeSummary("pass");
@@ -96,34 +94,20 @@ describe("Telegram live QA scenario gate", () => {
   afterEach(() => {
     process.exitCode = previousExitCode ?? 0;
     rmSync(tempRoot, { force: true, recursive: true });
-  });
-
-  afterAll(() => {
-    if (originalSutCommand === undefined) {
-      delete process.env[SUT_COMMAND_ENV];
-    } else {
-      process.env[SUT_COMMAND_ENV] = originalSutCommand;
-    }
+    vi.unstubAllEnvs();
   });
 
   it.each(["fail", "skip"])("fails the live Telegram lane on %s scenarios", async (status) => {
     writeSummary(status);
 
-    await runQaTelegramSuite({
-      repoRoot: "/repo",
-      providerMode: "mock-openai",
-    });
+    await runSuite();
 
     expect(process.exitCode).toBe(1);
   });
 
   it("permits genuinely executed failed scenarios when failures are explicitly allowed", async () => {
     writeSummary("fail");
-    await runQaTelegramSuite({
-      repoRoot: "/repo",
-      providerMode: "mock-openai",
-      allowFailures: true,
-    });
+    await runSuite(true);
 
     expect(process.exitCode).toBe(0);
   });
@@ -141,26 +125,16 @@ describe("Telegram live QA scenario gate", () => {
       } else if (summary === "malformed") {
         writeFileSync(summaryPath, "{not-json", "utf8");
       } else if (summary === "zero-work") {
-        writeFileSync(
-          summaryPath,
-          JSON.stringify({
-            run: { status: "completed" },
-            counts: { total: 0, passed: 0, failed: 0, skipped: 0 },
-            scenarios: [],
-          }),
-          "utf8",
-        );
+        writeSummaryData({
+          run: { status: "completed" },
+          counts: { total: 0, passed: 0, failed: 0, skipped: 0 },
+          scenarios: [],
+        });
       } else {
         writeSummary("skip");
       }
 
-      await expect(
-        runQaTelegramSuite({
-          repoRoot: "/repo",
-          providerMode: "mock-openai",
-          allowFailures: true,
-        }),
-      ).rejects.toThrow(expected);
+      await expect(runSuite(true)).rejects.toThrow(expected);
       expect(process.exitCode).toBe(0);
     },
   );
