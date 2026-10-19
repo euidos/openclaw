@@ -14,10 +14,7 @@ import { closeOpenClawStateDatabaseAsync } from "openclaw/plugin-sdk/sqlite-runt
 import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveSessionStoreAgentIds, stateMigrations } from "./doctor-contract-api.js";
-import {
-  installVoiceCallStateRuntimeForTests,
-  makePersistedCall,
-} from "./src/manager.test-harness.js";
+import { installVoiceCallStateRuntimeForTests } from "./src/manager.test-harness.js";
 import { loadActiveCallsFromStore } from "./src/manager/store.js";
 
 const tempDirs = useAutoCleanupTempDirTracker((cleanup) => {
@@ -28,8 +25,12 @@ const tempDirs = useAutoCleanupTempDirTracker((cleanup) => {
   });
 });
 
-function createDoctorContext(env: NodeJS.ProcessEnv): PluginDoctorStateMigrationContext {
-  return {
+function pluginConfig(config: Record<string, unknown>, id = "voice-call") {
+  return { plugins: { entries: { [id]: { config } } } };
+}
+
+function migrationParams(stateDir: string, env: NodeJS.ProcessEnv, store?: string) {
+  const context: PluginDoctorStateMigrationContext = {
     openPluginStateKeyedStore<T>(options: OpenKeyedStoreOptions) {
       return createPluginStateKeyedStoreForTests<T>("voice-call", {
         ...options,
@@ -37,19 +38,12 @@ function createDoctorContext(env: NodeJS.ProcessEnv): PluginDoctorStateMigration
       });
     },
   };
-}
-
-function pluginConfig(config: Record<string, unknown>, id = "voice-call") {
-  return { plugins: { entries: { [id]: { config } } } };
-}
-
-function migrationParams(stateDir: string, env: NodeJS.ProcessEnv, config = {}) {
   return {
-    config,
+    config: store ? pluginConfig({ store }) : {},
     env,
     stateDir,
     oauthDir: path.join(stateDir, "oauth"),
-    context: createDoctorContext(env),
+    context,
   };
 }
 
@@ -66,7 +60,7 @@ describe.each(["default", "custom"] as const)("absent %s Voice Call store", (loc
       try {
         const result = await expectDefined(stateMigrations[1], "voice-call schema migration")[
           method
-        ](migrationParams(root, env, location === "custom" ? pluginConfig({ store }) : {}));
+        ](migrationParams(root, env, location === "custom" ? store : undefined));
         expect(result).toEqual(
           method === "detectLegacyState" ? null : { changes: [], warnings: [] },
         );
@@ -90,30 +84,18 @@ describe("voice-call doctor state migration", () => {
     installVoiceCallStateRuntimeForTests();
   });
 
-  it("reports top-level and per-number session-store agents", () => {
-    expect(
-      resolveSessionStoreAgentIds({
-        cfg: pluginConfig({
-          agentId: "Voice",
-          numbers: {
-            "+15550001111": { agentId: "Cards" },
-            "+15550002222": {},
-          },
-        }),
+  it.each([
+    [
+      pluginConfig({
+        agentId: "Voice",
+        numbers: { "+15550001111": { agentId: "Cards" }, "+15550002222": {} },
       }),
-    ).toEqual(["cards", "voice"]);
-    expect(
-      resolveSessionStoreAgentIds({
-        cfg: pluginConfig({}, "@openclaw/voice-call"),
-      }),
-    ).toEqual(["main"]);
-    expect(
-      resolveSessionStoreAgentIds({
-        cfg: {
-          plugins: { entries: { "voice-call": { enabled: true } } },
-        },
-      }),
-    ).toEqual(["main"]);
+      ["cards", "voice"],
+    ],
+    [pluginConfig({}, "@openclaw/voice-call"), ["main"]],
+    [{ plugins: { entries: { "voice-call": { enabled: true } } } }, ["main"]],
+  ] as const)("reports session-store agents for %j", (cfg, expected) => {
+    expect(resolveSessionStoreAgentIds({ cfg })).toEqual(expected);
   });
 
   it.each(["default", "custom", "tilde"] as const)(
@@ -128,17 +110,13 @@ describe("voice-call doctor state migration", () => {
             : storePath;
       await fs.mkdir(store, { recursive: true });
       const source = path.join(store, "calls.jsonl");
-      const bytes = Buffer.from(
-        `${JSON.stringify(makePersistedCall({ callId: "unmigrated" }))}\n{invalid retained bytes\n`,
-      );
+      const bytes = Buffer.from('{"callId":"unmigrated"}\n{invalid retained bytes\n');
       await fs.writeFile(source, bytes);
       const migration = expectDefined(stateMigrations[0], "retired call-log migration");
       const params = migrationParams(
         stateDir,
         { ...env, HOME: home },
-        pluginConfig(
-          location === "default" ? {} : { store: location === "tilde" ? "~/dollar-store" : store },
-        ),
+        location === "default" ? undefined : location === "tilde" ? "~/dollar-store" : store,
       );
       await expect(migration.detectLegacyState(params)).resolves.toMatchObject({
         preview: [expect.stringContaining(source)],
@@ -161,29 +139,20 @@ describe("voice-call doctor state migration", () => {
         PRAGMA user_version = 1;
         CREATE TABLE audit_events (
           sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-          event_id TEXT NOT NULL UNIQUE,
-          source_id TEXT NOT NULL UNIQUE,
-          source_sequence INTEGER NOT NULL,
-          occurred_at INTEGER NOT NULL,
-          kind TEXT NOT NULL,
-          action TEXT NOT NULL,
-          status TEXT NOT NULL,
+          event_id TEXT NOT NULL UNIQUE, source_id TEXT NOT NULL UNIQUE,
+          source_sequence INTEGER NOT NULL, occurred_at INTEGER NOT NULL,
+          kind TEXT NOT NULL, action TEXT NOT NULL, status TEXT NOT NULL,
           error_code TEXT,
-          actor_type TEXT NOT NULL,
-          actor_id TEXT NOT NULL,
-          agent_id TEXT NOT NULL,
-          session_key TEXT,
-          session_id TEXT,
-          run_id TEXT NOT NULL,
-          tool_call_id TEXT,
-          tool_name TEXT
+          actor_type TEXT NOT NULL, actor_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+          session_key TEXT, session_id TEXT, run_id TEXT NOT NULL,
+          tool_call_id TEXT, tool_name TEXT
         );
       `);
     } finally {
       db.close();
     }
     const migration = expectDefined(stateMigrations[1], "voice-call schema migration");
-    const params = migrationParams(stateDir, env, pluginConfig({ store: storePath }));
+    const params = migrationParams(stateDir, env, storePath);
 
     await expect(migration.detectLegacyState(params)).resolves.toEqual({
       preview: [
