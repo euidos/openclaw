@@ -69,9 +69,7 @@ export const DEFAULT_SMALL_LIVE_MODEL_LIMIT = SMALL_LIVE_MODEL_PRIORITY.length;
 const highSignalPriorityIndex = new Map<string, number>(
   HIGH_SIGNAL_LIVE_MODEL_PRIORITY.map((ref, index) => [ref, index] as const),
 );
-const smallPriorityIndex = new Map<string, number>(
-  SMALL_LIVE_MODEL_PRIORITY.map((ref, index) => [ref, index] as const),
-);
+const smallPriorityRefs = new Set<string>(SMALL_LIVE_MODEL_PRIORITY);
 const excludedProviders = new Set(["codex", "codex-cli"]);
 const curatedProviders = new Set(["fireworks", "google", "openrouter", "xai"]);
 const directOpenAiModels = new Set(["gpt-5.6-terra", "gpt-5.6-luna"]);
@@ -108,7 +106,7 @@ export function isPrioritizedHighSignalLiveModelRef(ref: ModelRef): boolean {
 
 export function isSmallLiveModelRef(ref: ModelRef): boolean {
   const key = canonicalLiveModelRef(ref);
-  return key !== undefined && smallPriorityIndex.has(key);
+  return key !== undefined && smallPriorityRefs.has(key);
 }
 
 export function isModernModelRef(ref: LiveModelPolicyRef): boolean {
@@ -258,29 +256,20 @@ function selectPrioritizedLiveItems<T>(
   return selected;
 }
 
-export function selectHighSignalLiveItems<T>(
+type LiveItemSelector = <T>(
   items: T[],
   maxItems: number,
   refOf: (item: T) => ModelRef,
   providerOf: (item: T) => string,
-): T[] {
-  return selectPrioritizedLiveItems(
-    items,
-    maxItems,
-    refOf,
-    providerOf,
-    HIGH_SIGNAL_LIVE_MODEL_PRIORITY,
-  );
+) => T[];
+
+function createLiveItemSelector(priority: readonly string[]): LiveItemSelector {
+  return (items, maxItems, refOf, providerOf) =>
+    selectPrioritizedLiveItems(items, maxItems, refOf, providerOf, priority);
 }
 
-export function selectSmallLiveItems<T>(
-  items: T[],
-  maxItems: number,
-  refOf: (item: T) => ModelRef,
-  providerOf: (item: T) => string,
-): T[] {
-  return selectPrioritizedLiveItems(items, maxItems, refOf, providerOf, SMALL_LIVE_MODEL_PRIORITY);
-}
+export const selectHighSignalLiveItems = createLiveItemSelector(HIGH_SIGNAL_LIVE_MODEL_PRIORITY);
+export const selectSmallLiveItems = createLiveItemSelector(SMALL_LIVE_MODEL_PRIORITY);
 
 export function resolveHighSignalLiveModelLimit(params: {
   rawMaxModels?: string;
@@ -343,11 +332,7 @@ export function applyLiveProviderPluginDiscoveryCompat(params: {
         config: params.config,
         env: params.env,
       }) ?? [];
-    if (owners.length === 0) {
-      pluginIds.add(provider);
-      continue;
-    }
-    for (const owner of owners) {
+    for (const owner of owners.length ? owners : [provider]) {
       pluginIds.add(owner);
     }
   }

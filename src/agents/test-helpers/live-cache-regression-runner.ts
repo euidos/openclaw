@@ -90,28 +90,6 @@ function makeUserTurn(content: Extract<Message, { role: "user" }>["content"]): M
   return { role: "user", content, timestamp: Date.now() };
 }
 
-function makeImageUserTurn(text: string, pngBase64: string): Message {
-  return makeUserTurn([
-    { type: "text", text },
-    { type: "image", mimeType: "image/png", data: pngBase64 },
-  ]);
-}
-
-function makeToolResultMessage(
-  toolCallId: string,
-  toolName: string,
-  text: string,
-): Extract<Message, { role: "toolResult" }> {
-  return {
-    role: "toolResult",
-    toolCallId,
-    toolName,
-    content: [{ type: "text", text }],
-    isError: false,
-    timestamp: Date.now(),
-  };
-}
-
 function extractFirstToolCall(message: AssistantMessage) {
   return message.content.find((block) => block.type === "toolCall");
 }
@@ -257,10 +235,13 @@ async function runRepeatedLane(
     let tools: Tool[] | undefined;
     if (params.lane === "image") {
       history.push(
-        makeImageUserTurn(
-          "An image is attached. Ignore image semantics but keep the bytes in history.",
-          params.pngBase64,
-        ),
+        makeUserTurn([
+          {
+            type: "text",
+            text: "An image is attached. Ignore image semantics but keep the bytes in history.",
+          },
+          { type: "image", mimeType: "image/png", data: params.pngBase64 },
+        ]),
         buildAssistantHistoryTurn("IMAGE HISTORY ACKNOWLEDGED", params.fixture.model),
         makeUserTurn("Keep the earlier image turn stable in context."),
         buildAssistantHistoryTurn("IMAGE HISTORY PRESERVED", params.fixture.model),
@@ -274,7 +255,14 @@ async function runRepeatedLane(
       history.push(
         makeUserTurn(toolTurn.prompt),
         toolTurn.response,
-        makeToolResultMessage(toolTurn.toolCall.id, tool.name, toolText),
+        {
+          role: "toolResult",
+          toolCallId: toolTurn.toolCall.id,
+          toolName: tool.name,
+          content: [{ type: "text", text: toolText }],
+          isError: false,
+          timestamp: Date.now(),
+        },
         buildAssistantHistoryTurn(`${historyPrefix} ACKNOWLEDGED`, params.fixture.model),
         makeUserTurn(
           params.lane === "mcp"
@@ -349,23 +337,12 @@ async function runRepeatedLaneWithBaselineRetry(
   return { result, findings, attempts };
 }
 
-function appendBaselineFindings(target: BaselineFindings, source: BaselineFindings) {
-  target.regressions.push(...source.regressions);
-  target.warnings.push(...source.warnings);
-}
-
 function isAnthropicEmptyCacheProbe(error: unknown): boolean {
   return error instanceof CacheProbeTextMismatchError && error.text.trim().length === 0;
 }
 
 function shouldSkipAnthropicCacheProviderDrift(error: unknown): boolean {
-  return Boolean(
-    shouldSkipLiveProviderDrift({
-      error,
-      allowAuth: true,
-      allowBilling: true,
-    }),
-  );
+  return Boolean(shouldSkipLiveProviderDrift({ error, allowAuth: true, allowBilling: true }));
 }
 
 async function runAnthropicCacheLane(
@@ -373,20 +350,18 @@ async function runAnthropicCacheLane(
     apiKeys: readonly string[];
     warnings: string[];
   },
-): Promise<{ attempt?: Awaited<ReturnType<typeof runRepeatedLaneWithBaselineRetry>> }> {
+): Promise<Awaited<ReturnType<typeof runRepeatedLaneWithBaselineRetry>> | undefined> {
   const keys = params.apiKeys.length > 0 ? params.apiKeys : [params.fixture.apiKey];
   let lastError: unknown;
   for (const [index, apiKey] of keys.entries()) {
     try {
-      return {
-        attempt: await runRepeatedLaneWithBaselineRetry({
-          lane: params.lane,
-          providerTag: "anthropic",
-          fixture: withLiveDirectModelApiKey(params.fixture, apiKey),
-          runToken: params.runToken,
-          pngBase64: params.pngBase64,
-        }),
-      };
+      return await runRepeatedLaneWithBaselineRetry({
+        lane: params.lane,
+        providerTag: "anthropic",
+        fixture: withLiveDirectModelApiKey(params.fixture, apiKey),
+        runToken: params.runToken,
+        pngBase64: params.pngBase64,
+      });
     } catch (error) {
       lastError = error;
       if (shouldSkipAnthropicCacheProviderDrift(error) && index + 1 < keys.length) {
@@ -411,7 +386,7 @@ async function runAnthropicCacheLane(
     const warning = `anthropic ${params.lane} skipped: ${reason}`;
     params.warnings.push(warning);
     logLiveCache(warning);
-    return {};
+    return undefined;
   }
   throw lastError;
 }
@@ -478,7 +453,8 @@ export async function runLiveCacheRegression(): Promise<LiveCacheRegressionResul
       attempts,
       warmup: result.warmup?.usage,
     };
-    appendBaselineFindings({ regressions, warnings }, findings);
+    regressions.push(...findings.regressions);
+    warnings.push(...findings.warnings);
   };
   const openai = await resolveLiveCacheProviderPool({
     config: {
@@ -514,8 +490,7 @@ export async function runLiveCacheRegression(): Promise<LiveCacheRegressionResul
         attempt =
           provider === "openai"
             ? await runRepeatedLaneWithBaselineRetry({ ...context, providerTag: provider })
-            : (await runAnthropicCacheLane({ ...context, apiKeys: pool.apiKeys, warnings }))
-                .attempt;
+            : await runAnthropicCacheLane({ ...context, apiKeys: pool.apiKeys, warnings });
       }
       recordLane(provider, lane, attempt);
     }
