@@ -23,33 +23,25 @@ type CompactionSafeguardTestApi = {
   CONTEXT_TRUNCATED_MARKER: string;
 };
 
-function getTestApi(): CompactionSafeguardTestApi {
-  const api = (globalThis as Record<PropertyKey, unknown>)[
-    Symbol.for("openclaw.compactionSafeguardTestApi")
-  ];
-  if (!api) {
-    throw new Error("compaction safeguard test API is unavailable");
-  }
-  return api as CompactionSafeguardTestApi;
+export const testing = (globalThis as Record<PropertyKey, unknown>)[
+  Symbol.for("openclaw.compactionSafeguardTestApi")
+] as CompactionSafeguardTestApi;
+if (!testing) {
+  throw new Error("compaction safeguard test API is unavailable");
 }
-
-export const testing = getTestApi();
 
 export function structuredSummary(
   values: Partial<Record<"decisions" | "todos" | "rules" | "asks" | "identifiers", string>> = {},
 ): string {
-  return [
-    "## Decisions",
-    values.decisions ?? "Keep current flow.",
-    "## Open TODOs",
-    values.todos ?? "None.",
-    "## Constraints/Rules",
-    values.rules ?? "Preserve exact context.",
-    "## Pending user asks",
-    values.asks ?? "None.",
-    "## Exact identifiers",
-    values.identifiers ?? "None.",
-  ].join("\n");
+  return Object.entries({
+    Decisions: values.decisions ?? "Keep current flow.",
+    "Open TODOs": values.todos ?? "None.",
+    "Constraints/Rules": values.rules ?? "Preserve exact context.",
+    "Pending user asks": values.asks ?? "None.",
+    "Exact identifiers": values.identifiers ?? "None.",
+  })
+    .map(([heading, body]) => `## ${heading}\n${body}`)
+    .join("\n");
 }
 export function stubSessionManager(): ExtensionContext["sessionManager"] {
   return {
@@ -200,6 +192,10 @@ export const createCompactionContext = (params: {
 });
 
 type CompactionEvent = ReturnType<typeof createCompactionEvent>;
+type CompactionResult = {
+  cancel?: boolean;
+  compaction?: { summary: string; firstKeptEntryId: string; tokensBefore: number };
+};
 
 function withLatestUnresolvedUserRequest(event: CompactionEvent): CompactionEvent {
   const { preparation } = event;
@@ -236,21 +232,11 @@ export async function runCompactionScenario(
   const result = (await createCompactionHandler()(
     latestUnresolvedUserRequest ? withLatestUnresolvedUserRequest(event) : event,
     createCompactionContext({ sessionManager, getApiKeyAndHeadersMock }),
-  )) as {
-    cancel?: boolean;
-    compaction?: { summary: string; firstKeptEntryId: string; tokensBefore: number };
-  };
+  )) as CompactionResult;
   return { result, getApiKeyAndHeadersMock };
 }
 
-export function expectCompactionResult(result: {
-  cancel?: boolean;
-  compaction?: {
-    summary: string;
-    firstKeptEntryId: string;
-    tokensBefore: number;
-  };
-}) {
+export function expectCompactionResult(result: CompactionResult) {
   expect(result.cancel).not.toBe(true);
   if (!result.compaction) {
     throw new Error("Expected compaction result");
