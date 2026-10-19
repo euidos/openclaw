@@ -1,5 +1,6 @@
 import { createMemo, For } from "solid-js";
-import { registryFor } from "../../components/overlay-registry.ts";
+import { hasMenuSurface } from "../../components/menu-surface.ts";
+import { hasModalSurface, registryFor } from "../../components/overlay-registry.ts";
 import { Icon } from "../../components/solid/icon.tsx";
 import { Popover, type PopoverHandle } from "../../components/solid/popover.tsx";
 import { SettingsSegmented } from "../../components/solid/settings-ui.tsx";
@@ -298,11 +299,11 @@ function handleSessionsSearchKeydown(
     document.activeElement !== input ||
     !input.value ||
     props.sessionMenu ||
-    document.openClawModalLayers?.size ||
+    hasModalSurface(document) ||
     registryFor(document).stack.some(
       (overlay) => overlay.open && overlay.id !== "sessions-filter-popover",
     ) ||
-    document.querySelector("dialog[open], [aria-modal='true'], openclaw-menu-surface")
+    hasMenuSurface(document)
   ) {
     return;
   }
