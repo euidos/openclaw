@@ -16,7 +16,6 @@ import {
   type OpenClawTestInstance,
 } from "../../../test/helpers/openclaw-test-instance.ts";
 import { runQaGatewayFixture } from "../../../test/helpers/qa-gateway-cleanup.ts";
-import type { SessionsListResult } from "../api/types.ts";
 import type { ChatPaneElement } from "../pages/chat/chat-pane.tsx";
 import type { ChatState } from "../pages/chat/chat-state-contract.ts";
 import type { ChatPageHost } from "../pages/chat/chat-state-host.ts";
@@ -411,14 +410,6 @@ suite.define(() => {
                 .getByRole("button", { name: "Stop generating", exact: true })
                 .waitFor({ state: "detached" });
               await bubble.getByText(closing, { exact: true }).waitFor();
-              // Stream retirement can precede the durable history receipt. Local MEDIA
-              // previews are replaced at that handoff; capture the managed images, not
-              // decoded nodes whose custody is still waiting to transfer.
-              await expect
-                .poll(() =>
-                  bubble.locator(".chat-image-frame--managed img.chat-message-image").count(),
-                )
-                .toBe(2);
               const assertDecoded = async () => {
                 // Run retirement starts a final history read that can replace live image nodes.
                 await page.waitForFunction((expectedSessionKey) => {
@@ -588,55 +579,30 @@ suite.define(() => {
                   rendered: true,
                   images,
                 });
-              // The final roster can change media admission after history settles.
-              const sessions: SessionsListResult = JSON.parse(
-                await runCli([
-                  "gateway",
-                  "call",
-                  "sessions.list",
-                  "--json",
-                  "--params",
-                  JSON.stringify({ agentId: "main", limit: 50 }),
-                ]),
-              );
-              const authoritativeSession = sessions.sessions.find((row) => row.key === sessionKey);
-              expect(authoritativeSession?.sessionId).toBe(sessionId);
-              const policy = JSON.stringify([
-                authoritativeSession?.permissionMode,
-                authoritativeSession?.permissionModePending,
-                authoritativeSession?.execNode,
-                authoritativeSession?.execCwd,
-                authoritativeSession?.sessionRoot,
-                authoritativeSession?.spawnedWorkspaceDir,
-                authoritativeSession?.spawnedCwd,
-                authoritativeSession?.worktree?.id,
-              ]);
+              // Sidebar rows omit full policy fields. Wait for the pane's own list
+              // read and rendered managed images, not equality with a full CLI row.
               await expect
                 .poll(() =>
-                  page.locator(".chat-pane-cache__pane--active").evaluate(
-                    (element, expected) => {
-                      const state = (element as HTMLElement & { state: ChatPageHost }).state;
-                      const selected = state.sessionsResult?.sessions.find(
-                        (row) => row.key === state.sessionKey,
-                      );
-                      return (
-                        selected?.sessionId === expected.sessionId &&
-                        JSON.stringify([
-                          selected?.permissionMode,
-                          selected?.permissionModePending,
-                          selected?.execNode,
-                          selected?.execCwd,
-                          selected?.sessionRoot,
-                          selected?.spawnedWorkspaceDir,
-                          selected?.spawnedCwd,
-                          selected?.worktree?.id,
-                        ]) === expected.policy
-                      );
-                    },
-                    { sessionId, policy },
-                  ),
+                  page.locator(".chat-pane-cache__pane--active").evaluate((element) => {
+                    const state = (element as HTMLElement & { state: ChatPageHost }).state;
+                    const selected = state.sessionsResult?.sessions.find(
+                      (row) => row.key === state.sessionKey,
+                    );
+                    return {
+                      sessionId: selected?.sessionId,
+                      loading: state.sessionsLoading,
+                      error: state.sessionsError,
+                    };
+                  }),
                 )
-                .toBe(true);
+                .toEqual({ sessionId, loading: false, error: null });
+              // Stream retirement can precede the durable history receipt. Capture
+              // managed images after that handoff, then retain strict node identity.
+              await expect
+                .poll(() =>
+                  bubble.locator(".chat-image-frame--managed img.chat-message-image").count(),
+                )
+                .toBe(2);
               await assertDecoded();
               const liveNodes = await bubble.evaluateHandle((element) => {
                 const pane = element.closest<ChatPaneElement>("openclaw-chat-pane");
