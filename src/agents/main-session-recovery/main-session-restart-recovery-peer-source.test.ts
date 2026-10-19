@@ -4,7 +4,11 @@ import {
   clearRuntimeConfigSnapshot,
   setRuntimeConfigSnapshot,
 } from "../../config/runtime-snapshot.js";
-import { loadSessionEntry, loadTranscriptEvents } from "../../config/sessions/session-accessor.js";
+import {
+  loadSessionEntry,
+  loadTranscriptEvents,
+  updateSessionEntry,
+} from "../../config/sessions/session-accessor.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { GatewayRecoveryRuntime } from "../../gateway/server-instance-runtime.types.js";
 import { prepareConsumedSessionSendSource } from "../../gateway/session-send-recovery-source.js";
@@ -23,6 +27,76 @@ afterEach(() => {
   clearRuntimeConfigSnapshot();
   vi.restoreAllMocks();
 });
+
+it.each(["reset", "archive", "deny"] as const)(
+  "settles a consumed peer input once when its sender changes before recovery: %s",
+  async (change) => {
+    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+      const storePath = state.statePath("agents", "main", "sessions", "sessions.json");
+      const source = {
+        agentId: "main",
+        sessionKey: "agent:main:revoked-source",
+        sessionId: "revoked-source-session",
+        lifecycleRevision: "revoked-source-generation",
+        storePath,
+      };
+      const target = {
+        ...source,
+        sessionKey: "agent:main:revoked-target",
+        sessionId: "revoked-target-session",
+        lifecycleRevision: "revoked-target-generation",
+      };
+      const cfg: OpenClawConfig = {
+        agents: { defaults: { workspace: state.workspaceDir }, entries: { main: {} } },
+        session: { store: storePath, communication: { send: "always", receive: "always" } },
+        tools: { sessions: { visibility: "all" } },
+      };
+      setRuntimeConfigSnapshot(cfg);
+      const { originalTranscript } = await seedConsumedPeerRestartInput({
+        cfg,
+        source,
+        target,
+        runId: "revoked-peer-input",
+      });
+      await cleanupSessionStateForTest({ stateDir: state.stateDir });
+      rotateAgentEventLifecycleGeneration();
+      await markStartupOrphanedMainSessionsForRecovery({ cfg, stateDir: state.stateDir });
+      await updateSessionEntry(source, () =>
+        change === "reset"
+          ? { sessionId: "replacement-source-session", lifecycleRevision: "replacement-generation" }
+          : change === "archive"
+            ? { archivedAt: Date.now() }
+            : { communication: { send: "never" } },
+      );
+      const runtime: GatewayRecoveryRuntime = {
+        prepareRestartRecovery: () => undefined,
+        dispatchSessionMethod: vi.fn(),
+        waitForAgent: vi.fn(),
+        sendRecoveryNotice: vi.fn(async () => ({ suppressed: false })),
+        dispatchAgent: vi.fn(),
+      };
+      const recover = () =>
+        recoverStore({
+          storeAgentId: target.agentId,
+          storePath,
+          cfg,
+          handledSessionKeys: new Set(),
+          gatewayRuntime: runtime,
+        });
+      expect(await recover()).toEqual({ started: 0, settled: 1, failed: 0, skipped: 0 });
+      expect(runtime.dispatchAgent).not.toHaveBeenCalled();
+      const settledTranscript = await loadTranscriptEvents(target);
+      expect(settledTranscript).toHaveLength(originalTranscript.length + 1);
+      expect(JSON.stringify(settledTranscript.at(-1))).toContain(
+        "This interrupted turn could not resume after the Gateway restarted",
+      );
+      expect(loadSessionEntry(target)).toMatchObject({ status: "interrupted" });
+      expect(loadSessionEntry(target)?.mainRestartRecovery?.tombstone).toBeUndefined();
+      expect(await recover()).toEqual({ started: 0, settled: 0, failed: 0, skipped: 0 });
+      expect(await loadTranscriptEvents(target)).toEqual(settledTranscript);
+    });
+  },
+);
 
 it("leaves authenticated consumed inputs to their private requester recovery owner", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async (state) => {

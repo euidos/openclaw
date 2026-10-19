@@ -170,9 +170,18 @@ export async function prepareConsumedSessionSendSource(params: {
       target: params.target,
       assertCurrent,
       signal: params.signal,
+    }).catch((error: unknown) => {
+      // Permanent sender loss belongs to the caller's delegated-recovery settlement.
+      if (
+        error instanceof SessionSendEndpointChangedError ||
+        error instanceof SessionCommunicationDeniedError
+      ) {
+        return undefined;
+      }
+      throw error;
     });
     if (!communication) {
-      throw new SessionCommunicationDeniedError("Session delivery endpoint is archived");
+      return undefined;
     }
     return {
       source: () => {

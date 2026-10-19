@@ -140,6 +140,10 @@ remains consumed and is not submitted as a new message. A queued session event
 joins this recovery through normal session admission instead of treating the
 missing live sender as an ended session.
 
+If the original peer endpoint was reset, archived, or lost communication permission,
+recovery records one interruption notice and settles that input through the existing
+recovery owner. Temporary storage failures remain retryable.
+
 When an update replaces the bundled Control UI, an open tab reloads after the
 Gateway reports the new build. Automatic recovery for that reported build and
 manual reloads share a bounded document-readiness check, so a transient failed
