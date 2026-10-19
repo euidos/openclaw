@@ -15,48 +15,65 @@ import { setInternalBeforeToolBatch } from "../../../../packages/agent-core/src/
 import { createDeferred } from "../../../../test/helpers/promise.js";
 import { createToolLoopBatchAdmission } from "./tool-loop-recovery.js";
 
-describe("default repeated tool error termination", () => {
-  it.each([true])(
-    "records a terminal failure after three identical errors with loop detection %s",
-    async (enabled) => {
-      const requests: Message[][] = [];
-      const tool = makeTool("probe");
-      tool.execute = async () => {
-        throw new Error("resource unavailable");
-      };
-      const run = captureAgentLoop(
-        [user()],
-        { systemPrompt: "", messages: [], tools: [tool] },
-        {
-          ...config,
-          beforeToolBatch: createToolLoopBatchAdmission({
-            sessionKey: `repeat-error-${enabled}`,
-            runId: `repeat-error-${enabled}`,
-            loopDetection: { enabled },
-          }),
-        },
-        undefined,
-        createTurnSequenceStream(
-          [
-            ...Array.from({ length: 3 }, (_, index) => [makeCall("probe", `call-${index}`)]),
-            [{ type: "text", text: "[tool error]" }],
-          ],
-          requests,
-        ),
-      );
-      const messages = await run.result;
-      expect(requests).toHaveLength(3);
-      expect(messages.filter((message) => message.role === "toolResult")).toHaveLength(3);
-      expect(messages.at(-1)).toMatchObject({
-        role: "assistant",
-        stopReason: "error",
-        errorCode: REPEATED_TOOL_ERROR_CODE,
-        errorMessage: expect.stringContaining("3 consecutive"),
-        content: [{ type: "text", text: expect.stringContaining("native tool calling") }],
-      });
-      expect(run.events.at(-1)).toMatchObject({ type: "agent_end", messages });
-    },
+function failingTool(message = "same failure") {
+  const tool = makeTool("probe");
+  tool.execute = async () => {
+    throw new Error(message);
+  };
+  return tool;
+}
+
+function runTurns(
+  tools: ReturnType<typeof makeTool>[],
+  turns: Parameters<typeof createTurnSequenceStream>[0],
+  options: Partial<typeof config> = {},
+  requests?: Message[][],
+) {
+  return captureAgentLoop(
+    [user()],
+    { systemPrompt: "", messages: [], tools },
+    { ...config, beforeToolBatch: createToolLoopBatchAdmission({}), ...options },
+    undefined,
+    createTurnSequenceStream(turns, requests),
   );
+}
+
+function makeAgent(options: ConstructorParameters<typeof Agent>[0]) {
+  const agent = new Agent(options);
+  setInternalBeforeToolBatch(agent, createToolLoopBatchAdmission({}));
+  return agent;
+}
+
+describe("default repeated tool error termination", () => {
+  it("records a terminal failure after three identical errors with loop detection enabled", async () => {
+    const requests: Message[][] = [];
+    const run = runTurns(
+      [failingTool("resource unavailable")],
+      [
+        ...Array.from({ length: 3 }, (_, index) => [makeCall("probe", `call-${index}`)]),
+        [{ type: "text", text: "[tool error]" }],
+      ],
+      {
+        beforeToolBatch: createToolLoopBatchAdmission({
+          sessionKey: "repeat-error-true",
+          runId: "repeat-error-true",
+          loopDetection: { enabled: true },
+        }),
+      },
+      requests,
+    );
+    const messages = await run.result;
+    expect(requests).toHaveLength(3);
+    expect(messages.filter((message) => message.role === "toolResult")).toHaveLength(3);
+    expect(messages.at(-1)).toMatchObject({
+      role: "assistant",
+      stopReason: "error",
+      errorCode: REPEATED_TOOL_ERROR_CODE,
+      errorMessage: expect.stringContaining("3 consecutive"),
+      content: [{ type: "text", text: expect.stringContaining("native tool calling") }],
+    });
+    expect(run.events.at(-1)).toMatchObject({ type: "agent_end", messages });
+  });
 
   it("preserves successful retry", async () => {
     let calls = 0;
@@ -69,19 +86,12 @@ describe("default repeated tool error termination", () => {
       throw new Error("same error");
     };
     const turns = Array.from({ length: 4 }, (_, index) => [makeCall(tool.name, `call-${index}`)]);
-    const run = captureAgentLoop(
-      [user()],
-      { systemPrompt: "", messages: [], tools: [tool] },
-      {
-        ...config,
-        beforeToolBatch: createToolLoopBatchAdmission({
-          sessionKey: "successful retry",
-          runId: "successful retry",
-        }),
-      },
-      undefined,
-      createTurnSequenceStream([...turns, [{ type: "text", text: "done" }]]),
-    );
+    const run = runTurns([tool], [...turns, [{ type: "text", text: "done" }]], {
+      beforeToolBatch: createToolLoopBatchAdmission({
+        sessionKey: "successful retry",
+        runId: "successful retry",
+      }),
+    });
     expect((await run.result).at(-1)).toMatchObject({ stopReason: "stop" });
     expect(calls).toBe(4);
   });
@@ -96,14 +106,9 @@ describe("default repeated tool error termination", () => {
           details: { status: "error" },
         };
       };
-      const run = captureAgentLoop(
-        [user()],
-        { systemPrompt: "", messages: [], tools: failure === "unknown name" ? [] : [tool] },
-        { ...config, beforeToolBatch: createToolLoopBatchAdmission({}) },
-        undefined,
-        createTurnSequenceStream(
-          Array.from({ length: 3 }, (_, index) => [makeCall("probe", `call-${index}`)]),
-        ),
+      const run = runTurns(
+        failure === "unknown name" ? [] : [tool],
+        Array.from({ length: 3 }, (_, index) => [makeCall("probe", `call-${index}`)]),
       );
       expect((await run.result).at(-1)).toMatchObject({ stopReason: "error" });
     },
@@ -118,18 +123,10 @@ describe("default repeated tool error termination", () => {
         calls++;
         throw new Error("same failure");
       };
-      const run = captureAgentLoop(
-        [user()],
-        { systemPrompt: "", messages: [], tools: [tool] },
-        {
-          ...config,
-          toolExecution,
-          beforeToolBatch: createToolLoopBatchAdmission({}),
-        },
-        undefined,
-        createTurnSequenceStream([
-          Array.from({ length: 5 }, (_, index) => makeCall("probe", `call-${index}`)),
-        ]),
+      const run = runTurns(
+        [tool],
+        [Array.from({ length: 5 }, (_, index) => makeCall("probe", `call-${index}`))],
+        { toolExecution },
       );
       const messages = await run.result;
       expect(calls).toBe(toolExecution === "sequential" ? 3 : 5);
@@ -149,14 +146,13 @@ describe("default repeated tool error termination", () => {
       throw new Error("same failure");
     };
     const completed: string[] = [];
-    const agent = new Agent({
+    const agent = makeAgent({
       initialState: { model, tools: [tool] },
       streamFn: createTurnSequenceStream([
         ["first", "second", "success", "fourth", "fifth"].map((id) => makeCall("probe", id)),
         [{ type: "text", text: "done" }],
       ]),
     });
-    setInternalBeforeToolBatch(agent, createToolLoopBatchAdmission({}));
     agent.subscribe((event) => {
       if (event.type === "tool_execution_end") {
         completed.push(event.toolCallId);
@@ -172,12 +168,8 @@ describe("default repeated tool error termination", () => {
   });
 
   it("keeps failure evidence across continue and resets it for a fresh prompt", async () => {
-    const tool = makeTool("probe");
-    tool.execute = async () => {
-      throw new Error("same failure");
-    };
-    const agent = new Agent({
-      initialState: { model, tools: [tool] },
+    const agent = makeAgent({
+      initialState: { model, tools: [failingTool()] },
       convertToLlm: config.convertToLlm,
       streamFn: createTurnSequenceStream([
         [makeCall("probe", "first")],
@@ -185,7 +177,6 @@ describe("default repeated tool error termination", () => {
       ]),
       afterToolOutcome: async () => ({ terminate: true }),
     });
-    setInternalBeforeToolBatch(agent, createToolLoopBatchAdmission({}));
     await agent.prompt("start");
     await agent.continue();
     agent.streamFn = createTurnSequenceStream([[makeCall("probe", "third")]]);
@@ -206,13 +197,9 @@ describe("default repeated tool error termination", () => {
   ] as const)(
     "starts a fresh error streak for $queue through $delivery",
     async ({ queue, delivery }) => {
-      const tool = makeTool("probe");
-      tool.execute = async () => {
-        throw new Error("same failure");
-      };
       const freshInput = user("second request", 2);
-      const agent = new Agent({
-        initialState: { model, tools: [tool] },
+      const agent = makeAgent({
+        initialState: { model, tools: [failingTool()] },
         streamFn: createTurnSequenceStream([
           [makeCall("probe", "first")],
           [makeCall("probe", "second")],
@@ -223,7 +210,6 @@ describe("default repeated tool error termination", () => {
           [{ type: "text", text: "second answer" }],
         ]),
       });
-      setInternalBeforeToolBatch(agent, createToolLoopBatchAdmission({}));
       if (delivery === "active") {
         agent.subscribe((event) => {
           if (

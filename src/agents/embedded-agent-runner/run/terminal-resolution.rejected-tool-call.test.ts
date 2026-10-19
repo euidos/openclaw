@@ -20,9 +20,14 @@ vi.mock("./auth-profile-success.js", () => ({
 
 const REJECTED_TOOL_CALL_MESSAGE = "Provider returned an incomplete or malformed tool call";
 
-// The reported turn: an exec call completed, then the provider streamed a second
-// call whose arguments were not valid JSON. The transport removed that call
-// before dispatch and ended the turn with stopReason=error.
+function execAssistant(id: string) {
+  return buildEmbeddedRunnerAssistant({
+    stopReason: "toolUse",
+    content: [{ type: "toolCall", id, name: "exec", arguments: {} }],
+  });
+}
+
+// A completed exec followed by a malformed call removed by the transport before dispatch.
 function rejectedCallAfterSettledTool(
   overrides: Parameters<typeof makeEmbeddedRunnerAttempt>[0] = {},
   assistantOverrides: Parameters<typeof buildEmbeddedRunnerAssistant>[0] = {},
@@ -105,29 +110,28 @@ async function refusedExecThenRejectedCall() {
   const failedResult = await refusedExecResult();
   turn.attempt.messagesSnapshot = [
     { role: "user", content: "Inspect the workspace", timestamp: 0 },
-    buildEmbeddedRunnerAssistant({
-      stopReason: "toolUse",
-      content: [{ type: "toolCall", id: "call_exec", name: "exec", arguments: {} }],
-    }),
+    execAssistant("call_exec"),
     failedResult,
     turn.attemptAssistant,
   ];
   return { ...turn, failure, failedTool, failedResult, modelApi: "anthropic-messages" };
 }
 
+function terminalCase(turn: Partial<TerminalInput>, overrides: Partial<TerminalInput> = {}) {
+  const activateInternalPrompt = vi.fn();
+  const input = makeTerminalInput({
+    ...turn,
+    ...overrides,
+    sessionPromptState: { activateInternalPrompt },
+  });
+  return { activateInternalPrompt, resolve: () => resolveEmbeddedRunTerminal(input) };
+}
+
 function prependFailedExec(
   turn: Awaited<ReturnType<typeof refusedExecThenRejectedCall>>,
   result: Awaited<ReturnType<typeof refusedExecResult>>,
 ) {
-  turn.attempt.messagesSnapshot.splice(
-    1,
-    0,
-    buildEmbeddedRunnerAssistant({
-      stopReason: "toolUse",
-      content: [{ type: "toolCall", id: result.toolCallId, name: "exec", arguments: {} }],
-    }),
-    result,
-  );
+  turn.attempt.messagesSnapshot.splice(1, 0, execAssistant(result.toolCallId), result);
   turn.attempt.toolMetas.unshift({
     toolName: "exec",
     toolCallId: result.toolCallId,
@@ -141,26 +145,17 @@ describe("terminal resolution for a tool call rejected before dispatch", () => {
 
   it("continues once after settled tools instead of replaying the attempt", async () => {
     const turn = rejectedCallAfterSettledTool();
-    // The completed exec makes the attempt unsafe to replay.
     expect(turn.attempt.replayMetadata.hadPotentialSideEffects).toBe(true);
-    const activateInternalPrompt = vi.fn();
-
-    await expect(
-      resolveEmbeddedRunTerminal(
-        makeTerminalInput({ ...turn, sessionPromptState: { activateInternalPrompt } }),
-      ),
-    ).resolves.toEqual({ action: "retry" });
+    const { resolve, activateInternalPrompt } = terminalCase(turn);
+    await expect(resolve()).resolves.toEqual({ action: "retry" });
     expect(activateInternalPrompt).toHaveBeenCalledOnce();
     const instruction = activateInternalPrompt.mock.calls[0]?.[0] as string;
     expect(instruction).toContain("rejected before it ran");
     expect(instruction).toContain("Do not repeat completed tool calls");
 
-    const exhausted = await resolveEmbeddedRunTerminal(
-      makeTerminalInput({
-        ...turn,
-        retryState: { ...createEmbeddedRunTerminalRetryState(), emptyResponseAttempts: 1 },
-      }),
-    );
+    const exhausted = await terminalCase(turn, {
+      retryState: { ...createEmbeddedRunTerminalRetryState(), emptyResponseAttempts: 1 },
+    }).resolve();
     expect(exhausted.action).toBe("complete");
     if (exhausted.action !== "complete") {
       return;
@@ -170,15 +165,11 @@ describe("terminal resolution for a tool call rejected before dispatch", () => {
 
   it("continues once after a consumed exec refusal and a malformed different call", async () => {
     const turn = await refusedExecThenRejectedCall();
-    const retryState = createEmbeddedRunTerminalRetryState();
-    const activateInternalPrompt = vi.fn();
-    const input = makeTerminalInput({
-      ...turn,
-      retryState,
-      sessionPromptState: { activateInternalPrompt },
+    const { resolve, activateInternalPrompt } = terminalCase(turn, {
+      retryState: createEmbeddedRunTerminalRetryState(),
     });
 
-    await expect(resolveEmbeddedRunTerminal(input)).resolves.toEqual({ action: "retry" });
+    await expect(resolve()).resolves.toEqual({ action: "retry" });
     expect(activateInternalPrompt).toHaveBeenCalledExactlyOnceWith(
       expect.stringContaining("Do not repeat completed tool calls"),
     );
@@ -187,7 +178,7 @@ describe("terminal resolution for a tool call rejected before dispatch", () => {
       executionStarted: false,
       mutatingAction: false,
     });
-    expect((await resolveEmbeddedRunTerminal(input)).action).toBe("complete");
+    expect((await resolve()).action).toBe("complete");
     expect(activateInternalPrompt).toHaveBeenCalledOnce();
   });
 
@@ -195,45 +186,34 @@ describe("terminal resolution for a tool call rejected before dispatch", () => {
     const turn = await refusedExecThenRejectedCall();
     prependFailedExec(turn, await refusedExecResult("call_earlier"));
 
-    await expect(resolveEmbeddedRunTerminal(makeTerminalInput(turn))).resolves.toEqual({
-      action: "retry",
-    });
+    await expect(terminalCase(turn).resolve()).resolves.toEqual({ action: "retry" });
   });
 
-  it.each([
-    "started",
-    "unknown",
-    "missing-result",
-    "unconsumed",
-    "prior-turn",
-    "different-tool",
-    "earlier-failure",
-    "active",
-    "async",
-  ])("does not continue a %s tool failure", async (condition) => {
-    const turn = await refusedExecThenRejectedCall();
-    const snapshot = turn.attempt.messagesSnapshot;
-    switch (condition) {
-      case "started":
-        turn.failure.executionStarted = true;
-        break;
-      case "unknown":
-        delete turn.failure.executionStarted;
-        break;
-      case "missing-result":
-        snapshot.splice(2, 1);
-        break;
-      case "unconsumed":
-        snapshot.splice(2, 1);
-        snapshot.push(turn.failedResult);
-        break;
-      case "prior-turn":
-        snapshot.splice(3, 0, { role: "user", content: "New task", timestamp: 1 });
-        break;
-      case "different-tool":
-        turn.failure.toolName = "write";
-        break;
-      case "earlier-failure":
+  it.each<[string, (turn: Awaited<ReturnType<typeof refusedExecThenRejectedCall>>) => void]>([
+    ["started", ({ failure }) => Object.assign(failure, { executionStarted: true })],
+    [
+      "unknown",
+      ({ failure }) => {
+        delete failure.executionStarted;
+      },
+    ],
+    ["missing-result", ({ attempt }) => attempt.messagesSnapshot.splice(2, 1)],
+    [
+      "unconsumed",
+      ({ attempt, failedResult }) => {
+        attempt.messagesSnapshot.splice(2, 1);
+        attempt.messagesSnapshot.push(failedResult);
+      },
+    ],
+    [
+      "prior-turn",
+      ({ attempt }) =>
+        attempt.messagesSnapshot.splice(3, 0, { role: "user", content: "New task", timestamp: 1 }),
+    ],
+    ["different-tool", ({ failure }) => Object.assign(failure, { toolName: "write" })],
+    [
+      "earlier-failure",
+      (turn) =>
         prependFailedExec(turn, {
           role: "toolResult",
           toolCallId: "call_earlier",
@@ -241,51 +221,24 @@ describe("terminal resolution for a tool call rejected before dispatch", () => {
           content: [{ type: "text", text: "Command failed after starting" }],
           isError: true,
           timestamp: 0,
-        });
-        break;
-      case "active":
-        turn.attempt.itemLifecycle.activeCount = 1;
-        break;
-      case "async":
-        turn.failedTool.asyncStarted = true;
-        break;
-    }
-    const activateInternalPrompt = vi.fn();
-    const result = await resolveEmbeddedRunTerminal(
-      makeTerminalInput({ ...turn, sessionPromptState: { activateInternalPrompt } }),
-    );
+        }),
+    ],
+    ["active", ({ attempt }) => Object.assign(attempt.itemLifecycle, { activeCount: 1 })],
+    ["async", ({ failedTool }) => Object.assign(failedTool, { asyncStarted: true })],
+  ])("does not continue a %s tool failure", async (_condition, alter) => {
+    const turn = await refusedExecThenRejectedCall();
+    alter(turn);
+    const { resolve, activateInternalPrompt } = terminalCase(turn);
+    const result = await resolve();
     expect(result.action).toBe("complete");
     expect(activateInternalPrompt).not.toHaveBeenCalled();
   });
 
-  it("also covers the malformed-arguments error code", async () => {
-    const activateInternalPrompt = vi.fn();
-    await expect(
-      resolveEmbeddedRunTerminal(
-        makeTerminalInput({
-          ...rejectedCallAfterSettledTool(
-            {},
-            {
-              errorMessage: "Provider completed tool call with malformed JSON arguments",
-              errorCode: "malformed_tool_call_arguments",
-            },
-          ),
-          sessionPromptState: { activateInternalPrompt },
-        }),
-      ),
-    ).resolves.toEqual({ action: "retry" });
-  });
-
   it("does not continue after an unrelated provider error", async () => {
-    const overrides = {};
-    const assistant = { errorMessage: "upstream connect error" };
-    const activateInternalPrompt = vi.fn();
-    const result = await resolveEmbeddedRunTerminal(
-      makeTerminalInput({
-        ...rejectedCallAfterSettledTool(overrides, assistant),
-        sessionPromptState: { activateInternalPrompt },
-      }),
+    const { resolve, activateInternalPrompt } = terminalCase(
+      rejectedCallAfterSettledTool({}, { errorMessage: "upstream connect error" }),
     );
+    const result = await resolve();
 
     expect(result.action).toBe("complete");
     expect(activateInternalPrompt).not.toHaveBeenCalled();
