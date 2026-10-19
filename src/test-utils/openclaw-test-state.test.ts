@@ -1,4 +1,3 @@
-// Tests isolated OpenClaw test-state setup and cleanup behavior.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -52,124 +51,104 @@ const readEnv = (keys: string[], env = process.env) =>
 function expectEnv(expected: NodeJS.ProcessEnv, env = process.env) {
   expect(readEnv(Object.keys(expected), env)).toEqual(expected);
 }
+function expectOpen(isOpen: boolean, ...databases: Pick<DatabaseSync, "isOpen">[]) {
+  for (const database of databases) {
+    expect(database).toMatchObject({ isOpen });
+  }
+}
+function saveAuthFixture(dir: string) {
+  saveAuthProfileStore(makeAuthStore(), dir, {
+    filterExternalAuthProfiles: false,
+    syncExternalCli: false,
+  });
+}
+
+async function createRollbackFixture() {
+  const parent = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "state-rollback-")));
+  const owner = createVitestResourceOwner(parent);
+  const lifetime = createFixtureLifetime(parent);
+  return { parent, owner, lifetime, prefix: path.join(path.basename(parent), "fixture-") };
+}
 
 describe("openclaw test state", () => {
-  it("retains failed pre-handoff state rollback through the cleanup verifier", async () => {
-    const lifetimeRoot = await fs.mkdtemp(path.join(os.tmpdir(), "state-rollback-owner-"));
-    const owner = createVitestResourceOwner(lifetimeRoot);
-    const lifetime = createFixtureLifetime(lifetimeRoot);
-    const acquisitionFailure = new Error("state canonicalization failed");
-    const cleanupFailure = new Error("state acquisition rollback failed");
-    const mkdtemp = fs.mkdtemp;
-    const rm = fs.rm;
-    let allocatedRoot: string | undefined;
-    const allocated = vi.spyOn(fs, "mkdtemp").mockImplementation(async (...args) => {
-      const root = await mkdtemp(...args);
-      if (args[0].endsWith("state-failed-rollback-")) {
-        allocatedRoot = root;
-      }
-      return root;
-    });
-    const canonicalization = vi.spyOn(fs, "realpath").mockRejectedValueOnce(acquisitionFailure);
-    const removal = vi.spyOn(fs, "rm").mockImplementation(async (...args) => {
-      if (args[0] === allocatedRoot) {
-        throw cleanupFailure;
-      }
-      return rm(...args);
-    });
-    const sessionDrain = vi.spyOn(sessionCleanup, "cleanupSessionStateForTest");
-    const options = {
-      prefix: "state-failed-rollback-",
-      applyEnv: false,
-      verifyCleanup: lifetime.verifyCleanup,
-    };
-    try {
-      await expect(lifetime.run(() => createOpenClawTestState(options))).rejects.toBe(
-        cleanupFailure,
-      );
-      // Preserve the factory's existing error order; the separate lifetime must
-      // still observe failed rollback when no state object reached the caller.
-      await expect(lifetime.cleanup()).rejects.toThrow("Fixture cleanup unverified");
-      expect(() => owner.assertReleased()).toThrow("Unreleased Vitest resource claim");
-      expect(allocatedRoot).toBeDefined();
-      await expect(fs.stat(allocatedRoot!)).resolves.toBeDefined();
-      expect(sessionDrain).not.toHaveBeenCalled();
-    } finally {
-      allocated.mockRestore();
-      canonicalization.mockRestore();
-      removal.mockRestore();
-      sessionDrain.mockRestore();
-      await lifetime.cleanup().catch(() => undefined);
-      if (allocatedRoot) {
-        await fs.rm(allocatedRoot, { recursive: true, force: true });
-      }
-      await fs.rm(lifetimeRoot, { recursive: true, force: true });
-    }
-  });
-
-  it("retains a synchronous environment rollback failure without removing its state", async () => {
-    const parent = await fs.realpath(
-      await fs.mkdtemp(path.join(os.tmpdir(), "state-env-rollback-owner-")),
-    );
-    const owner = createVitestResourceOwner(parent);
-    const lifetime = createFixtureLifetime(parent);
-    const environment = captureFullEnv();
-    const previousHome = path.join(parent, "previous-home");
-    setTestEnvValue("HOME", previousHome);
-    const acquisitionFailure = new Error("partial environment application failed");
-    const rollbackFailure = new Error("environment rollback failed synchronously");
-    const prefix = path.join(path.basename(parent), "fixture-");
-    const mkdtemp = fs.mkdtemp;
-    const set = Reflect.set;
-    let allocatedRoot: string | undefined;
-    let applicationFailed = false;
-    let rollbackFailed = false;
-    const allocation = vi.spyOn(fs, "mkdtemp").mockImplementation(async (...args) => {
-      const root = await mkdtemp(...args);
-      if (args[0].endsWith(prefix)) {
-        allocatedRoot = root;
-      }
-      return root;
-    });
-    const removal = vi.spyOn(fs, "rm");
-    const fault = vi.spyOn(Reflect, "set").mockImplementation((...args) => {
-      const result = set(...args);
-      if (args[0] === process.env && args[1] === "HOME") {
-        if (!applicationFailed) {
-          applicationFailed = true;
-          throw acquisitionFailure;
+  it.each(["filesystem", "environment"])(
+    "retains failed %s rollback through the cleanup verifier",
+    async (stage) => {
+      const { parent, owner, lifetime, prefix } = await createRollbackFixture();
+      const environment = captureFullEnv();
+      const previousHome = path.join(parent, "previous-home");
+      setTestEnvValue("HOME", previousHome);
+      const acquisitionFailure = new Error("state canonicalization failed");
+      const cleanupFailure = new Error("state acquisition rollback failed");
+      const mkdtemp = fs.mkdtemp;
+      const rm = fs.rm;
+      const set = Reflect.set;
+      let writes = 0;
+      let allocatedRoot: string | undefined;
+      const allocated = vi.spyOn(fs, "mkdtemp").mockImplementation(async (...args) => {
+        const root = await mkdtemp(...args);
+        if (args[0].endsWith(prefix)) {
+          allocatedRoot = root;
         }
-        rollbackFailed = true;
+        return root;
+      });
+      const removal = vi.spyOn(fs, "rm").mockImplementation(async (...args) => {
+        if (stage === "filesystem" && args[0] === allocatedRoot) {
+          throw cleanupFailure;
+        }
+        return rm(...args);
+      });
+      const fault =
+        stage === "filesystem"
+          ? vi.spyOn(fs, "realpath").mockRejectedValueOnce(acquisitionFailure)
+          : vi.spyOn(Reflect, "set").mockImplementation((...args) => {
+              const result = set(...args);
+              if (args[0] === process.env && args[1] === "HOME") {
+                if (++writes === 1) {
+                  throw acquisitionFailure;
+                }
+                fault.mockRestore();
+                throw cleanupFailure;
+              }
+              return result;
+            });
+      const sessionDrain = vi.spyOn(sessionCleanup, "cleanupSessionStateForTest");
+      try {
+        await expect(
+          lifetime.run(() =>
+            createOpenClawTestState({
+              prefix,
+              applyEnv: stage === "environment",
+              verifyCleanup: lifetime.verifyCleanup,
+            }),
+          ),
+        ).rejects.toBe(cleanupFailure);
+        if (stage === "environment") {
+          expect(writes).toBe(2);
+          expect(process.env.HOME).toBe(previousHome);
+          expect(removal).not.toHaveBeenCalled();
+          await expect(lifetime.cleanup()).rejects.toMatchObject({ errors: [cleanupFailure] });
+        } else {
+          await expect(lifetime.cleanup()).rejects.toThrow("Fixture cleanup unverified");
+        }
+        expect(() => owner.assertReleased()).toThrow("Unreleased Vitest resource claim");
+        expect(allocatedRoot).toBeDefined();
+        await expect(fs.stat(allocatedRoot!)).resolves.toBeDefined();
+        expect(sessionDrain).not.toHaveBeenCalled();
+        if (stage === "environment") {
+          expect(removal).not.toHaveBeenCalled();
+        }
+      } finally {
+        allocated.mockRestore();
         fault.mockRestore();
-        throw rollbackFailure;
+        removal.mockRestore();
+        sessionDrain.mockRestore();
+        environment.restore();
+        await lifetime.cleanup().catch(() => undefined);
+        await fs.rm(parent, { recursive: true, force: true });
       }
-      return result;
-    });
-    try {
-      await expect(
-        lifetime.run(() =>
-          createOpenClawTestState({ prefix, verifyCleanup: lifetime.verifyCleanup }),
-        ),
-      ).rejects.toBe(rollbackFailure);
-      expect(applicationFailed && rollbackFailed).toBe(true);
-      expect(process.env.HOME).toBe(previousHome);
-      expect(removal).not.toHaveBeenCalled();
-      expect(allocatedRoot).toBeDefined();
-      await expect(fs.stat(allocatedRoot!)).resolves.toBeDefined();
-      await expect(lifetime.cleanup()).rejects.toMatchObject({ errors: [rollbackFailure] });
-      expect(() => owner.assertReleased()).toThrow("Unreleased Vitest resource claim");
-      expect(removal).not.toHaveBeenCalled();
-    } finally {
-      fault.mockRestore();
-      allocation.mockRestore();
-      removal.mockRestore();
-      environment.restore();
-      await lifetime.cleanup().catch(() => undefined);
-      // The injected synchronous failure owns no pending work. Only this outer
-      // test disposes the deliberately retained root and failed claim.
-      await fs.rm(parent, { recursive: true, force: true });
-    }
-  });
+    },
+  );
 
   it("joins callback descendants before beginning state release", async () => {
     const gate = createDeferredCore();
@@ -177,14 +156,7 @@ describe("openclaw test state", () => {
     let background: Promise<void> | undefined;
     let fixtureStateDir: string | undefined;
     let selectedStateDir: string | undefined;
-    let cleanupStarted = false;
-    const cleanup = sessionCleanup.cleanupSessionStateForTest;
-    const observedCleanup = vi
-      .spyOn(sessionCleanup, "cleanupSessionStateForTest")
-      .mockImplementation((options) => {
-        cleanupStarted = true;
-        return cleanup(options);
-      });
+    const observedCleanup = vi.spyOn(sessionCleanup, "cleanupSessionStateForTest");
     const operation = withOpenClawTestState({ label: "callback-descendant" }, async (state) => {
       fixtureStateDir = state.stateDir;
       background = trackAsyncWork(async () => {
@@ -196,7 +168,7 @@ describe("openclaw test state", () => {
     try {
       await entered.promise;
       await nextTurn();
-      expect.soft(cleanupStarted).toBe(false);
+      expect.soft(observedCleanup).not.toHaveBeenCalled();
       expect.soft(process.env.OPENCLAW_STATE_DIR).toBe(fixtureStateDir);
     } finally {
       gate.resolve();
@@ -269,12 +241,7 @@ describe("openclaw test state", () => {
   ] as const)(
     "rolls back $stage acquisition in $layout layout ($verifier)",
     async ({ stage, layout, verifier }) => {
-      const parent = await fs.realpath(
-        await fs.mkdtemp(path.join(os.tmpdir(), "test-state-acquisition-")),
-      );
-      const prefix = path.join(path.basename(parent), "fixture-");
-      const owner = createVitestResourceOwner(parent);
-      const lifetime = createFixtureLifetime(parent);
+      const { parent, prefix, owner, lifetime } = await createRollbackFixture();
       const unrelated = openOpenClawStateDatabase({
         env: { OPENCLAW_STATE_DIR: path.join(parent, "unrelated") },
       });
@@ -453,25 +420,23 @@ describe("openclaw test state", () => {
         PI_CODING_AGENT_DIR: "/tmp/outside-legacy-agent",
       };
       await withEnvAsync(inherited, async () => {
-        const state = await createOpenClawTestState({
-          layout: agentEnv === "main" ? "home" : "state-only",
-          agentEnv,
-          applyEnv,
-        });
-
-        try {
-          const expectedAgentDir = agentEnv === "main" ? state.agentDir() : undefined;
-          const selectors = {
-            OPENCLAW_AGENT_DIR: expectedAgentDir,
-            PI_CODING_AGENT_DIR: undefined,
-          };
-          expectEnv(selectors, state.env);
-          expectEnv(applyEnv ? selectors : inherited);
-          expect(state.agentDir()).toBe(path.join(state.stateDir, "agents", "main", "agent"));
-        } finally {
-          await state.cleanup();
-        }
-
+        await withOpenClawTestState(
+          {
+            layout: agentEnv === "main" ? "home" : "state-only",
+            agentEnv,
+            applyEnv,
+          },
+          async (state) => {
+            const expectedAgentDir = agentEnv === "main" ? state.agentDir() : undefined;
+            const selectors = {
+              OPENCLAW_AGENT_DIR: expectedAgentDir,
+              PI_CODING_AGENT_DIR: undefined,
+            };
+            expectEnv(selectors, state.env);
+            expectEnv(applyEnv ? selectors : inherited);
+            expect(state.agentDir()).toBe(path.join(state.stateDir, "agents", "main", "agent"));
+          },
+        );
         expectEnv(inherited);
       });
     },
@@ -484,19 +449,19 @@ describe("openclaw test state", () => {
         OPENCLAW_AGENT_DIR: "/tmp/explicit-openclaw-agent",
         PI_CODING_AGENT_DIR: "/tmp/explicit-legacy-agent",
       };
-      const state = await createOpenClawTestState({
-        agentEnv: "main",
-        applyEnv: false,
-        env: overrides,
-      });
-      try {
-        expectEnv(overrides, state.env);
-        expectEnv(previous);
-        state.applyEnv();
-        expectEnv(overrides);
-      } finally {
-        await state.cleanup();
-      }
+      await withOpenClawTestState(
+        {
+          agentEnv: "main",
+          applyEnv: false,
+          env: overrides,
+        },
+        async (state) => {
+          expectEnv(overrides, state.env);
+          expectEnv(previous);
+          state.applyEnv();
+          expectEnv(overrides);
+        },
+      );
       expectEnv(previous);
     });
   });
@@ -509,9 +474,10 @@ describe("openclaw test state", () => {
       });
       const profilePath = await state.writeAuthProfiles(makeAuthStore());
       expect(profilePath).toBe(path.join(state.agentDir(), "openclaw-agent.sqlite"));
-      const profiles = loadPersistedAuthProfileStore(state.agentDir());
-      expect(profiles?.version).toBe(1);
-      expect(profiles?.profiles["openai:test"]?.provider).toBe("openai");
+      expect(loadPersistedAuthProfileStore(state.agentDir())).toMatchObject({
+        version: 1,
+        profiles: { "openai:test": { provider: "openai" } },
+      });
     });
   });
 
@@ -530,19 +496,12 @@ describe("openclaw test state", () => {
         layout: "state-only",
         label: "database-cleanup",
       });
-      const authStore = makeAuthStore();
       const fixtureAuthDir =
         location === "configured" ? state.path("configured-auth") : state.agentDir("auth-reader");
       const fixtureAuthPath = resolveAuthProfileDatabasePath(fixtureAuthDir);
-      saveAuthProfileStore(authStore, fixtureAuthDir, {
-        filterExternalAuthProfiles: false,
-        syncExternalCli: false,
-      });
+      saveAuthFixture(fixtureAuthDir);
       const unrelatedAgentDir = path.join(unrelatedRoot, "state", "agents", "outside", "agent");
-      saveAuthProfileStore(authStore, unrelatedAgentDir, {
-        filterExternalAuthProfiles: false,
-        syncExternalCli: false,
-      });
+      saveAuthFixture(unrelatedAgentDir);
       const fixtureShared = openOpenClawStateDatabase({ env: state.env });
       const fixtureAgent = openOpenClawAgentDatabase({
         agentId: "worker",
@@ -556,49 +515,43 @@ describe("openclaw test state", () => {
         env: unrelatedEnv,
       });
       const openSpy = vi.spyOn(nodeSqlite, "openNodeSqliteDatabase");
-      expect(loadPersistedAuthProfileStore(fixtureAuthDir)).not.toBeNull();
-      expect(loadPersistedAuthProfileStore(unrelatedAgentDir)).not.toBeNull();
-      const readOnlyDatabases = openSpy.mock.calls.flatMap((call, index) => {
-        if (call[1]?.readOnly !== true) {
-          return [];
+      const loadReader = (dir: string, expectedPath: string) => {
+        expect(loadPersistedAuthProfileStore(dir)).not.toBeNull();
+        const result = openSpy.mock.results.find((_, index) => {
+          const call = openSpy.mock.calls[index];
+          return (
+            call?.[1]?.readOnly === true && path.resolve(call[0]) === path.resolve(expectedPath)
+          );
+        });
+        if (result?.type !== "return") {
+          throw new Error("expected pooled auth reader");
         }
-        const database = openSpy.mock.results[index]?.value as DatabaseSync | undefined;
-        return database ? [{ path: path.resolve(call[0]), database }] : [];
-      });
-      const fixtureAuthReader = readOnlyDatabases.find(
-        (entry) => entry.path === path.resolve(fixtureAuthPath),
-      )?.database;
-      const unrelatedAuthReader = readOnlyDatabases.find(
-        (entry) => entry.path === path.resolve(unrelatedAgent.path),
-      )?.database;
-      if (!fixtureAuthReader || !unrelatedAuthReader) {
-        throw new Error("expected fixture and unrelated pooled auth readers");
-      }
-      expect(fixtureAuthReader.isOpen).toBe(true);
-      expect(unrelatedAuthReader.isOpen).toBe(true);
-      const restoreEnv = state.restoreEnv;
-      const originalRm = fs.rm;
-      const rmSpy = vi.spyOn(fs, "rm").mockImplementation((...args) => {
-        expect(fixtureAuthReader.isOpen).toBe(false);
-        expect(fixtureAgent.db.isOpen).toBe(false);
+        return result.value;
+      };
+      const fixtureAuthReader = loadReader(fixtureAuthDir, fixtureAuthPath);
+      const unrelatedAuthReader = loadReader(unrelatedAgentDir, unrelatedAgent.path);
+      expectOpen(true, fixtureAuthReader, unrelatedAuthReader);
+      const expectFixtureClosed = () => {
+        expectOpen(false, fixtureAuthReader, fixtureAgent.db);
         expect(
           openClawStateDatabaseCache.getOpenClawStateDatabaseIfOpenAtPath(fixtureShared.path),
         ).toBeUndefined();
-        expect(unrelatedAuthReader.isOpen).toBe(true);
+      };
+      const expectUnrelatedOpen = () =>
+        expectOpen(true, unrelatedAuthReader, unrelatedShared.db, unrelatedAgent.db);
+      const restoreEnv = state.restoreEnv;
+      const originalRm = fs.rm;
+      const rmSpy = vi.spyOn(fs, "rm").mockImplementation((...args) => {
+        expectFixtureClosed();
+        expectOpen(true, unrelatedAuthReader);
         return originalRm(...args);
       });
       state.restoreEnv = async () => {
         expect(process.env.OPENCLAW_STATE_DIR).toBe(state.stateDir);
         await restoreEnv();
-        expect(fixtureAuthReader.isOpen).toBe(false);
-        expect(fixtureShared.db.isOpen).toBe(false);
-        expect(fixtureAgent.db.isOpen).toBe(false);
-        expect(
-          openClawStateDatabaseCache.getOpenClawStateDatabaseIfOpenAtPath(fixtureShared.path),
-        ).toBeUndefined();
-        expect(unrelatedAuthReader.isOpen).toBe(true);
-        expect(unrelatedShared.db.isOpen).toBe(true);
-        expect(unrelatedAgent.db.isOpen).toBe(true);
+        expectFixtureClosed();
+        expectOpen(false, fixtureShared.db);
+        expectUnrelatedOpen();
       };
 
       try {
@@ -607,19 +560,19 @@ describe("openclaw test state", () => {
         expect(process.env.OPENCLAW_STATE_DIR).toBe(previousStateDir);
         expect(rmSpy).toHaveBeenCalledWith(state.root, removeOptions);
         await expectPathMissing(state.root);
-        expect(unrelatedAuthReader.isOpen).toBe(true);
-        expect(unrelatedShared.db.isOpen).toBe(true);
-        expect(unrelatedAgent.db.isOpen).toBe(true);
+        expectUnrelatedOpen();
       } finally {
         state.restoreEnv = restoreEnv;
         await restoreEnv();
-        closeAuthProfileReadPool({ kind: "database", databasePath: fixtureAuthPath });
-        closeAuthProfileReadPool({ kind: "database", databasePath: unrelatedAgent.path });
-        closeOpenClawAgentDatabaseByPath(fixtureAuthPath);
-        closeOpenClawAgentDatabaseByPath(fixtureAgent.path);
-        closeOpenClawAgentDatabaseByPath(unrelatedAgent.path);
-        closeOpenClawStateDatabaseByPath(fixtureShared.path);
-        closeOpenClawStateDatabaseByPath(unrelatedShared.path);
+        for (const databasePath of [fixtureAuthPath, unrelatedAgent.path]) {
+          closeAuthProfileReadPool({ kind: "database", databasePath });
+        }
+        for (const databasePath of [fixtureAuthPath, fixtureAgent.path, unrelatedAgent.path]) {
+          closeOpenClawAgentDatabaseByPath(databasePath);
+        }
+        for (const database of [fixtureShared, unrelatedShared]) {
+          closeOpenClawStateDatabaseByPath(database.path);
+        }
         openSpy.mockRestore();
         rmSpy.mockRestore();
         await fs.rm(state.root, removeOptions);
@@ -650,14 +603,7 @@ describe("openclaw test state", () => {
             return run(operation);
           }, owner),
         );
-      const originalRm = fs.rm;
-      let removalStarted = false;
-      const rmSpy = vi.spyOn(fs, "rm").mockImplementation((...args) => {
-        if (args[0] === state.root) {
-          removalStarted = true;
-        }
-        return originalRm(...args);
-      });
+      const rmSpy = vi.spyOn(fs, "rm");
       const openSpy = vi.spyOn(nodeSqlite, "openNodeSqliteDatabase");
       let cleanup: Promise<void> | undefined;
       let reconcile: Promise<void> | undefined;
@@ -670,19 +616,18 @@ describe("openclaw test state", () => {
         // Empty drains settle before this real event-loop checkpoint. Old cleanup
         // reaches rm; repaired cleanup must keep the fixture alive for the owner.
         await nextTurn();
-        expect(removalStarted).toBe(false);
+        expect(rmSpy.mock.calls.some(([target]) => target === state.root)).toBe(false);
         expect(agent.db.isOpen).toBe(true);
         expect(process.env.OPENCLAW_STATE_DIR).toBe(state.stateDir);
         resumeReconcile.resolve();
         await reconcile;
         await cleanup;
 
-        await expectPathMissing(state.root);
-        await expectPathMissing(agent.path);
-        await expectPathMissing(shared.path);
+        for (const target of [state.root, agent.path, shared.path]) {
+          await expectPathMissing(target);
+        }
         expect(isOpenClawAgentDatabaseOpen(agent.path)).toBe(false);
-        expect(agent.db.isOpen).toBe(false);
-        expect(shared.db.isOpen).toBe(false);
+        expectOpen(false, agent.db, shared.db);
         expect(openSpy.mock.calls.filter(([pathname]) => pathname === agent.path)).toEqual([]);
       } finally {
         operationSpy.mockRestore();
@@ -736,8 +681,10 @@ describe("openclaw test state", () => {
           }),
         ).rejects.toBe(callbackError);
 
-        expect(shared?.db.isOpen).toBe(false);
-        expect(agent?.db.isOpen).toBe(false);
+        expect({ shared, agent }).toMatchObject({
+          shared: { db: { isOpen: false } },
+          agent: { db: { isOpen: false } },
+        });
         expect(selectorKeys.map((key) => process.env[key])).toEqual(previous);
         if (failure === "ordinary") {
           await expectPathMissing(root);

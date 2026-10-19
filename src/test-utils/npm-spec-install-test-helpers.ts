@@ -1,4 +1,3 @@
-// Helpers for package install tests that inspect npm spec output.
 import fs from "node:fs";
 import path from "node:path";
 import { expect } from "vitest";
@@ -76,26 +75,27 @@ export function createCommandResult(overrides: Partial<SpawnResult> = {}): Spawn
   };
 }
 
-/** Mocks npm view JSON metadata for package install validation tests. */
-export function mockNpmViewMetadataResult(run: CommandMock, metadata: NpmViewMetadata) {
-  run.mockImplementation(async (argv) => {
-    if (npmCommandArgs(argv)?.[0] !== "view") {
+function mockNpmMetadata(
+  run: CommandMock,
+  command: "view" | "pack",
+  metadata: (options: number | CommandOptions) => unknown,
+) {
+  run.mockImplementation(async (argv, options) => {
+    if (npmCommandArgs(argv)?.[0] !== command) {
       throw new Error(`unexpected command: ${argv.join(" ")}`);
     }
-
+    return createCommandResult({ stdout: JSON.stringify(metadata(options)) });
+  });
+}
+export function mockNpmViewMetadataResult(run: CommandMock, metadata: NpmViewMetadata) {
+  mockNpmMetadata(run, "view", () => {
     const { name, version, integrity, shasum } = metadata;
-    return createCommandResult({
-      stdout: JSON.stringify({ name, version, dist: { integrity, shasum } }),
-    });
+    return { name, version, dist: { integrity, shasum } };
   });
 }
 
 export function mockNpmPackMetadataResult(run: CommandMock, metadata: NpmPackMetadata) {
-  run.mockImplementation(async (argv, optionsOrTimeout) => {
-    if (npmCommandArgs(argv)?.[0] !== "pack") {
-      throw new Error(`unexpected command: ${argv.join(" ")}`);
-    }
-
+  mockNpmMetadata(run, "pack", (optionsOrTimeout) => {
     const cwd =
       typeof optionsOrTimeout === "object" && optionsOrTimeout !== null
         ? optionsOrTimeout.cwd
@@ -104,7 +104,7 @@ export function mockNpmPackMetadataResult(run: CommandMock, metadata: NpmPackMet
       fs.writeFileSync(path.join(cwd, metadata.filename), "");
     }
 
-    return createCommandResult({ stdout: JSON.stringify([metadata]) });
+    return [metadata];
   });
 }
 
