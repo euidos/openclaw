@@ -1,4 +1,3 @@
-// Voice Call tests cover doctor contract api plugin behavior.
 import fs from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -40,6 +39,20 @@ function createDoctorContext(env: NodeJS.ProcessEnv): PluginDoctorStateMigration
   };
 }
 
+function pluginConfig(config: Record<string, unknown>, id = "voice-call") {
+  return { plugins: { entries: { [id]: { config } } } };
+}
+
+function migrationParams(stateDir: string, env: NodeJS.ProcessEnv, config = {}) {
+  return {
+    config,
+    env,
+    stateDir,
+    oauthDir: path.join(stateDir, "oauth"),
+    context: createDoctorContext(env),
+  };
+}
+
 describe.each(["default", "custom"] as const)("absent %s Voice Call store", (location) => {
   it.each(["detectLegacyState", "migrateLegacyState"] as const)(
     "%s leaves absent state untouched without loading repair machinery",
@@ -53,16 +66,7 @@ describe.each(["default", "custom"] as const)("absent %s Voice Call store", (loc
       try {
         const result = await expectDefined(stateMigrations[1], "voice-call schema migration")[
           method
-        ]({
-          config:
-            location === "custom"
-              ? { plugins: { entries: { "voice-call": { config: { store } } } } }
-              : {},
-          env,
-          stateDir: root,
-          oauthDir: path.join(root, "oauth"),
-          context: createDoctorContext(env),
-        });
+        ](migrationParams(root, env, location === "custom" ? pluginConfig({ store }) : {}));
         expect(result).toEqual(
           method === "detectLegacyState" ? null : { changes: [], warnings: [] },
         );
@@ -89,28 +93,18 @@ describe("voice-call doctor state migration", () => {
   it("reports top-level and per-number session-store agents", () => {
     expect(
       resolveSessionStoreAgentIds({
-        cfg: {
-          plugins: {
-            entries: {
-              "voice-call": {
-                config: {
-                  agentId: "Voice",
-                  numbers: {
-                    "+15550001111": { agentId: "Cards" },
-                    "+15550002222": {},
-                  },
-                },
-              },
-            },
+        cfg: pluginConfig({
+          agentId: "Voice",
+          numbers: {
+            "+15550001111": { agentId: "Cards" },
+            "+15550002222": {},
           },
-        },
+        }),
       }),
     ).toEqual(["cards", "voice"]);
     expect(
       resolveSessionStoreAgentIds({
-        cfg: {
-          plugins: { entries: { "@openclaw/voice-call": { config: {} } } },
-        },
+        cfg: pluginConfig({}, "@openclaw/voice-call"),
       }),
     ).toEqual(["main"]);
     expect(
@@ -139,24 +133,13 @@ describe("voice-call doctor state migration", () => {
       );
       await fs.writeFile(source, bytes);
       const migration = expectDefined(stateMigrations[0], "retired call-log migration");
-      const params = {
-        config: {
-          plugins: {
-            entries: {
-              "voice-call": {
-                config:
-                  location === "default"
-                    ? {}
-                    : { store: location === "tilde" ? "~/dollar-store" : store },
-              },
-            },
-          },
-        },
-        env: { ...env, HOME: home },
+      const params = migrationParams(
         stateDir,
-        oauthDir: path.join(stateDir, "oauth"),
-        context: createDoctorContext(env),
-      };
+        { ...env, HOME: home },
+        pluginConfig(
+          location === "default" ? {} : { store: location === "tilde" ? "~/dollar-store" : store },
+        ),
+      );
       await expect(migration.detectLegacyState(params)).resolves.toMatchObject({
         preview: [expect.stringContaining(source)],
       });
@@ -200,22 +183,7 @@ describe("voice-call doctor state migration", () => {
       db.close();
     }
     const migration = expectDefined(stateMigrations[1], "voice-call schema migration");
-    const config = {
-      plugins: {
-        entries: {
-          "voice-call": {
-            config: { store: storePath },
-          },
-        },
-      },
-    };
-    const params = {
-      config,
-      env,
-      stateDir,
-      oauthDir: path.join(stateDir, "oauth"),
-      context: createDoctorContext(env),
-    };
+    const params = migrationParams(stateDir, env, pluginConfig({ store: storePath }));
 
     await expect(migration.detectLegacyState(params)).resolves.toEqual({
       preview: [
