@@ -110,8 +110,7 @@ async function writeMedia(name = "inbound/report.txt", data: string | Buffer = "
   return source;
 }
 // These fixtures run the Linux remote host locally (including GNU stat).
-const describeLinux = describe.runIf(process.platform === "linux");
-describeLinux("workspace attachment adapter with the real remote-shell bridge", () => {
+describe.runIf(process.platform === "linux")("workspace attachments over remote shell", () => {
   it("keeps images readable on Gateway and transfers their originals without a local workspace copy", async () => {
     const bytes = Buffer.from(
       "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACXBIWXMAAAsTAAALEwEAmpwYAAAADUlEQVR4nGP4////KwAJ5gPoxLp9owAAAABJRU5ErkJggg==",
@@ -132,15 +131,13 @@ describeLinux("workspace attachment adapter with the real remote-shell bridge", 
     await prepareMedia(media);
     expect(await fs.readFile(f.destination(source))).toEqual(bytes);
     const result = await loadImages({ media, workspaceOnly: true });
-    expect(result.failedMediaCount).toBe(0);
-    expect(result.images).toHaveLength(1);
+    expect(result).toMatchObject({ failedMediaCount: 0, images: [expect.any(Object)] });
     const promptOnly = await loadImages({ prompt: `Inspect ${source}` });
     expect(promptOnly.images).toHaveLength(0);
     const outside = path.join(f.gateway, "private.png");
     await fs.writeFile(outside, bytes);
     const rejected = await loadImages({ media: [{ path: outside, contentType: "image/png" }] });
-    expect(rejected.images).toHaveLength(0);
-    expect(rejected.failedMediaCount).toBe(1);
+    expect(rejected).toMatchObject({ images: [], failedMediaCount: 1 });
   });
 
   it("transfers 50 MiB without a Gateway workspace copy and preserves subsequent Harness edits", async () => {
@@ -209,54 +206,55 @@ describeLinux("workspace attachment adapter with the real remote-shell bridge", 
     expect(f.create).toHaveBeenCalledTimes(4);
   });
 
-  it.each(["outside", "symlink", "invalid-uri", "oversized"])(
-    "rejects %s input before any remote mutation",
-    async (kind) => {
-      const outside = path.join(f.gateway, "secret.txt");
-      await fs.writeFile(outside, "secret");
-      let source = outside;
-      if (kind === "symlink") {
-        source = path.join(getMediaDir(), "remote-cache", "escape.txt");
-        await fs.symlink(outside, source);
-      } else if (kind === "invalid-uri") {
-        source = "media://inbound/nested%2Fsecret.txt";
-      } else if (kind === "oversized") {
-        source = await writeMedia("remote-cache/large.bin", "");
-        await fs.truncate(source, 50 * 1024 * 1024 + 1);
-      }
-      await expect(prepareMedia([{ path: source, workspaceDir: f.gateway }])).rejects.toThrow();
-      expect(f.create).not.toHaveBeenCalled();
-      expect(await fs.readdir(f.harness)).toEqual([]);
-    },
-  );
-
-  it.each(["unmarked-directory", "bad-marker", "non-file"])(
-    "does not overwrite an existing %s",
-    async (kind) => {
-      const source = await writeMedia();
-      const destination = f.destination(source);
-      if (kind === "non-file") {
-        await prepareMedia([{ path: source }]);
-        await fs.unlink(destination);
-        await fs.mkdir(destination);
-      } else {
-        await fs.mkdir(path.dirname(destination), { recursive: true });
-        if (kind === "bad-marker") {
-          await fs.writeFile(path.join(path.dirname(destination), ".gitignore"), "user marker");
-        }
-      }
-      f.create.mockClear();
-      await expect(prepareMedia([{ path: source }])).rejects.toThrow();
-      if (kind !== "non-file") {
-        expect(f.create).not.toHaveBeenCalled();
-      }
+  it.each([
+    "outside",
+    "symlink",
+    "invalid-uri",
+    "oversized",
+    "unmarked-directory",
+    "bad-marker",
+    "non-file",
+  ])("rejects unsafe staging: %s", async (kind) => {
+    const existing = ["unmarked-directory", "bad-marker", "non-file"].includes(kind);
+    let source = existing ? await writeMedia() : path.join(f.gateway, "secret.txt");
+    if (!existing) {
+      await fs.writeFile(source, "secret");
+    }
+    if (kind === "symlink") {
+      const outside = source;
+      source = path.join(getMediaDir(), "remote-cache", "escape.txt");
+      await fs.symlink(outside, source);
+    } else if (kind === "invalid-uri") {
+      source = "media://inbound/nested%2Fsecret.txt";
+    } else if (kind === "oversized") {
+      source = await writeMedia("remote-cache/large.bin", "");
+      await fs.truncate(source, 50 * 1024 * 1024 + 1);
+    }
+    const destination = f.destination(source);
+    const markerPath = path.join(path.dirname(destination), ".gitignore");
+    if (kind === "non-file") {
+      await prepareMedia([{ path: source }]);
+      await fs.unlink(destination);
+      await fs.mkdir(destination);
+    } else if (existing) {
+      await fs.mkdir(path.dirname(destination), { recursive: true });
       if (kind === "bad-marker") {
-        expect(await fs.readFile(path.join(path.dirname(destination), ".gitignore"), "utf8")).toBe(
-          "user marker",
-        );
+        await fs.writeFile(markerPath, "user marker");
       }
-    },
-  );
+    }
+    f.create.mockClear();
+    const media = existing ? { path: source } : { path: source, workspaceDir: f.gateway };
+    await expect(prepareMedia([media])).rejects.toThrow();
+    if (kind !== "non-file") {
+      expect(f.create).not.toHaveBeenCalled();
+    }
+    if (!existing) {
+      expect(await fs.readdir(f.harness)).toEqual([]);
+    }
+    if (kind === "bad-marker") {
+      expect(await fs.readFile(markerPath, "utf8")).toBe("user marker");
+    }
+  });
 
   it("does not fetch HTTP references or invent source files for inline images", async () => {
     await expect(

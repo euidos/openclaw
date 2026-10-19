@@ -1,6 +1,4 @@
 import fs from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
 import { expect, it, vi } from "vitest";
 import { observeHostDataSql } from "../../test/helpers/sqlite-statement-execution-counter.js";
 import { captureRuntimeConfigAsyncReader } from "../config/io.js";
@@ -20,13 +18,7 @@ const runParams = (workspaceDir: string, sessionId = "execution") => ({
 });
 
 it("keeps cwd authority with the selected local or remote workspace owner", () => {
-  const sandbox = createSandboxTestContext({
-    overrides: {
-      workspaceSource: "managed-worktree",
-      workspaceDir: "/private",
-      workspaceAccess: "rw",
-    },
-  });
+  const sandbox = createSandboxTestContext({ overrides: { workspaceSource: "managed-worktree" } });
   const prepared = {
     effectiveCwd: "/private",
     effectiveWorkspace: "/private",
@@ -48,9 +40,8 @@ it("keeps cwd authority with the selected local or remote workspace owner", () =
 });
 
 it("refuses a retired admitted run before creating or preparing its workspace", async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-retired-workspace-"));
-  const workspaceDir = path.join(root, "must-not-exist");
-  try {
+  await withOpenClawTestState({ label: "retired-workspace" }, async (state) => {
+    const workspaceDir = state.path("must-not-exist");
     await expect(
       resolveAttemptWorkspaceSandbox({
         ...runParams(workspaceDir, "retired"),
@@ -59,9 +50,7 @@ it("refuses a retired admitted run before creating or preparing its workspace", 
       }),
     ).rejects.toThrow("active admitted run");
     await expect(fs.stat(workspaceDir)).rejects.toMatchObject({ code: "ENOENT" });
-  } finally {
-    await fs.rm(root, { recursive: true, force: true });
-  }
+  });
 });
 
 it("keeps writable placement policy without preparing its paths locally", async () => {
@@ -76,7 +65,6 @@ it("keeps writable placement policy without preparing its paths locally", async 
           workspaceDir: remoteWorkspace,
           agentWorkspaceDir: remoteWorkspace,
           containerWorkdir: "/native/guest",
-          workspaceAccess: "rw",
         },
       }),
     });
@@ -95,48 +83,36 @@ it.each(["realpath", "mkdir"] as const)(
   async (boundary) => {
     await withOpenClawTestState({ label: "workspace-preparation-authority" }, async (state) => {
       const config = { agents: { entries: { main: { workspace: state.workspaceDir } } } };
-      const admission = prepareSystemAgentRunAdmission(
-        config,
-        `workspace-preparation-${boundary}`,
-        "main",
-        "workspace-preparation-test",
-      );
+      const admission = prepareSystemAgentRunAdmission(config, boundary, "main", "test");
       const admittedRunContext = await admission.admit("embedded");
-      const mkdir = vi.spyOn(fs, "mkdir").mockResolvedValue(undefined);
-      const realpath = vi.spyOn(fs, "realpath");
+      using scope = { close: admission.close, [Symbol.dispose]: admission.close };
+      using mkdir = vi.spyOn(fs, "mkdir").mockResolvedValue(undefined);
+      using realpath = vi.spyOn(fs, "realpath");
       if (boundary === "realpath") {
         realpath.mockImplementationOnce(async () => {
-          admission.close();
+          scope.close();
           return state.workspaceDir;
         });
       } else {
-        mkdir.mockImplementationOnce(async () => {
-          admission.close();
-          return undefined;
-        });
+        mkdir.mockImplementationOnce(async () => scope.close());
       }
-      try {
-        await expect(
-          resolveAttemptWorkspaceSandbox({
-            config,
-            ...runParams(state.workspaceDir, "workspace-preparation"),
-            placementSandbox: createSandboxTestContext(),
-            admittedRunContext,
-          }),
-        ).rejects.toThrow("admitted run authority is no longer active");
-        // A revoked path lookup must not admit the following directory mutation.
-        expect(mkdir).toHaveBeenCalledOnce();
-      } finally {
-        mkdir.mockRestore();
-        realpath.mockRestore();
-        admission.close();
-      }
+      await expect(
+        resolveAttemptWorkspaceSandbox({
+          config,
+          ...runParams(state.workspaceDir, "workspace-preparation"),
+          placementSandbox: createSandboxTestContext(),
+          admittedRunContext,
+        }),
+      ).rejects.toThrow("admitted run authority is no longer active");
+      // A revoked path lookup must not admit the following directory mutation.
+      expect(mkdir).toHaveBeenCalledOnce();
     });
   },
 );
 
 it.each([false, true])("uses independent policy session (required=%s)", async (required) => {
   await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+    const identity = "UNMATERIALIZED_SANDBOX_IDENTITY";
     await captureRuntimeConfigAsyncReader()();
     const sessionId = required ? "required" : "optional";
     const sessionKey = "agent:main:" + sessionId;
@@ -153,22 +129,16 @@ it.each([false, true])("uses independent policy session (required=%s)", async (r
       resolveAttemptWorkspaceSandbox({
         ...runParams(state.workspaceDir),
         sandboxSessionKey: sessionKey,
-        config: sandboxConfig(
-          required
-            ? {
-                mode: "off",
-                backend: "ssh",
-                ssh: {
-                  target: "sandbox@example.invalid",
-                  identityData: {
-                    source: "env",
-                    provider: "default",
-                    id: "UNMATERIALIZED_SANDBOX_IDENTITY",
-                  },
-                },
-              }
-            : { mode: "all" },
-        ),
+        config: sandboxConfig({
+          mode: required ? "off" : "all",
+          ...(required && {
+            backend: "ssh",
+            ssh: {
+              target: "sandbox@example.invalid",
+              identityData: { source: "env" as const, provider: "default", id: identity },
+            },
+          }),
+        }),
       });
     if (required) {
       await expect(prepare()).rejects.toMatchObject({
@@ -177,20 +147,16 @@ it.each([false, true])("uses independent policy session (required=%s)", async (r
       });
       return;
     }
-    const mkdir = vi.spyOn(fs, "mkdir");
-    const sql = observeHostDataSql();
-    try {
-      expect(await prepare()).toMatchObject({
-        sandbox: null,
-        sandboxReport: { mode: "all", sandboxed: false },
-      });
-      expect(mkdir.mock.calls.filter(([dir]) => dir === state.workspaceDir)).toHaveLength(1);
-      expect(
-        sql.queries.filter((query) => /\bsession_(?:nodes|windows|participants)\b/.test(query)),
-      ).toEqual([]);
-    } finally {
-      sql.restore();
-      mkdir.mockRestore();
-    }
+    using mkdir = vi.spyOn(fs, "mkdir");
+    const observed = observeHostDataSql();
+    using sql = { queries: observed.queries, [Symbol.dispose]: observed.restore };
+    expect(await prepare()).toMatchObject({
+      sandbox: null,
+      sandboxReport: { mode: "all", sandboxed: false },
+    });
+    expect(mkdir.mock.calls.filter(([dir]) => dir === state.workspaceDir)).toHaveLength(1);
+    expect(
+      sql.queries.filter((query) => /\bsession_(?:nodes|windows|participants)\b/.test(query)),
+    ).toEqual([]);
   });
 });
