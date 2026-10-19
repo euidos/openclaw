@@ -95,42 +95,45 @@ function mockOllama(modelId: string, thinking: unknown) {
   };
 }
 
-async function sendThinking(model: ProviderRuntimeModel, thinkingLevel: ThinkingLevel) {
-  const streamFn = expectDefined(
-    createConfiguredOllamaCompatStreamWrapper({
-      provider: model.provider,
-      modelId: model.id,
-      model,
-      thinkingLevel,
-      streamFn: createOllamaStreamFn(baseUrl),
-    }),
-    "native Ollama stream wrapper",
-  );
-  const stream = await streamFn(
-    model,
-    { messages: [{ role: "user", content: "Hello", timestamp: 0 }] },
-    {},
-  );
-  expect((await stream.result()).stopReason).toBe("stop");
+const chatContext = { messages: [{ role: "user" as const, content: "Hello", timestamp: 0 }] };
+
+async function sendThinking(model: ProviderRuntimeModel, ...levels: ThinkingLevel[]) {
+  for (const thinkingLevel of levels) {
+    const streamFn = expectDefined(
+      createConfiguredOllamaCompatStreamWrapper({
+        provider: model.provider,
+        modelId: model.id,
+        model,
+        thinkingLevel,
+        streamFn: createOllamaStreamFn(baseUrl),
+      }),
+      "native Ollama stream wrapper",
+    );
+    const stream = await streamFn(model, chatContext, {});
+    expect((await stream.result()).stopReason).toBe("stop");
+  }
 }
 
 function profileFor(model: ProviderRuntimeModel) {
-  return resolveThinkingProfile({
-    provider: model.provider,
-    modelId: model.id,
-    api: model.api,
-    reasoning: model.reasoning,
-    compat: model.compat,
-    thinkingLevelMap: model.thinkingLevelMap,
-  });
+  return resolveThinkingProfile({ ...model, modelId: model.id });
 }
+
+const descriptor = (values: unknown, fallback: unknown) => ({ values, default: fallback });
+const graded = ["low", "medium", "high"];
+const extended = [false, "low", "medium", "xhigh"];
+const fallback = [false, "low", "high", "high"];
+type Mapping = [
+  name: string,
+  thinking: unknown,
+  expected: unknown[],
+  xhigh?: boolean,
+  minimal?: boolean,
+  minimalFallback?: string,
+];
 
 describe("Ollama discovered thinking contracts", () => {
   it("keeps manual model settings while discovering the mandatory native thinking format", async () => {
-    const fixture = mockOllama("manual-mandatory-thinking:latest", {
-      values: [true],
-      default: true,
-    });
+    const fixture = mockOllama("manual-mandatory-thinking:latest", descriptor([true], true));
     fixture.metadata.parameterCount = 70_000_000_000;
     const model = await fixture.discover("ollama", {
       id: "manual-mandatory-thinking:latest",
@@ -149,8 +152,7 @@ describe("Ollama discovered thinking contracts", () => {
       maxTokens: 2048,
       compat: { supportsTools: false },
     });
-    await sendThinking(model, "off");
-    await sendThinking(model, "high");
+    await sendThinking(model, "off", "high");
     expect(fixture.chatBodies.map((body) => body.think)).toEqual([true, true]);
   });
 
@@ -161,62 +163,25 @@ describe("Ollama discovered thinking contracts", () => {
     expect(model.thinkingLevelMap).toBeUndefined();
   });
 
-  it.each([
-    {
-      name: "boolean",
-      thinking: { values: [false, true], default: true },
-      expected: [false, true, true, true],
-      xhigh: false,
-    },
-    {
-      name: "mandatory boolean",
-      thinking: { values: [true], default: true },
-      expected: [true, true, true, true],
-      xhigh: false,
-    },
-    {
-      name: "graded xhigh",
-      thinking: { values: [false, "low", "medium", "xhigh"], default: "medium" },
-      expected: [false, "low", "xhigh", "xhigh"],
-      xhigh: true,
-    },
-    {
-      name: "mandatory graded",
-      thinking: { values: ["low", "medium", "high"], default: "medium" },
-      expected: ["low", "low", "high", "high"],
-      xhigh: false,
-    },
-    {
-      name: "native max",
-      thinking: { values: [false, "low", "medium", "high", "max"], default: "high" },
-      expected: [false, "low", "high", "max"],
-      xhigh: false,
-    },
-    {
-      name: "native minimal",
-      thinking: { values: [false, "minimal", "low", "high"], default: "low" },
-      expected: [false, "low", "high", "high"],
-      xhigh: false,
-      minimal: true,
-      minimalFallback: "minimal",
-    },
-    {
-      name: "missing descriptor",
-      thinking: undefined,
-      expected: [false, "low", "high", "high"],
-      xhigh: false,
-      minimalFallback: "minimal",
-    },
-    {
-      name: "malformed descriptor",
-      thinking: { values: "xhigh", default: "xhigh" },
-      expected: [false, "low", "high", "high"],
-      xhigh: false,
-      minimalFallback: "minimal",
-    },
+  it.each<Mapping>([
+    ["boolean", descriptor([false, true], true), [false, true, true, true]],
+    ["mandatory boolean", descriptor([true], true), [true, true, true, true]],
+    ["graded xhigh", descriptor(extended, "medium"), [false, "low", "xhigh", "xhigh"], true],
+    ["mandatory graded", descriptor(graded, "medium"), ["low", "low", "high", "high"]],
+    ["native max", descriptor([false, ...graded, "max"], "high"), [false, "low", "high", "max"]],
+    [
+      "native minimal",
+      descriptor([false, "minimal", "low", "high"], "low"),
+      fallback,
+      false,
+      true,
+      "minimal",
+    ],
+    ["missing descriptor", undefined, fallback, false, false, "minimal"],
+    ["malformed descriptor", descriptor("xhigh", "xhigh"), fallback, false, false, "minimal"],
   ])(
-    "maps $name discovery to native requests",
-    async ({ name, thinking, expected, xhigh, minimal = false, minimalFallback = "low" }) => {
+    "maps %s discovery to native requests",
+    async (name, thinking, expected, xhigh = false, minimal = false, minimalFallback = "low") => {
       const fixture = mockOllama(`thinking-${name.replaceAll(" ", "-")}:latest`, thinking);
       const model = await fixture.discover();
       const profile = profileFor(model);
@@ -231,9 +196,7 @@ describe("Ollama discovered thinking contracts", () => {
         ...(xhigh ? ["xhigh"] : []),
         "max",
       ]);
-      for (const level of ["off", "low", "high", "max"] as const) {
-        await sendThinking(model, level);
-      }
+      await sendThinking(model, "off", "low", "high", "max");
       expect(fixture.chatBodies.map((body) => body.think)).toEqual(expected);
       for (const body of fixture.chatBodies) {
         expect(body.options).not.toHaveProperty("think");
@@ -247,28 +210,21 @@ describe("Ollama discovered thinking contracts", () => {
   );
 
   it("preserves explicit native think with implicit off and lets an enabled runtime level win", async () => {
-    const fixture = mockOllama("thinking-precedence:latest", {
-      values: [false, "low", "medium", "xhigh"],
-      default: "medium",
-    });
+    const fixture = mockOllama("thinking-precedence:latest", descriptor(extended, "medium"));
     const model = await fixture.discover();
     model.params = { think: "xhigh", thinking: "low" };
-    await sendThinking(model, "off");
-    await sendThinking(model, "low");
+    await sendThinking(model, "off", "low");
     model.params = { think: false, thinking: "xhigh" };
     await sendThinking(model, "off");
     expect(fixture.chatBodies.map((body) => body.think)).toEqual(["xhigh", "low", false]);
   });
 
   it("honors reasoning false even when discovery advertised thinking levels", async () => {
-    const fixture = mockOllama("thinking-disabled:latest", {
-      values: [false, "low", "medium", "xhigh"],
-    });
+    const fixture = mockOllama("thinking-disabled:latest", { values: extended });
     const model = await fixture.discover();
     model.reasoning = false;
     expect(profileFor(model).levels.map(({ id }) => id)).toEqual(["off"]);
-    await sendThinking(model, "high");
-    await sendThinking(model, "off");
+    await sendThinking(model, "high", "off");
     expect(fixture.chatBodies.map((body) => body.think)).toEqual([undefined, false]);
   });
 
@@ -282,21 +238,18 @@ describe("Ollama discovered thinking contracts", () => {
   });
 
   it("preserves configured effort over an implicit mandatory-thinking floor, including direct completions", async () => {
-    const fixture = mockOllama("thinking-mandatory-precedence:latest", {
-      values: ["low", "medium", "high"],
-    });
+    const fixture = mockOllama("thinking-mandatory-precedence:latest", { values: graded });
     const model = await fixture.discover();
     model.params = { think: "medium" };
     await sendThinking(model, "off");
     const streamFn = createOllamaStreamFn(baseUrl);
-    const context = { messages: [{ role: "user" as const, content: "Hello", timestamp: 0 }] };
-    expect((await (await streamFn(model, context, { reasoning: "off" })).result()).stopReason).toBe(
-      "stop",
-    );
+    expect(
+      (await (await streamFn(model, chatContext, { reasoning: "off" })).result()).stopReason,
+    ).toBe("stop");
     model.params = {};
-    expect((await (await streamFn(model, context, { reasoning: "off" })).result()).stopReason).toBe(
-      "stop",
-    );
+    expect(
+      (await (await streamFn(model, chatContext, { reasoning: "off" })).result()).stopReason,
+    ).toBe("stop");
     expect(fixture.chatBodies.map((body) => body.think)).toEqual(["medium", "medium", "low"]);
   });
 
@@ -307,7 +260,7 @@ describe("Ollama discovered thinking contracts", () => {
     expect(fixture.requests.filter((path) => path === "/api/show")).toHaveLength(1);
 
     fixture.metadata.digest = "second";
-    fixture.metadata.thinking = { values: [false, "low", "medium", "xhigh"] };
+    fixture.metadata.thinking = { values: extended };
     await sendThinking(await fixture.discover(), "high");
     expect(fixture.chatBodies.map((body) => body.think)).toEqual([true, true, "xhigh"]);
     expect(fixture.requests.filter((path) => path === "/api/show")).toHaveLength(2);
