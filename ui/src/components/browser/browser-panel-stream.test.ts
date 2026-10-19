@@ -1,104 +1,31 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../../test/helpers/promise.js";
 import { GatewayRequestError } from "../../api/gateway.ts";
 import {
   createBrowserClient,
-  createBrowserPanelTestMetrics,
   createBrowserPanelTestTab,
   createInspectedNode,
-  flushBrowserResponses,
-  setupBrowserPanelTestCleanup,
   stubScreenshotMedia,
-  TestBrowserPanelHost,
   type BrowserRequestEnvelope,
 } from "./browser-panel-controller-test-support.ts";
 import type { BrowserPanel } from "./browser-panel-owner.ts";
+import {
+  deferImages,
+  flush,
+  PAGE_URL,
+  streamFixture,
+} from "./browser-panel-stream-test-support.ts";
 import { screencastFrame, TestScreencastSocket } from "./browser-screencast-test-support.ts";
 
-const PAGE_URL = "https://example.test/page";
 const NEXT_URL = "https://example.test/next";
-const controllers: BrowserPanel[] = [];
-let sockets: TestScreencastSocket[];
-let createdUrls: string[];
-let revokedUrls: string[];
+const { setup, sockets, createdUrls, revokedUrls } = streamFixture(TestScreencastSocket);
 
-setupBrowserPanelTestCleanup();
-beforeEach(() => {
-  vi.useFakeTimers();
-  stubScreenshotMedia();
-  sockets = [];
-  createdUrls = [];
-  revokedUrls = [];
-  vi.stubGlobal(
-    "WebSocket",
-    class extends TestScreencastSocket {
-      constructor(url: string) {
-        super(url);
-        sockets.push(this);
-      }
-    },
-  );
-  vi.spyOn(URL, "createObjectURL").mockImplementation(() => {
-    const url = `blob:frame-${createdUrls.length}`;
-    createdUrls.push(url);
-    return url;
-  });
-  vi.spyOn(URL, "revokeObjectURL").mockImplementation((url) => revokedUrls.push(url));
-});
-afterEach(() => {
-  for (const controller of controllers.splice(0)) {
-    controller.suspendView();
-  }
-});
-
-async function flush(): Promise<void> {
-  await flushBrowserResponses();
-  await flushBrowserResponses();
-  await flushBrowserResponses();
-}
-
-function setup(handle?: (envelope: BrowserRequestEnvelope) => Promise<unknown>) {
-  const gateway = createBrowserClient(
-    async (envelope) => {
-      if (handle) {
-        const result = await handle(envelope);
-        if (result !== undefined) {
-          return result;
-        }
-      }
-      switch (envelope.path) {
-        case "/tabs":
-          return {
-            running: true,
-            canAutoResizeViewport: true,
-            tabs: [createBrowserPanelTestTab("tab-a", PAGE_URL, "Page")],
-          };
-        case "/screencast":
-          return {
-            token: "token",
-            wsPath: "/browser/screencast?token=token",
-            targetId: "raw-a",
-            url: PAGE_URL,
-          };
-        case "/screenshot":
-          return { path: "/fresh.png", targetId: "raw-a", url: PAGE_URL };
-        case "/act":
-          return createBrowserPanelTestMetrics(PAGE_URL);
-        default:
-          return { ok: true };
-      }
-    },
-    { screencast: true },
-  );
-  const host = new TestBrowserPanelHost(gateway.client);
-  const controller = host.createPanel();
-  controller.synchronizeClient();
-  controllers.push(controller);
-  const calls = (path: string) =>
-    gateway.request.mock.calls.filter(
-      ([, params]) => (params as BrowserRequestEnvelope).path === path,
-    );
-  return { ...gateway, host, controller, calls };
+function setupScreenshot() {
+  const screenshot = createDeferred<unknown>();
+  return {
+    screenshot,
+    ...setup(async (request) => (request.path === "/screenshot" ? screenshot.promise : undefined)),
+  };
 }
 
 async function start(controller: BrowserPanel) {
@@ -146,10 +73,7 @@ describe("Browser panel stream ownership", () => {
   });
 
   it("reconnects while a fallback screenshot is still pending", async () => {
-    const screenshot = createDeferred<unknown>();
-    const { controller, calls } = setup(async (envelope) =>
-      envelope.path === "/screenshot" ? screenshot.promise : undefined,
-    );
+    const { screenshot, controller, calls } = setupScreenshot();
     const socket = await start(controller);
     socket.disconnect(1006);
     await vi.advanceTimersByTimeAsync(0);
@@ -166,10 +90,7 @@ describe("Browser panel stream ownership", () => {
   });
 
   it("keeps a pending fallback screenshot when the reconnect fails", async () => {
-    const screenshot = createDeferred<unknown>();
-    const { controller, calls } = setup(async (envelope) =>
-      envelope.path === "/screenshot" ? screenshot.promise : undefined,
-    );
+    const { screenshot, controller, calls } = setupScreenshot();
     const socket = await start(controller);
     socket.disconnect(1006);
     await vi.advanceTimersByTimeAsync(0);
@@ -246,17 +167,7 @@ describe("Browser panel stream ownership", () => {
     await flush();
     expect(calls("/screenshot")).toHaveLength(1);
     await vi.advanceTimersByTimeAsync(10_000);
-    const images: EventTarget[] = [];
-    vi.stubGlobal(
-      "Image",
-      class extends EventTarget {
-        constructor() {
-          super();
-          images.push(this);
-        }
-        src = "";
-      },
-    );
+    const images = deferImages();
     sockets[1]!.receive(screencastFrame());
     sockets[1]!.disconnect(1006);
     screenshot.resolve({ path: "/old.png", targetId: "raw-a", url: PAGE_URL });
@@ -290,17 +201,7 @@ describe("Browser panel stream ownership", () => {
   it("holds a frame whose decode finishes after capture mode begins", async () => {
     const { controller } = setup();
     const socket = await start(controller);
-    const images: EventTarget[] = [];
-    vi.stubGlobal(
-      "Image",
-      class extends EventTarget {
-        constructor() {
-          super();
-          images.push(this);
-        }
-        src = "";
-      },
-    );
+    const images = deferImages();
     socket.receive(screencastFrame(NEXT_URL));
     controller.setMode("annotate");
     socket.receive(JSON.stringify({ type: "meta", url: NEXT_URL, title: "Next" }));
@@ -318,10 +219,7 @@ describe("Browser panel stream ownership", () => {
   it.each([false, true])(
     "discards a fallback screenshot overtaken by a frame (socket then closes: %s)",
     async (closes) => {
-      const screenshot = createDeferred<unknown>();
-      const { controller, calls } = setup(async (envelope) =>
-        envelope.path === "/screenshot" ? screenshot.promise : undefined,
-      );
+      const { screenshot, controller, calls } = setupScreenshot();
       const pending = controller.refreshAll();
       await flush();
       sockets[0]!.disconnect(1006);
@@ -454,10 +352,7 @@ describe("Browser panel stream ownership", () => {
   });
 
   it("does not replace a capture entered while the recovery screenshot is pending", async () => {
-    const screenshot = createDeferred<unknown>();
-    const { controller, calls } = setup(async (envelope) =>
-      envelope.path === "/screenshot" ? screenshot.promise : undefined,
-    );
+    const { screenshot, controller, calls } = setupScreenshot();
     const socket = await start(controller);
     socket.disconnect(1006);
     await vi.advanceTimersByTimeAsync(0);
@@ -551,17 +446,7 @@ describe("Browser panel stream ownership", () => {
   it("coalesces decoding frames and never publishes a frame overtaken by navigation metadata", async () => {
     const { controller } = setup();
     const socket = await start(controller);
-    const images: EventTarget[] = [];
-    vi.stubGlobal(
-      "Image",
-      class extends EventTarget {
-        constructor() {
-          super();
-          images.push(this);
-        }
-        src = "";
-      },
-    );
+    const images = deferImages();
     socket.receive(screencastFrame());
     socket.receive(JSON.stringify({ type: "meta", url: NEXT_URL, title: "Next" }));
     socket.receive(screencastFrame(NEXT_URL, 200, 100));
@@ -588,17 +473,13 @@ describe("Browser panel stream ownership", () => {
   });
 
   it("does not let continuous mismatched frames postpone the debounced viewport sync", async () => {
-    const { controller, calls } = setup();
+    const { controller, resizes } = setup();
     controller.handleViewportResize(500, 300);
     const socket = await start(controller);
     for (let elapsed = 100; elapsed <= 600; elapsed += 100) {
       socket.receive(screencastFrame(PAGE_URL, 100, 100));
       await vi.advanceTimersByTimeAsync(100);
     }
-    const resizes = () =>
-      calls("/act").filter(
-        ([, params]) => (params as BrowserRequestEnvelope).body?.kind === "resize",
-      );
     expect(resizes()).toHaveLength(1);
     expect(resizes()[0]?.[1]).toMatchObject({ body: { width: 500, height: 300 } });
     socket.receive(screencastFrame(PAGE_URL, 100, 100));
@@ -612,7 +493,7 @@ describe("Browser panel stream ownership", () => {
   ])(
     "restores the visible viewport after drift to $width × $height (acknowledged: $acknowledged)",
     async ({ acknowledged, width, height }) => {
-      const { controller, calls } = setup();
+      const { controller, resizes } = setup();
       controller.handleViewportResize(640, 480);
       const socket = await start(controller);
       await vi.advanceTimersByTimeAsync(300);
@@ -624,10 +505,6 @@ describe("Browser panel stream ownership", () => {
       socket.receive(screencastFrame(PAGE_URL, width, height));
       await flush();
       await vi.advanceTimersByTimeAsync(300);
-      const resizes = () =>
-        calls("/act").filter(
-          ([, params]) => (params as BrowserRequestEnvelope).body?.kind === "resize",
-        );
       expect(resizes()).toHaveLength(2);
       expect(resizes()[1]?.[1]).toMatchObject({ body: { width: 640, height: 480 } });
 
@@ -706,17 +583,7 @@ describe("Browser panel stream ownership", () => {
   it("does not let a retired decoder replace or revoke the new stream's frame", async () => {
     const { controller } = setup();
     await start(controller);
-    const images: EventTarget[] = [];
-    vi.stubGlobal(
-      "Image",
-      class extends EventTarget {
-        constructor() {
-          super();
-          images.push(this);
-        }
-        src = "";
-      },
-    );
+    const images = deferImages();
     sockets[0]!.receive(screencastFrame());
     controller.resetBrowserState();
     await vi.advanceTimersByTimeAsync(10_000);
