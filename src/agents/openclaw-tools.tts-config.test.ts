@@ -7,28 +7,25 @@ import type { AnyAgentTool } from "./tools/common.js";
 import type { MediaGenerateToolOptions } from "./tools/media-generate-background.js";
 
 const mocks = vi.hoisted(() => {
-  const stubTool = (name: string): AnyAgentTool => ({
+  const stubTool = (name: string, execute: AnyAgentTool["execute"] = vi.fn()): AnyAgentTool => ({
     name,
     label: name,
     displaySummary: name,
     description: name,
     parameters: { type: "object", properties: {} },
-    execute: vi.fn(),
+    execute,
   });
-  const backgroundMediaTool = (name: string): AnyAgentTool => ({
-    ...stubTool(name),
-    execute: async () => ({
-      content: [{ type: "text", text: "Background task started." }],
-      details: {},
-    }),
+  const background: AnyAgentTool["execute"] = async () => ({
+    content: [{ type: "text", text: "Background task started." }],
+    details: {},
   });
   return {
     cron: vi.fn((_options: unknown) => stubTool("cron")),
     transcripts: vi.fn((_options: unknown) => stubTool("transcripts")),
     status: vi.fn((_options: unknown) => stubTool("session_status")),
-    image: vi.fn((_options?: MediaGenerateToolOptions) => backgroundMediaTool("image_generate")),
-    music: vi.fn((_options?: MediaGenerateToolOptions) => backgroundMediaTool("music_generate")),
-    video: vi.fn((_options?: MediaGenerateToolOptions) => backgroundMediaTool("video_generate")),
+    image: vi.fn((_options?: MediaGenerateToolOptions) => stubTool("image_generate", background)),
+    music: vi.fn((_options?: MediaGenerateToolOptions) => stubTool("music_generate", background)),
+    video: vi.fn((_options?: MediaGenerateToolOptions) => stubTool("video_generate", background)),
     textToSpeech: vi.fn<typeof import("../tts/tts.js").textToSpeech>(async () => ({
       success: true,
       audioPath: "/tmp/openclaw/tts-config-test.opus",
@@ -61,6 +58,7 @@ const channelCaller = {
 const cronKey = "agent:main:cron:daily-media";
 const cronRunKey = `${cronKey}:run:run-123`;
 const qaKey = "agent:main:qa-channel:default:direct:media-requester";
+const mediaModel = { primary: "fixture/model" };
 
 beforeEach(() => {
   setRuntimeConfigSnapshot({});
@@ -127,13 +125,7 @@ it.each([
       config: {
         agents: {
           entries: { main: {}, work: {} },
-          defaults: {
-            mediaModels: {
-              image: { primary: "image-owner/model" },
-              music: { primary: "music-owner/model" },
-              video: { primary: "video-owner/model" },
-            },
-          },
+          defaults: { mediaModels: { image: mediaModel, music: mediaModel, video: mediaModel } },
         },
       },
       agentSessionKey,

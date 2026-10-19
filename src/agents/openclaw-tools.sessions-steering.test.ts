@@ -165,11 +165,11 @@ it.each([
   "persists steering provenance: mode=%s alternateStore=%s hiddenRun=%s refreshedDisplay=%s",
   async (mode, alternateStore, hiddenRun, refreshedDisplay) => {
     const runId = "hidden-sessions-send-steering-run";
-    const runScopedCallerKey =
+    const sessionKey =
       mode === "steer"
         ? "agent:leasing-ops:dashboard:active-target"
         : "agent:leasing-ops:cron:monthly-utility:run:run-fast";
-    const { dir, scope, testConfig } = await steeringFixture(runScopedCallerKey, alternateStore);
+    const { dir, scope, testConfig } = await steeringFixture(sessionKey, alternateStore);
     const sessionManager = SessionManager.open(scope, dir);
     guardSessionManager(sessionManager);
     const { session } = await createTestSession({ sessionManager });
@@ -199,16 +199,10 @@ it.each([
       expect(streamMocks.streamSimple).toHaveBeenCalledOnce();
       const queueMessage = vi.fn(
         (text: string, options?: EmbeddedAgentQueueMessageOptions, assertCurrent?: () => void) =>
-          steerActiveSessionWithOptionalDeliveryWait(
-            session,
-            text,
-            options,
-            runScopedCallerKey,
-            () => {
-              assertCurrent?.();
-              return true;
-            },
-          ),
+          steerActiveSessionWithOptionalDeliveryWait(session, text, options, sessionKey, () => {
+            assertCurrent?.();
+            return true;
+          }),
       );
       await setSessionsSendTestActiveRun(
         "caller-active-session",
@@ -222,7 +216,7 @@ it.each([
           sourceReplyDeliveryMode: mode === "steer" ? "automatic" : "message_tool_only",
           abort: () => {},
         },
-        runScopedCallerKey,
+        sessionKey,
         requesterKey,
         testConfig,
         scope.storePath,
@@ -256,7 +250,7 @@ it.each([
       const send = withGatewayToolCallerIdentity(caller, () =>
         tool.execute("call-run-scoped-caller", {
           mode,
-          sessionKey: runScopedCallerKey,
+          sessionKey,
           message: "[TASK-COMPLETE] re-portal occupancy ready",
           timeoutSeconds: 0,
         }),
@@ -279,7 +273,7 @@ it.each([
       expect(result.details).toMatchObject({
         status: "accepted",
         targetDisposition: "steered",
-        sessionKey: runScopedCallerKey,
+        sessionKey,
         delivery: { status: "skipped" },
       });
       expect(queueMessage).toHaveBeenCalledOnce();
@@ -302,7 +296,7 @@ it.each([
         false,
       );
       await waitForSessionParticipantRecording(scope);
-      expect(listSessionParticipantsReadOnly(scope).get(runScopedCallerKey)).toEqual([
+      expect(listSessionParticipantsReadOnly(scope).get(sessionKey)).toEqual([
         expect.objectContaining({
           identity: { type: "agent", id: "re-portal" },
           contributionCount: 1,

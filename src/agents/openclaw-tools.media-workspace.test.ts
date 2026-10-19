@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { Type } from "typebox";
@@ -209,4 +210,3 @@ it("image_generate shared reference loader follows the task cwd and session boun
   expect(loaded.every(({ source }) => typeof source === "number" && source > 0)).toBe(true);
   await expectOutside(loadReferences([outsidePath]));
 });
-import assert from "node:assert/strict";

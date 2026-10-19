@@ -3,12 +3,9 @@ import { afterAll, afterEach, beforeEach, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import { clearRuntimeConfigSnapshot, setRuntimeConfigSnapshot } from "../config/io.js";
 import { emitAgentEvent } from "../infra/agent-events.js";
-import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-clock.js";
+import { disposeAllSessionMcpRuntimes } from "./agent-bundle-mcp-manager-api.js";
 import {
-  disposeAllSessionMcpRuntimes,
-  setSessionMcpRuntimeScheduler,
-} from "./agent-bundle-mcp-manager-api.js";
-import {
+  bindSessionMcpRuntimeTestScheduler,
   getOrCreateSessionMcpRuntime,
   getSessionMcpRuntimeTestManager,
   unopenedMcpConfig,
@@ -59,11 +56,9 @@ async function waitForCleanup(childSessionKey: string) {
   );
 }
 
-let scheduler: ReturnType<typeof createTestGatewayScheduler>;
 beforeEach(async () => {
   await disposeAllSessionMcpRuntimes();
-  scheduler = createTestGatewayScheduler();
-  await setSessionMcpRuntimeScheduler(scheduler);
+  await bindSessionMcpRuntimeTestScheduler();
   resetSessionsSpawnAnnounceFlowOverride();
   resetSessionsSpawnHookRunnerOverride();
   resetSessionsSpawnConfigOverride();
@@ -90,7 +85,6 @@ afterEach(async () => {
   resetSessionsSpawnConfigOverride();
   await resetSubagentRegistryForTests({ persist: false });
   await disposeAllSessionMcpRuntimes();
-  await scheduler.stop();
   clearRuntimeConfigSnapshot();
 });
 afterAll(() => {

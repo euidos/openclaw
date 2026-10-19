@@ -11,15 +11,12 @@ const metadataUrl = new URL("./package-metadata.ts", import.meta.url);
 
 afterEach(() => fixtures.cleanup());
 
-function writePackage(root: string, name?: string, manifest: Record<string, unknown> = {}) {
+function writePackage(root: string, name?: string) {
   mkdirSync(join(root, "docs"), { recursive: true });
+  const openclawConfig = name ? { name, configDir: `.${name}` } : undefined;
   writeFileSync(
     join(root, "package.json"),
-    JSON.stringify({
-      type: "module",
-      ...(name ? { openclawConfig: { name, configDir: `.${name}` } } : {}),
-      ...manifest,
-    }),
+    JSON.stringify({ name: "@fixture/package-name", openclawConfig }),
   );
   writeFileSync(join(root, "README.md"), "fixture readme");
   writeFileSync(join(root, "docs", "guide.md"), "fixture guide");
@@ -53,7 +50,7 @@ const snapshotScript = String.raw`
 async function readMetadata(
   entry: string,
   options: {
-    cwd: string;
+    cwd?: string;
     env?: NodeJS.ProcessEnv;
     script?: string;
     args?: string[];
@@ -84,7 +81,7 @@ async function readMetadata(
       ],
       { ...process.env, OPENCLAW_PACKAGE_DIR: undefined, ...options.env },
       10_000,
-      { cwd: options.cwd, requireProcessTreeExit: true },
+      { cwd: options.cwd ?? dirname(entry), requireProcessTreeExit: true },
     ),
   );
   expect(result, result.stderr).toMatchObject({ error: undefined, status: 0 });
@@ -100,9 +97,7 @@ it.each(["relative", "~", "~/", "nested"] as const)(
       const packageDir = form === "~" ? home : join(home, "package");
       const nextPackageDir = join(root, "replacement");
       const nested = form === "nested";
-      writePackage(packageDir, nested ? undefined : "fixture-claw", {
-        name: "@fixture/package-name",
-      });
+      writePackage(packageDir, nested ? undefined : "fixture-claw");
       writePackage(nextPackageDir, "replacement");
       if (nested) {
         writePackage(root, "outer-package");
@@ -148,7 +143,6 @@ it.each(["missing", "invalid"] as const)(
       }
       const entry = join(root, "package-metadata.mjs");
       const result = await readMetadata(entry, {
-        cwd: root,
         env: { OPENCLAW_PACKAGE_DIR: packageDir },
         script: String.raw`
             try {
@@ -179,7 +173,6 @@ it.each(["2026.9.14-worker", ""])(
       }
       const result = await readMetadata(entry, {
         workerVersion,
-        cwd: dirname(entry),
         env: { OPENCLAW_PACKAGE_DIR: root },
       });
       expect(result).toEqual({

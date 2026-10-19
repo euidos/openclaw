@@ -51,23 +51,19 @@ export function registerSessionsSendResumeTests({
   });
 
   it.each([
-    ["explicit resume", { mode: "resume" }],
-    ["newer completed sibling", {}],
-    ["automatic resume with reply options", { timeoutSeconds: 30, watch: true }],
-    ["explicit separate followup", { mode: "followup" }],
-    ["unrelated caller", {}],
-    ["completion unspecified", {}],
-  ] as const)("sessions_send preserves completion ownership: %s", async (scenario, options) => {
+    ["explicit resume", { mode: "resume" }, true],
+    ["newer completed sibling", {}, true],
+    ["automatic resume with reply options", { timeoutSeconds: 30, watch: true }, true],
+    ["explicit separate followup", { mode: "followup" }, false],
+    ["unrelated caller", {}, false],
+    ["completion unspecified", {}, false],
+  ] as const)("sessions_send completion ownership: %s", async (scenario, options, resumes) => {
     const targetKey = `agent:main:${scenario === "explicit resume" ? "subagent" : "dashboard"}:resume-child`;
     const previousRunId = "tool-resume-paused";
     const siblingRunId = "tool-resume-independent-sibling";
     const controller =
       scenario === "unrelated caller" ? "agent:main:dashboard:other-parent" : parent;
     const pauseReason = "sessions_yield";
-    const resumes =
-      scenario !== "explicit separate followup" &&
-      scenario !== "unrelated caller" &&
-      scenario !== "completion unspecified";
     const childSessionIdentity = {
       sessionId: "tool-resume-session",
       lifecycleRevision: "tool-resume-revision",

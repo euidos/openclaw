@@ -33,6 +33,7 @@ vi.mock("../plugins/web-search-providers.runtime.js", () => ({
 }));
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+const tokens = { access: "test-access", refresh: "test-refresh" };
 const unconfigured = "Web search is supported but not configured.";
 async function expectSearch(
   expected: boolean,
@@ -105,12 +106,7 @@ it.each([
     replaceRuntimeAuthProfileStoreSnapshots([
       {
         agentDir,
-        store: createOAuthAuthProfileStore({
-          provider,
-          profileId: `${provider}:test`,
-          access: "test-access",
-          refresh: "test-refresh",
-        }),
+        store: createOAuthAuthProfileStore({ provider, profileId: `${provider}:test`, ...tokens }),
       },
     ]);
     if (!prepared) {
