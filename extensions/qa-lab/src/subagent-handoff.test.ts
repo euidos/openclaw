@@ -193,7 +193,9 @@ it.each([
       api: {
         runScenario: runQaSuiteScenarioSteps,
         [wait]: async () => {
-          await new Promise((resolve) => setTimeout(resolve, 360_000));
+          await new Promise<void>((resolve) => {
+            setTimeout(resolve, 360_000);
+          });
           throw new Error(details);
         },
       },
