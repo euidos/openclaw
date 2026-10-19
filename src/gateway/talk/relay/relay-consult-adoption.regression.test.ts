@@ -10,51 +10,40 @@ import {
 } from "../../../config/sessions/session-accessor.js";
 import type { RealtimeVoiceBridgeCreateRequest } from "../../../talk/provider-types.js";
 import { controlBridge, controlContext } from "../client-gateway-control.test-support.js";
-import { prepareTalkSessionTarget } from "../session-target.js";
+import { useRelayFixtures } from "./fixture.test-support.js";
 import { createIdleRelayProvider } from "./index.test-support.js";
 import { flushTalkRealtimeRelayVoiceWrites } from "./operations.js";
-import { createTalkRealtimeRelaySession } from "./session-create.js";
-import { usePersistentRelayTestState } from "./session-state.test-support.js";
-import { relaySessions } from "./state.js";
 
 const connId = "relay-adoption-test-client";
-const agentId = "main";
 const sessionKey = "agent:main:main";
 const speech = { assistant: "Checking now.", user: "Please keep working." };
 
-const activeRelays = new Map<string, string>();
-usePersistentRelayTestState(activeRelays);
+const createRelay = useRelayFixtures();
 const assistantMessage = (text: string) =>
   makeAgentAssistantMessage({ content: [{ type: "text", text }], timestamp: 2 });
 
 async function createConsult(excludeFromContext = true) {
-  const cfg = { agents: { entries: { main: {} } } };
   let bridgeRequest: RealtimeVoiceBridgeCreateRequest | undefined;
-  const session = createTalkRealtimeRelaySession({
-    cfg,
+  const { relay } = await createRelay({
+    cfg: { agents: { entries: { main: {} } } },
     context: controlContext(),
     connId,
-    sessionTarget: await prepareTalkSessionTarget(cfg, sessionKey),
     controlSource: "delegation",
     provider: createIdleRelayProvider((options) => {
       bridgeRequest = options;
       return controlBridge();
     }),
-    providerConfig: {},
     instructions: "Answer briefly.",
-    tools: [],
   });
-  const relay = relaySessions.get(session.relaySessionId);
   const onTranscript = bridgeRequest?.onTranscript;
   const onEvent = bridgeRequest?.onEvent;
-  if (!relay || !onTranscript || !onEvent) {
+  if (!onTranscript || !onEvent) {
     throw new Error("expected registered relay transcript and response callbacks");
   }
-  activeRelays.set(relay.id, connId);
   bridgeRequest?.onReady?.();
   onEvent({ direction: "server", type: "response.created", responseId: "consult-response" });
   const scope = {
-    agentId,
+    agentId: "main",
     sessionId: "main",
     sessionKey,
     storePath: relay.sessionTarget.storePath,

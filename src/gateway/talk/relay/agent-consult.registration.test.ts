@@ -1,12 +1,11 @@
 import { copyFileSync, existsSync, readFileSync, renameSync, unlinkSync } from "node:fs";
 import path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { expect, it, vi } from "vitest";
 import {
   awaitGateBeforeSettlement,
   createDeferred,
   withinTest,
 } from "../../../../test/helpers/promise.js";
-import type { OpenClawConfig } from "../../../config/types.js";
 import * as operationAdmission from "../../../infra/sqlite-worker-operation-admission.js";
 import { trackSessionControllerSourceWork } from "../../../sessions/session-controller.mailbox.js";
 import {
@@ -32,43 +31,19 @@ import { clientVoiceSessionTesting } from "../../../talk/client-voice-session.te
 import { captureEnv, setTestEnvValue } from "../../../test-utils/env.js";
 import { withOpenClawTestState } from "../../../test-utils/openclaw-test-state.js";
 import { cleanupSessionStateForTest } from "../../../test-utils/session-state-cleanup.js";
-import { createGatewayRequestContext } from "../../server-request-context.js";
-import { makeContextParams } from "../../server-request-context.test-support.js";
 import { claimRpcSourceForTest, createRpcSourceForTest } from "../../test-helpers.rpc-source.js";
-import { prepareTalkSessionTarget } from "../session-target.js";
-import { createIdleRelayProvider } from "./index.test-support.js";
+import { useRelayFixtures } from "./fixture.test-support.js";
 import {
   cancelTalkRealtimeRelayProviderToolCall,
   closeRelaySession,
   registerTalkRealtimeRelayAgentRun as registerRun,
 } from "./operations.js";
 import { clearRelayAgentToolCall } from "./provider-results.js";
-import { createTalkRealtimeRelaySession } from "./session-create.js";
-import { usePersistentRelayTestState } from "./session-state.test-support.js";
-import { adoptRelayProviderToolCallId, relaySessions, type RelaySession } from "./state.js";
+import { adoptRelayProviderToolCallId, type RelaySession } from "./state.js";
 import { enqueueRelayVoiceTranscript, ensureRelayVoiceSession } from "./voice.js";
 
 const resolveBinding = voiceSessions.resolveClientVoiceRunBinding;
-const activeRelaySessions = new Map<string, string>();
-usePersistentRelayTestState(activeRelaySessions);
-
-async function createRelay(connId: string, cfg: OpenClawConfig = {}, key = "agent:main:main") {
-  const context = createGatewayRequestContext(makeContextParams());
-  context.getRuntimeConfig = () => cfg;
-  const created = createTalkRealtimeRelaySession({
-    context,
-    connId,
-    cfg,
-    provider: createIdleRelayProvider(),
-    providerConfig: {},
-    instructions: "brief",
-    tools: [],
-    controlSource: "transcript",
-    sessionTarget: await prepareTalkSessionTarget(cfg, key),
-  });
-  activeRelaySessions.set(created.relaySessionId, connId);
-  return relaySessions.get(created.relaySessionId)!;
-}
+const createRelay = useRelayFixtures();
 
 function afterResult<A extends unknown[], R>(
   run: (...args: A) => Promise<R>,
@@ -108,609 +83,602 @@ async function createControllerSource(relay: RelaySession, runId: string, sessio
   };
 }
 
-describe("relay consult registration authority", () => {
-  const createRegistrationFixture = async () => {
-    const relay = await createRelay("registration-owner");
-    const target = {
-      relaySessionId: relay.id,
-      connId: relay.connId,
-      sessionKey: relay.sessionTarget.canonicalKey,
-      runId: "registration-run",
-    };
-    const chat = await createControllerSource(relay, target.runId, "registration-session");
-    return { relay, target, chat };
+const createRegistrationFixture = async () => {
+  const { relay } = await createRelay({ connId: "registration-owner" });
+  const target = {
+    relaySessionId: relay.id,
+    connId: relay.connId,
+    sessionKey: relay.sessionTarget.canonicalKey,
+    runId: "registration-run",
   };
+  const chat = await createControllerSource(relay, target.runId, "registration-session");
+  return { relay, target, chat };
+};
 
-  it.for(["release", "failure"] as const)(
-    "preserves a newer registration with identical IDs after old %s",
-    async (phase, { signal }) => {
-      const { relay, target, chat } = await createRegistrationFixture();
-      const callId = adoptRelayProviderToolCallId(relay, "registration-call")!;
-      const held = createDeferred();
-      const resume = createDeferred();
-      let rejectOld = false;
-      const old = registerRun({
-        ...target,
-        callId,
-        assertCurrent: () => {
-          if (rejectOld) {
-            throw new Error("old registration retired");
-          }
-        },
-        registerVoice: async (assertCurrent, physicalSource, onRegistered) => {
-          await voiceSessions.registerClientVoiceConsultRun({
-            agentId: "main",
-            sessionKey: target.sessionKey,
-            voiceSessionId: relay.id,
-            runId: target.runId,
-            assertCurrent,
-            physicalSource,
-            onRegistered,
-          });
-          held.resolve();
-          if (phase === "failure") {
-            await resume.promise;
-          }
-        },
-      });
-      const settled = old.then(
-        (release) => ({ release }),
-        (error: unknown) => ({ error }),
-      );
-      try {
-        await withinTest(held.promise, signal);
-        if (phase === "release") {
-          await old;
-        }
-        const current = await registerRun({ ...target, callId });
-        rejectOld = phase === "failure";
-        resume.resolve();
-        const result = await settled;
-        if ("release" in result) {
-          result.release.release();
-        } else {
-          expect(result.error).toBeInstanceOf(Error);
-        }
-        expectRegistrations(relay, 1, 1);
-        expect(resolveBinding(target.runId)).toBeDefined();
-        expect(chat.source.input.abortSignal.aborted).toBe(false);
-        cancelTalkRealtimeRelayProviderToolCall(relay, "registration-call");
-        expect(chat.source.input.abortSignal.aborted).toBe(true);
-        current.release();
-      } finally {
-        resume.resolve();
-        await settled;
-        await chat.cleanup();
-      }
-    },
-  );
-
-  it.for(["none", "live", "detached"] as const)(
-    "settles published cleanup before a replaced registration returns (successor=%s)",
-    async (successor, { signal }) => {
-      const { relay, target, chat } = await createRegistrationFixture();
-      const callId = adoptRelayProviderToolCallId(relay, "publication-call")!;
-      const held = createDeferred();
-      const resume = createDeferred();
-      let activeChat = chat;
-      let current: Awaited<ReturnType<typeof registerRun>> | undefined;
-      const register = voiceSessions.registerClientVoiceConsultRun;
-      const registering = vi
-        .spyOn(voiceSessions, "registerClientVoiceConsultRun")
-        .mockImplementationOnce(
-          afterResult(register, async () => {
-            held.resolve();
-            await resume.promise;
-          }),
-        );
-      const pending = registerRun({ ...target, callId });
-      const settled = pending.catch((error: unknown) => error);
-      try {
-        await withinTest(held.promise, signal);
-        await expect(
-          registerRun({
-            ...target,
-            callId,
-            registerVoice: async () => {
-              throw new Error("replacement registration refused");
-            },
-          }),
-        ).rejects.toThrow("replacement registration refused");
-        expectRegistrations(relay, 0, 0);
-        if (successor !== "none") {
-          await chat.cleanup();
-          activeChat = await createControllerSource(relay, target.runId, "successor-session");
-          current = await registerRun({ ...target, callId });
-          expect(resolveBinding(target.runId)).toBeDefined();
-          if (successor === "detached") {
-            clearRelayAgentToolCall(relay, callId);
-            expect(relay.activeAgentRuns.size).toBe(0);
-          }
-        }
-        const binding = resolveBinding(target.runId);
-        resume.resolve();
-        expect(await settled).toMatchObject({
-          message: "Realtime relay run registration changed while waiting",
-        });
-        if (successor === "none") {
-          expect(resolveBinding(target.runId)).toBeUndefined();
-        } else {
-          expect(resolveBinding(target.runId)).toBe(binding);
-          expect(activeChat.source.input.abortSignal.aborted).toBe(false);
-          if (successor === "live") {
-            expect(current?.isCurrent()).toBe(true);
-            current?.release();
-            expect(resolveBinding(target.runId)).toBeUndefined();
-          }
-        }
-      } finally {
-        resume.resolve();
-        await settled;
-        current?.release();
-        await activeChat.cleanup();
-        registering.mockRestore();
-      }
-    },
-  );
-
-  it.each(["call-1", "call-2"])("retains a shared run when %s clears first", async (first) => {
+it.for(["release", "failure"] as const)(
+  "preserves a newer registration with identical IDs after old %s",
+  async (phase, { signal }) => {
     const { relay, target, chat } = await createRegistrationFixture();
-    const second = first === "call-1" ? "call-2" : "call-1";
-    try {
-      for (const callId of ["call-1", "call-2"]) {
-        adoptRelayProviderToolCallId(relay, callId);
-        await registerRun({ ...target, callId });
-      }
-      clearRelayAgentToolCall(relay, first);
-      expect(relay.activeAgentRuns.size).toBe(1);
-      expect(relay.activeAgentToolCalls.has(second)).toBe(true);
-      expect(resolveBinding(target.runId)).toBeDefined();
-      cancelTalkRealtimeRelayProviderToolCall(relay, second);
-      expect(chat.source.input.abortSignal.aborted).toBe(true);
-      expect(relay.activeAgentRuns.size).toBe(0);
-    } finally {
-      await chat.cleanup();
-    }
-  });
-
-  it.each(["standalone", "call"])(
-    "retains shared voice ownership when the %s registration releases first",
-    async (first) => {
-      const { relay, target, chat } = await createRegistrationFixture();
-      const standalone = await registerRun(target);
-      const call = await registerRun({ ...target, callId: "shared-call" });
-      try {
-        (first === "standalone" ? standalone : call).release();
-        expect(relay.activeAgentRuns.size).toBe(1);
-        expect(resolveBinding(target.runId)).toBeDefined();
-        (first === "standalone" ? call : standalone).release();
-        expect(relay.activeAgentRuns.size).toBe(0);
-        expect(resolveBinding(target.runId)).toBeUndefined();
-      } finally {
-        standalone.release();
-        call.release();
-        await chat.cleanup();
-      }
-    },
-  );
-
-  it.for(["creation", "registration", "failure", "aborted", "cleanup"] as const)(
-    "preserves controller source ownership across the %s wait",
-    async (phase, { signal }) => {
-      const { relay, target, chat } = await createRegistrationFixture();
-      const callId = adoptRelayProviderToolCallId(relay, "controller-call")!;
-      const held = createDeferred();
-      const resume = createDeferred();
-      const waitForReplacement = async () => {
-        held.resolve();
-        await resume.promise;
-      };
-      const create = voiceSessions.createOrResumeClientVoiceSession;
-      const creating =
-        phase === "creation"
-          ? vi
-              .spyOn(voiceSessions, "createOrResumeClientVoiceSession")
-              .mockImplementationOnce(afterResult(create, waitForReplacement))
-          : undefined;
-      const register = voiceSessions.registerClientVoiceConsultRun;
-      const registering =
-        phase === "registration" || phase === "aborted" || phase === "cleanup"
-          ? vi
-              .spyOn(voiceSessions, "registerClientVoiceConsultRun")
-              .mockImplementationOnce(afterResult(register, waitForReplacement))
-          : undefined;
-      const pending = registerRun({
-        ...target,
-        callId,
-        ...(phase === "failure"
-          ? {
-              registerVoice: async () => {
-                await waitForReplacement();
-                throw new Error("registration refused");
-              },
-            }
-          : {}),
-      });
-      const settled = pending.catch((error: unknown) => error);
-      let replacement: typeof chat | undefined;
-      const terminalWrite = createDeferred();
-      let terminalCleanup: Promise<void> | undefined;
-      try {
-        await withinTest(held.promise, signal);
-        if (phase === "aborted" || phase === "cleanup") {
-          const entry = chat.source;
-          if (phase === "aborted") {
-            requestRpcSourceCancellation(chat.source);
-          } else {
-            entry.adapter.projectSessionTerminalPending = true;
-            trackSessionControllerSourceWork(entry.input, terminalWrite.promise);
-            terminalCleanup = chat.cleanup();
-          }
-          expect(getRpcSource(target.runId)).toBe(entry);
-        } else {
-          await chat.cleanup();
-          replacement = await createControllerSource(relay, target.runId, "replacement-chat");
+    const callId = adoptRelayProviderToolCallId(relay, "registration-call")!;
+    const held = createDeferred();
+    const resume = createDeferred();
+    let rejectOld = false;
+    const old = registerRun({
+      ...target,
+      callId,
+      assertCurrent: () => {
+        if (rejectOld) {
+          throw new Error("old registration retired");
         }
-        resume.resolve();
-        const result = await settled;
-        cancelTalkRealtimeRelayProviderToolCall(relay, "controller-call");
-        if (replacement) {
-          expect(replacement.source.input.abortSignal.aborted).toBe(false);
-        }
-        expect(result).toMatchObject({
-          message:
-            phase === "failure"
-              ? "registration refused"
-              : "Realtime relay run registration changed while waiting",
+      },
+      registerVoice: async (assertCurrent, physicalSource, onRegistered) => {
+        await voiceSessions.registerClientVoiceConsultRun({
+          agentId: "main",
+          sessionKey: target.sessionKey,
+          voiceSessionId: relay.id,
+          runId: target.runId,
+          assertCurrent,
+          physicalSource,
+          onRegistered,
         });
-        expectRegistrations(relay, 0, 0);
-        expect(resolveBinding(target.runId)).toBeUndefined();
-        expect(clientVoiceSessionTesting.readRecord("main", relay.id)?.consultRunIds).toEqual(
-          phase === "registration" || phase === "aborted" || phase === "cleanup"
-            ? [target.runId]
-            : [],
-        );
-        if (replacement) {
-          adoptRelayProviderToolCallId(relay, "replacement-call");
-          await registerRun({ ...target, callId: "replacement-call" });
-          cancelTalkRealtimeRelayProviderToolCall(relay, "replacement-call");
-          expect(replacement.source.input.abortSignal.aborted).toBe(true);
+        held.resolve();
+        if (phase === "failure") {
+          await resume.promise;
         }
-      } finally {
-        resume.resolve();
-        await settled;
-        await replacement?.cleanup();
-        chat.source.adapter.projectSessionTerminalPending = false;
-        terminalWrite.resolve();
-        await terminalCleanup;
-        await chat.cleanup();
-        registering?.mockRestore();
-        creating?.mockRestore();
+      },
+    });
+    const settled = old.then(
+      (release) => ({ release }),
+      (error: unknown) => ({ error }),
+    );
+    try {
+      await withinTest(held.promise, signal);
+      if (phase === "release") {
+        await old;
       }
-    },
-  );
-
-  it.for(["provider", "close", "close-without-controller"] as const)(
-    "retires completion custody without cancelling a later controller (%s)",
-    async (operation) => {
-      const { relay, target, chat } = await createRegistrationFixture();
-      if (operation === "close-without-controller") {
-        await chat.cleanup();
+      const current = await registerRun({ ...target, callId });
+      rejectOld = phase === "failure";
+      resume.resolve();
+      const result = await settled;
+      if ("release" in result) {
+        result.release.release();
+      } else {
+        expect(result.error).toBeInstanceOf(Error);
       }
-      const callId =
-        operation === "close"
-          ? undefined
-          : adoptRelayProviderToolCallId(relay, "settled-controller-call");
-      const registration = await registerRun({ ...target, callId });
-      if (operation === "provider") {
-        expect(registration.isCurrent()).toBe(true);
-      }
+      expectRegistrations(relay, 1, 1);
+      expect(resolveBinding(target.runId)).toBeDefined();
+      expect(chat.source.input.abortSignal.aborted).toBe(false);
+      cancelTalkRealtimeRelayProviderToolCall(relay, "registration-call");
+      expect(chat.source.input.abortSignal.aborted).toBe(true);
+      current.release();
+    } finally {
+      resume.resolve();
+      await settled;
       await chat.cleanup();
-      if (operation === "provider") {
-        expect(getRpcSource(target.runId)).toBeUndefined();
-        expect(registration.isCurrent()).toBe(false);
-        expect(registration.isCurrent("completion")).toBe(true);
-      }
-      const replacement = await createControllerSource(relay, target.runId, "replacement-chat");
-      try {
-        if (operation === "provider") {
-          expect(registration.isCurrent()).toBe(false);
-          expect(registration.isCurrent("completion")).toBe(false);
-          cancelTalkRealtimeRelayProviderToolCall(relay, "settled-controller-call");
-        } else {
-          await closeRelaySession(relay, "completed", { disposition: "abort" });
-        }
-        expect(replacement.source.input.abortSignal.aborted).toBe(false);
-        expectRegistrations(relay, 0, 0);
-        if (operation === "provider") {
-          adoptRelayProviderToolCallId(relay, "replacement-call");
-          const successor = await registerRun({
-            ...target,
-            callId: "replacement-call",
-          });
-          registration.release();
-          expect(successor.isCurrent()).toBe(true);
-          cancelTalkRealtimeRelayProviderToolCall(relay, "replacement-call");
-          expect(replacement.source.input.abortSignal.aborted).toBe(true);
-          successor.release();
-        }
-      } finally {
-        registration.release();
-        await replacement.cleanup();
+    }
+  },
+);
+
+it.for(["none", "live", "detached"] as const)(
+  "settles published cleanup before a replaced registration returns (successor=%s)",
+  async (successor, { signal }) => {
+    const { relay, target, chat } = await createRegistrationFixture();
+    const callId = adoptRelayProviderToolCallId(relay, "publication-call")!;
+    const held = createDeferred();
+    const resume = createDeferred();
+    let activeChat = chat;
+    let current: Awaited<ReturnType<typeof registerRun>> | undefined;
+    const register = voiceSessions.registerClientVoiceConsultRun;
+    const registering = vi
+      .spyOn(voiceSessions, "registerClientVoiceConsultRun")
+      .mockImplementationOnce(
+        afterResult(register, async () => {
+          held.resolve();
+          await resume.promise;
+        }),
+      );
+    const pending = registerRun({ ...target, callId });
+    const settled = pending.catch((error: unknown) => error);
+    try {
+      await withinTest(held.promise, signal);
+      await expect(
+        registerRun({
+          ...target,
+          callId,
+          registerVoice: async () => {
+            throw new Error("replacement registration refused");
+          },
+        }),
+      ).rejects.toThrow("replacement registration refused");
+      expectRegistrations(relay, 0, 0);
+      if (successor !== "none") {
         await chat.cleanup();
+        activeChat = await createControllerSource(relay, target.runId, "successor-session");
+        current = await registerRun({ ...target, callId });
+        expect(resolveBinding(target.runId)).toBeDefined();
+        if (successor === "detached") {
+          clearRelayAgentToolCall(relay, callId);
+          expect(relay.activeAgentRuns.size).toBe(0);
+        }
       }
-    },
-  );
+      const binding = resolveBinding(target.runId);
+      resume.resolve();
+      expect(await settled).toMatchObject({
+        message: "Realtime relay run registration changed while waiting",
+      });
+      if (successor === "none") {
+        expect(resolveBinding(target.runId)).toBeUndefined();
+      } else {
+        expect(resolveBinding(target.runId)).toBe(binding);
+        expect(activeChat.source.input.abortSignal.aborted).toBe(false);
+        if (successor === "live") {
+          expect(current?.isCurrent()).toBe(true);
+          current?.release();
+          expect(resolveBinding(target.runId)).toBeUndefined();
+        }
+      }
+    } finally {
+      resume.resolve();
+      await settled;
+      current?.release();
+      await activeChat.cleanup();
+      registering.mockRestore();
+    }
+  },
+);
 
-  it("retries a known refused voice write in the database admitted by its creator", async () => {
-    const originalEnv = { ...process.env };
-    const env = captureEnv(["OPENCLAW_STATE_DIR"]);
-    const successor = path.join(process.env.OPENCLAW_STATE_DIR!, "successor-known-failure");
-    const config = { agents: { entries: { main: {}, fresh: {} } } };
-    const relay = await createRelay("conn-known-failure", config, "agent:fresh:main");
-    const agentId = relay.sessionTarget.agentId;
-    const originalPath = resolveOpenClawAgentSqlitePath({ agentId });
-    expect(existsSync(originalPath)).toBe(false);
-    let writer: ClientVoiceSessionWriter | undefined;
+it.each(["call-1", "call-2"])("retains a shared run when %s clears first", async (first) => {
+  const { relay, target, chat } = await createRegistrationFixture();
+  const second = first === "call-1" ? "call-2" : "call-1";
+  try {
+    for (const callId of ["call-1", "call-2"]) {
+      adoptRelayProviderToolCallId(relay, callId);
+      await registerRun({ ...target, callId });
+    }
+    clearRelayAgentToolCall(relay, first);
+    expect(relay.activeAgentRuns.size).toBe(1);
+    expect(relay.activeAgentToolCalls.has(second)).toBe(true);
+    expect(resolveBinding(target.runId)).toBeDefined();
+    cancelTalkRealtimeRelayProviderToolCall(relay, second);
+    expect(chat.source.input.abortSignal.aborted).toBe(true);
+    expect(relay.activeAgentRuns.size).toBe(0);
+  } finally {
+    await chat.cleanup();
+  }
+});
+
+it.each(["standalone", "call"])(
+  "retains shared voice ownership when the %s registration releases first",
+  async (first) => {
+    const { relay, target, chat } = await createRegistrationFixture();
+    const standalone = await registerRun(target);
+    const call = await registerRun({ ...target, callId: "shared-call" });
+    try {
+      (first === "standalone" ? standalone : call).release();
+      expect(relay.activeAgentRuns.size).toBe(1);
+      expect(resolveBinding(target.runId)).toBeDefined();
+      (first === "standalone" ? call : standalone).release();
+      expect(relay.activeAgentRuns.size).toBe(0);
+      expect(resolveBinding(target.runId)).toBeUndefined();
+    } finally {
+      standalone.release();
+      call.release();
+      await chat.cleanup();
+    }
+  },
+);
+
+it.for(["creation", "registration", "failure", "aborted", "cleanup"] as const)(
+  "preserves controller source ownership across the %s wait",
+  async (phase, { signal }) => {
+    const { relay, target, chat } = await createRegistrationFixture();
+    const callId = adoptRelayProviderToolCallId(relay, "controller-call")!;
+    const published = ["registration", "aborted", "cleanup"].includes(phase);
+    const held = createDeferred();
+    const resume = createDeferred();
+    const waitForReplacement = async () => {
+      held.resolve();
+      await resume.promise;
+    };
     const create = voiceSessions.createOrResumeClientVoiceSession;
-    const creation = vi
-      .spyOn(voiceSessions, "createOrResumeClientVoiceSession")
-      .mockImplementation((...args) => {
-        writer = args[1];
-        return create(...args);
-      });
-    let refused = false;
-    const admit = operationAdmission.createSqliteWorkerOperationAdmission;
-    const admission = vi
-      .spyOn(operationAdmission, "createSqliteWorkerOperationAdmission")
-      .mockImplementation((authorize, attachment) =>
-        admit((request, grant) => {
-          if (!refused && request.stage === "commit" && writer?.identity.key.startsWith("file:")) {
-            refused = true;
-            throw new Error("Synthetic voice commit refusal");
-          }
-          authorize(request, grant);
-        }, attachment),
-      );
+    const creating =
+      phase === "creation"
+        ? vi
+            .spyOn(voiceSessions, "createOrResumeClientVoiceSession")
+            .mockImplementationOnce(afterResult(create, waitForReplacement))
+        : undefined;
+    const register = voiceSessions.registerClientVoiceConsultRun;
+    const registering = published
+      ? vi
+          .spyOn(voiceSessions, "registerClientVoiceConsultRun")
+          .mockImplementationOnce(afterResult(register, waitForReplacement))
+      : undefined;
+    const pending = registerRun({
+      ...target,
+      callId,
+      registerVoice:
+        phase === "failure"
+          ? async () => {
+              await waitForReplacement();
+              throw new Error("registration refused");
+            }
+          : undefined,
+    });
+    const settled = pending.catch((error: unknown) => error);
+    let replacement: typeof chat | undefined;
+    const terminalWrite = createDeferred();
+    let terminalCleanup: Promise<void> | undefined;
     try {
-      expect(await ensureRelayVoiceSession(relay)).toBe(false);
-      expect(refused).toBe(true);
-      expect(existsSync(originalPath)).toBe(true);
-      expect(readVoiceSessionRecord(agentId, relay.id)).toBeUndefined();
-      setTestEnvValue("OPENCLAW_STATE_DIR", successor);
-      expect(await ensureRelayVoiceSession(relay)).toBe(true);
-      expect(readVoiceSessionRecord(agentId, relay.id, { env: originalEnv })?.status).toBe("open");
-      expect(existsSync(resolveOpenClawAgentSqlitePath({ agentId }))).toBe(false);
+      await withinTest(held.promise, signal);
+      if (phase === "aborted" || phase === "cleanup") {
+        const entry = chat.source;
+        if (phase === "aborted") {
+          requestRpcSourceCancellation(chat.source);
+        } else {
+          entry.adapter.projectSessionTerminalPending = true;
+          trackSessionControllerSourceWork(entry.input, terminalWrite.promise);
+          terminalCleanup = chat.cleanup();
+        }
+        expect(getRpcSource(target.runId)).toBe(entry);
+      } else {
+        await chat.cleanup();
+        replacement = await createControllerSource(relay, target.runId, "replacement-chat");
+      }
+      resume.resolve();
+      const result = await settled;
+      cancelTalkRealtimeRelayProviderToolCall(relay, "controller-call");
+      if (replacement) {
+        expect(replacement.source.input.abortSignal.aborted).toBe(false);
+      }
+      expect(result).toMatchObject({
+        message:
+          phase === "failure"
+            ? "registration refused"
+            : "Realtime relay run registration changed while waiting",
+      });
+      expectRegistrations(relay, 0, 0);
+      expect(resolveBinding(target.runId)).toBeUndefined();
+      expect(clientVoiceSessionTesting.readRecord("main", relay.id)?.consultRunIds).toEqual(
+        published ? [target.runId] : [],
+      );
+      if (replacement) {
+        adoptRelayProviderToolCallId(relay, "replacement-call");
+        await registerRun({ ...target, callId: "replacement-call" });
+        cancelTalkRealtimeRelayProviderToolCall(relay, "replacement-call");
+        expect(replacement.source.input.abortSignal.aborted).toBe(true);
+      }
     } finally {
-      admission.mockRestore();
-      creation.mockRestore();
-      env.restore();
-      await closeRelaySession(relay, "completed");
-      await cleanupSessionStateForTest({ stateDir: successor, rootPath: successor });
+      resume.resolve();
+      await settled;
+      await replacement?.cleanup();
+      chat.source.adapter.projectSessionTerminalPending = false;
+      terminalWrite.resolve();
+      await terminalCleanup;
+      await chat.cleanup();
+      registering?.mockRestore();
+      creating?.mockRestore();
     }
-  });
+  },
+);
 
-  it("refuses a replaced physical source on the already-created fast path", async () => {
-    const relay = await createRelay("conn-replaced-source");
+it.for(["provider", "close", "close-without-controller"] as const)(
+  "retires completion custody without cancelling a later controller (%s)",
+  async (operation) => {
+    const { relay, target, chat } = await createRegistrationFixture();
+    if (operation === "close-without-controller") {
+      await chat.cleanup();
+    }
+    const callId =
+      operation === "close"
+        ? undefined
+        : adoptRelayProviderToolCallId(relay, "settled-controller-call");
+    const registration = await registerRun({ ...target, callId });
+    if (operation === "provider") {
+      expect(registration.isCurrent()).toBe(true);
+    }
+    await chat.cleanup();
+    if (operation === "provider") {
+      expect(getRpcSource(target.runId)).toBeUndefined();
+      expect(registration.isCurrent()).toBe(false);
+      expect(registration.isCurrent("completion")).toBe(true);
+    }
+    const replacement = await createControllerSource(relay, target.runId, "replacement-chat");
+    try {
+      if (operation === "provider") {
+        expect(registration.isCurrent()).toBe(false);
+        expect(registration.isCurrent("completion")).toBe(false);
+        cancelTalkRealtimeRelayProviderToolCall(relay, "settled-controller-call");
+      } else {
+        await closeRelaySession(relay, "completed", { disposition: "abort" });
+      }
+      expect(replacement.source.input.abortSignal.aborted).toBe(false);
+      expectRegistrations(relay, 0, 0);
+      if (operation === "provider") {
+        adoptRelayProviderToolCallId(relay, "replacement-call");
+        const successor = await registerRun({
+          ...target,
+          callId: "replacement-call",
+        });
+        registration.release();
+        expect(successor.isCurrent()).toBe(true);
+        cancelTalkRealtimeRelayProviderToolCall(relay, "replacement-call");
+        expect(replacement.source.input.abortSignal.aborted).toBe(true);
+        successor.release();
+      }
+    } finally {
+      registration.release();
+      await replacement.cleanup();
+      await chat.cleanup();
+    }
+  },
+);
+
+it("retries a known refused voice write in the database admitted by its creator", async () => {
+  const originalEnv = { ...process.env };
+  const env = captureEnv(["OPENCLAW_STATE_DIR"]);
+  const successor = path.join(process.env.OPENCLAW_STATE_DIR!, "successor-known-failure");
+  const config = { agents: { entries: { main: {}, fresh: {} } } };
+  const { relay } = await createRelay({
+    connId: "conn-known-failure",
+    cfg: config,
+    key: "agent:fresh:main",
+  });
+  const agentId = relay.sessionTarget.agentId;
+  const originalPath = resolveOpenClawAgentSqlitePath({ agentId });
+  expect(existsSync(originalPath)).toBe(false);
+  let writer: ClientVoiceSessionWriter | undefined;
+  const create = voiceSessions.createOrResumeClientVoiceSession;
+  const creation = vi
+    .spyOn(voiceSessions, "createOrResumeClientVoiceSession")
+    .mockImplementation((...args) => {
+      writer = args[1];
+      return create(...args);
+    });
+  let refused = false;
+  const admit = operationAdmission.createSqliteWorkerOperationAdmission;
+  const admission = vi
+    .spyOn(operationAdmission, "createSqliteWorkerOperationAdmission")
+    .mockImplementation((authorize, attachment) =>
+      admit((request, grant) => {
+        if (!refused && request.stage === "commit" && writer?.identity.key.startsWith("file:")) {
+          refused = true;
+          throw new Error("Synthetic voice commit refusal");
+        }
+        authorize(request, grant);
+      }, attachment),
+    );
+  try {
+    expect(await ensureRelayVoiceSession(relay)).toBe(false);
+    expect(refused).toBe(true);
+    expect(existsSync(originalPath)).toBe(true);
+    expect(readVoiceSessionRecord(agentId, relay.id)).toBeUndefined();
+    setTestEnvValue("OPENCLAW_STATE_DIR", successor);
     expect(await ensureRelayVoiceSession(relay)).toBe(true);
-    const sourcePath = resolveOpenClawAgentSqlitePath({ agentId: "main" });
-    const displaced = `${sourcePath}.original`;
+    expect(readVoiceSessionRecord(agentId, relay.id, { env: originalEnv })?.status).toBe("open");
+    expect(existsSync(resolveOpenClawAgentSqlitePath({ agentId }))).toBe(false);
+  } finally {
+    admission.mockRestore();
+    creation.mockRestore();
+    env.restore();
+    await closeRelaySession(relay, "completed");
+    await cleanupSessionStateForTest({ stateDir: successor, rootPath: successor });
+  }
+});
+
+it("refuses a replaced physical source on the already-created fast path", async () => {
+  const { relay } = await createRelay({ connId: "conn-replaced-source" });
+  expect(await ensureRelayVoiceSession(relay)).toBe(true);
+  const sourcePath = resolveOpenClawAgentSqlitePath({ agentId: "main" });
+  const displaced = `${sourcePath}.original`;
+  await closeOpenClawAgentDatabasesAsync(process.env.OPENCLAW_STATE_DIR!);
+  renameSync(sourcePath, displaced);
+  copyFileSync(displaced, sourcePath);
+  const replacement = readFileSync(sourcePath);
+  try {
+    expect(await ensureRelayVoiceSession(relay)).toBe(false);
+    expect(readFileSync(sourcePath)).toEqual(replacement);
+  } finally {
     await closeOpenClawAgentDatabasesAsync(process.env.OPENCLAW_STATE_DIR!);
-    renameSync(sourcePath, displaced);
-    copyFileSync(displaced, sourcePath);
-    const replacement = readFileSync(sourcePath);
-    try {
-      expect(await ensureRelayVoiceSession(relay)).toBe(false);
-      expect(readFileSync(sourcePath)).toEqual(replacement);
-    } finally {
-      await closeOpenClawAgentDatabasesAsync(process.env.OPENCLAW_STATE_DIR!);
-      unlinkSync(sourcePath);
-      renameSync(displaced, sourcePath);
-      await closeRelaySession(relay, "completed");
-    }
-  });
+    unlinkSync(sourcePath);
+    renameSync(displaced, sourcePath);
+    await closeRelaySession(relay, "completed");
+  }
+});
 
-  it.each([false, true])(
-    "keeps accepted registration and close on the creating source after a state switch (coalesced=%s)",
-    async (coalesced) => {
-      await withOpenClawTestState(
-        { label: "relay-source-switch", scenario: "minimal" },
-        async () => {
-          await ensureClientVoiceAgentSessionEntry({
-            agentId: "main",
-            sessionKey: "agent:main:main",
-          });
-          const originalEnv = { ...process.env };
-          const env = captureEnv(["OPENCLAW_STATE_DIR"]);
-          const successor = path.join(process.env.OPENCLAW_STATE_DIR!, "successor");
-          const relay = await createRelay("conn-source");
-          const binding = {
-            agentId: relay.sessionTarget.agentId,
-            sessionKey: relay.sessionTarget.sessionKey,
-            voiceSessionId: relay.id,
-          };
-          setTestEnvValue("OPENCLAW_STATE_DIR", successor);
-          await voiceSessions.createOrResumeClientVoiceSession({ ...binding, origin: "relay" });
-          env.restore();
-          const persistence = prepareClientVoiceSessionClose();
-          const acceptedClose = captureClientVoiceSessionSettlement();
-          const entered = createDeferred();
-          const resume = createDeferred();
-          const blocker = runOpenClawAgentWriteAdmission({ agentId: binding.agentId }, async () => {
-            entered.resolve();
-            await resume.promise;
-          });
-          await entered.promise;
-          const creating = coalesced ? ensureRelayVoiceSession(relay) : undefined;
-          let release: (() => void) | undefined;
-          const registered = registerRun({
-            relaySessionId: relay.id,
-            connId: relay.connId,
-            sessionKey: binding.sessionKey,
-            runId: "source-run",
-          }).then(
-            (registeredRelease) => {
-              release = registeredRelease.release;
-              return undefined;
-            },
-            (error: unknown) => error,
-          );
-          try {
-            setTestEnvValue("OPENCLAW_STATE_DIR", successor);
-            persistence.beginClose();
-            resume.resolve();
-            expect(await registered).toBeUndefined();
-            await creating;
-            expect(
-              readVoiceSessionRecord(binding.agentId, relay.id, { env: originalEnv }),
-            ).toMatchObject({
-              consultRunIds: ["source-run"],
-              status: "open",
-            });
-            expect(
-              acceptedClose.run(() =>
-                enqueueRelayVoiceTranscript(relay, "user", "accepted speech"),
-              ),
-            ).toBe(true);
-            await relay.voiceTranscriptQueue.flush();
-            release?.();
-            await acceptedClose.run(() => closeRelaySession(relay, "completed"));
-            expect(
-              readVoiceSessionRecord(binding.agentId, relay.id, { env: originalEnv }),
-            ).toMatchObject({
-              consultRunIds: ["source-run"],
-              hasUserTranscript: true,
-              status: "closed",
-            });
-            expect(readVoiceSessionRecord(binding.agentId, relay.id)).toMatchObject({
-              consultRunIds: [],
-              status: "open",
-            });
-          } finally {
-            resume.resolve();
-            await blocker;
-            await registered;
-            release?.();
-            env.restore();
-            await acceptedClose.run(() => closeRelaySession(relay, "completed"));
-            acceptedClose.release();
-            await persistence.drain();
-            await cleanupSessionStateForTest({ stateDir: successor, rootPath: successor });
-          }
-        },
-      );
-    },
-  );
-
-  it.for(["current", "caller", "relay", "controller"] as const)(
-    "fences delegated voice registration while queued (%s)",
-    async (revoked, { signal }) => {
-      const relay = await createRelay("conn-1", {}, "main");
-      const voiceSessionId = relay.id;
-      const sessionKey = relay.sessionTarget.sessionKey;
-      const chat =
-        revoked === "controller"
-          ? await createControllerSource(relay, "run-1", "queued-chat")
-          : undefined;
-      let replacement: typeof chat;
-      const queued = createDeferred();
-      const entered = createDeferred();
-      const releaseQueue = createDeferred();
-      let callerCurrent = true;
-      let blocker: Promise<void> | undefined;
-      let release: (() => void) | undefined;
-      const registerVoice = vi.fn<NonNullable<Parameters<typeof registerRun>[0]["registerVoice"]>>(
-        async (assertCurrent, physicalSource, onRegistered) => {
-          blocker = runOpenClawAgentWriteAdmission({ agentId: "main" }, async () => {
-            entered.resolve();
-            await releaseQueue.promise;
-          });
-          await entered.promise;
-          const pending = voiceSessions.registerClientVoiceConsultRun({
-            agentId: "main",
-            sessionKey,
-            voiceSessionId,
-            runId: "run-1",
-            assertCurrent,
-            physicalSource,
-            onRegistered,
-          });
-          queued.resolve();
-          await pending;
-        },
-      );
-      const pending = registerRun({
-        relaySessionId: voiceSessionId,
-        connId: "conn-1",
-        sessionKey: relay.sessionTarget.canonicalKey,
-        runId: "run-1",
-        callId: "call-1",
-        assertCurrent: () => {
-          if (!callerCurrent) {
-            throw new Error("Accepted caller was cancelled");
-          }
-        },
-        registerVoice,
+it.each([false, true])(
+  "keeps accepted registration and close on the creating source after a state switch (coalesced=%s)",
+  (coalesced) =>
+    withOpenClawTestState({ label: "relay-source-switch", scenario: "minimal" }, async () => {
+      await ensureClientVoiceAgentSessionEntry({
+        agentId: "main",
+        sessionKey: "agent:main:main",
       });
-      const settled = pending.then(
-        (registered) => {
-          release = registered.release;
+      const originalEnv = { ...process.env };
+      const env = captureEnv(["OPENCLAW_STATE_DIR"]);
+      const successor = path.join(process.env.OPENCLAW_STATE_DIR!, "successor");
+      const { relay } = await createRelay({ connId: "conn-source" });
+      const binding = {
+        agentId: relay.sessionTarget.agentId,
+        sessionKey: relay.sessionTarget.sessionKey,
+        voiceSessionId: relay.id,
+      };
+      setTestEnvValue("OPENCLAW_STATE_DIR", successor);
+      await voiceSessions.createOrResumeClientVoiceSession({ ...binding, origin: "relay" });
+      env.restore();
+      const persistence = prepareClientVoiceSessionClose();
+      const acceptedClose = captureClientVoiceSessionSettlement();
+      const entered = createDeferred();
+      const resume = createDeferred();
+      const blocker = runOpenClawAgentWriteAdmission({ agentId: binding.agentId }, async () => {
+        entered.resolve();
+        await resume.promise;
+      });
+      await entered.promise;
+      const creating = coalesced ? ensureRelayVoiceSession(relay) : undefined;
+      let release: (() => void) | undefined;
+      const registered = registerRun({
+        relaySessionId: relay.id,
+        connId: relay.connId,
+        sessionKey: binding.sessionKey,
+        runId: "source-run",
+      }).then(
+        (registeredRelease) => {
+          release = registeredRelease.release;
           return undefined;
         },
         (error: unknown) => error,
       );
       try {
-        await withinTest(
-          awaitGateBeforeSettlement(
-            queued.promise,
-            settled,
-            "Relay completed before registration queued",
-          ),
-          signal,
-        );
-        if (revoked === "caller") {
-          callerCurrent = false;
-        } else if (revoked === "relay") {
-          relay.toolCalls.markCancelled(["call-1"], "cancelled-turn");
-        } else if (revoked === "controller") {
-          await chat?.cleanup();
-          replacement = await createControllerSource(relay, "run-1", "replacement-chat");
-        }
-        releaseQueue.resolve();
-        const error = await settled;
-        await blocker;
-        expect(registerVoice).toHaveBeenCalledOnce();
-        expect(clientVoiceSessionTesting.readRecord("main", voiceSessionId)?.consultRunIds).toEqual(
-          revoked === "current" ? ["run-1"] : [],
-        );
-        if (revoked === "current") {
-          expect(error).toBeUndefined();
-          expect(resolveBinding("run-1")).toBeDefined();
-          expect(relay.activeAgentRuns.size).toBe(1);
-          release?.();
-        } else {
-          expect(error).toMatchObject({
-            message:
-              revoked === "caller"
-                ? "Accepted caller was cancelled"
-                : revoked === "controller"
-                  ? "Realtime relay run registration changed while waiting"
-                  : "Realtime provider cancelled the tool call before run registration",
-          });
-          expect(resolveBinding("run-1")).toBeUndefined();
-        }
-        expectRegistrations(relay, 0, 0);
-        if (replacement) {
-          expect(replacement.source.input.abortSignal.aborted).toBe(false);
-        }
-      } finally {
-        releaseQueue.resolve();
-        await settled;
-        await blocker;
+        setTestEnvValue("OPENCLAW_STATE_DIR", successor);
+        persistence.beginClose();
+        resume.resolve();
+        expect(await registered).toBeUndefined();
+        await creating;
+        expect(
+          readVoiceSessionRecord(binding.agentId, relay.id, { env: originalEnv }),
+        ).toMatchObject({
+          consultRunIds: ["source-run"],
+          status: "open",
+        });
+        expect(
+          acceptedClose.run(() => enqueueRelayVoiceTranscript(relay, "user", "accepted speech")),
+        ).toBe(true);
+        await relay.voiceTranscriptQueue.flush();
         release?.();
-        await replacement?.cleanup();
-        await chat?.cleanup();
+        await acceptedClose.run(() => closeRelaySession(relay, "completed"));
+        expect(
+          readVoiceSessionRecord(binding.agentId, relay.id, { env: originalEnv }),
+        ).toMatchObject({
+          consultRunIds: ["source-run"],
+          hasUserTranscript: true,
+          status: "closed",
+        });
+        expect(readVoiceSessionRecord(binding.agentId, relay.id)).toMatchObject({
+          consultRunIds: [],
+          status: "open",
+        });
+      } finally {
+        resume.resolve();
+        await blocker;
+        await registered;
+        release?.();
+        env.restore();
+        await acceptedClose.run(() => closeRelaySession(relay, "completed"));
+        acceptedClose.release();
+        await persistence.drain();
+        await cleanupSessionStateForTest({ stateDir: successor, rootPath: successor });
       }
-    },
-  );
-});
+    }),
+);
+
+it.for(["current", "caller", "relay", "controller"] as const)(
+  "fences delegated voice registration while queued (%s)",
+  async (revoked, { signal }) => {
+    const { relay } = await createRelay({ key: "main" });
+    const voiceSessionId = relay.id;
+    const sessionKey = relay.sessionTarget.sessionKey;
+    const chat =
+      revoked === "controller"
+        ? await createControllerSource(relay, "run-1", "queued-chat")
+        : undefined;
+    let replacement: typeof chat;
+    const queued = createDeferred();
+    const entered = createDeferred();
+    const releaseQueue = createDeferred();
+    let callerCurrent = true;
+    let blocker: Promise<void> | undefined;
+    let release: (() => void) | undefined;
+    const registerVoice = vi.fn<NonNullable<Parameters<typeof registerRun>[0]["registerVoice"]>>(
+      async (assertCurrent, physicalSource, onRegistered) => {
+        blocker = runOpenClawAgentWriteAdmission({ agentId: "main" }, async () => {
+          entered.resolve();
+          await releaseQueue.promise;
+        });
+        await entered.promise;
+        const pending = voiceSessions.registerClientVoiceConsultRun({
+          agentId: "main",
+          sessionKey,
+          voiceSessionId,
+          runId: "run-1",
+          assertCurrent,
+          physicalSource,
+          onRegistered,
+        });
+        queued.resolve();
+        await pending;
+      },
+    );
+    const pending = registerRun({
+      relaySessionId: voiceSessionId,
+      connId: "conn-1",
+      sessionKey: relay.sessionTarget.canonicalKey,
+      runId: "run-1",
+      callId: "call-1",
+      assertCurrent: () => {
+        if (!callerCurrent) {
+          throw new Error("Accepted caller was cancelled");
+        }
+      },
+      registerVoice,
+    });
+    const settled = pending.then(
+      (registered) => {
+        release = registered.release;
+        return undefined;
+      },
+      (error: unknown) => error,
+    );
+    try {
+      await withinTest(
+        awaitGateBeforeSettlement(
+          queued.promise,
+          settled,
+          "Relay completed before registration queued",
+        ),
+        signal,
+      );
+      if (revoked === "caller") {
+        callerCurrent = false;
+      } else if (revoked === "relay") {
+        relay.toolCalls.markCancelled(["call-1"], "cancelled-turn");
+      } else if (revoked === "controller") {
+        await chat?.cleanup();
+        replacement = await createControllerSource(relay, "run-1", "replacement-chat");
+      }
+      releaseQueue.resolve();
+      const error = await settled;
+      await blocker;
+      expect(registerVoice).toHaveBeenCalledOnce();
+      expect(clientVoiceSessionTesting.readRecord("main", voiceSessionId)?.consultRunIds).toEqual(
+        revoked === "current" ? ["run-1"] : [],
+      );
+      if (revoked === "current") {
+        expect(error).toBeUndefined();
+        expect(resolveBinding("run-1")).toBeDefined();
+        expect(relay.activeAgentRuns.size).toBe(1);
+        release?.();
+      } else {
+        expect(error).toMatchObject({
+          message:
+            revoked === "caller"
+              ? "Accepted caller was cancelled"
+              : revoked === "controller"
+                ? "Realtime relay run registration changed while waiting"
+                : "Realtime provider cancelled the tool call before run registration",
+        });
+        expect(resolveBinding("run-1")).toBeUndefined();
+      }
+      expectRegistrations(relay, 0, 0);
+      if (replacement) {
+        expect(replacement.source.input.abortSignal.aborted).toBe(false);
+      }
+    } finally {
+      releaseQueue.resolve();
+      await settled;
+      await blocker;
+      release?.();
+      await replacement?.cleanup();
+      await chat?.cleanup();
+    }
+  },
+);
