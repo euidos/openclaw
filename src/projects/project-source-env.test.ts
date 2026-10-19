@@ -1,5 +1,6 @@
 import path from "node:path";
 import { beforeEach, expect, it, vi } from "vitest";
+import { awaitGateBeforeSettlement } from "../../test/helpers/promise.js";
 
 const mocks = vi.hoisted(() => ({
   execute: vi.fn(),
@@ -66,6 +67,7 @@ import type { SessionEntry } from "../config/sessions/types.js";
 import { migrateManagedWorktreeCanonicalWorkspaces } from "../config/sessions/worktree-workspace-migration.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import type { OpenClawStateWorkerContext } from "../state/openclaw-state-worker-context.types.js";
+import { withMockedPlatform } from "../test-utils/vitest-spies.js";
 import { selectStoredProjectRegistry } from "./project-registry.js";
 import type { ProjectRegistryRecord } from "./project-registry.types.js";
 
@@ -77,15 +79,53 @@ const project: ProjectRegistryRecord = {
   repoRoot: path.resolve("/synthetic-repository/project"),
 };
 
-function callerEnvironment(): NodeJS.ProcessEnv {
-  return {
-    HOME: path.resolve("/synthetic-home"),
-    USERPROFILE: path.resolve("/synthetic-home"),
-    NODE_ENV: "test",
-    OPENCLAW_TEST_FAST: "1",
-    OpenClaw_State_Dir: root,
-    OpenClaw_Supervisor_Mode: "external",
-  };
+async function withPausedProject<T>(
+  start: (env: NodeJS.ProcessEnv) => Promise<T>,
+  check: (result: T, env: NodeJS.ProcessEnv) => Promise<void> | void,
+) {
+  await withMockedPlatform("win32", async () => {
+    const env: NodeJS.ProcessEnv = {
+      HOME: path.resolve("/synthetic-home"),
+      USERPROFILE: path.resolve("/synthetic-home"),
+      NODE_ENV: "test",
+      OPENCLAW_TEST_FAST: "1",
+      OpenClaw_State_Dir: root,
+      OpenClaw_Supervisor_Mode: "external",
+    };
+    const entered = createDeferredCore();
+    const projectRead = createDeferredCore<ProjectRegistryRecord>();
+    let captured: OpenClawStateWorkerContext | undefined;
+    mocks.execute.mockImplementation(async (context: OpenClawStateWorkerContext) => {
+      captured = context;
+      entered.resolve();
+      return await projectRead.promise;
+    });
+    const pending = start(env);
+    const joined = pending.catch(() => {});
+    try {
+      await awaitGateBeforeSettlement(entered.promise, pending, "Project read was bypassed");
+      env.OpenClaw_State_Dir = path.resolve("/changed-project-state");
+      env.OpenClaw_Supervisor_Mode = "other";
+      projectRead.resolve(project);
+      await check(await pending, env);
+      expect(captured?.environment).toEqual({
+        OPENCLAW_STATE_DIR: root,
+        OPENCLAW_SUPERVISOR_MODE: "external",
+      });
+      expect(captured?.admission.databasePath).toBe(path.join(root, "state", "openclaw.sqlite"));
+      expect(mocks.forbiddenSqlite).not.toHaveBeenCalled();
+    } finally {
+      projectRead.resolve(project);
+      await joined;
+    }
+  });
+}
+
+function expectSnapshot(snapshot: NodeJS.ProcessEnv | undefined, env: NodeJS.ProcessEnv) {
+  expect(snapshot?.OPENCLAW_STATE_DIR).toBe(root);
+  expect(snapshot).not.toBe(env);
+  expect(Object.keys(snapshot ?? {})).toContain("OpenClaw_State_Dir");
+  expect(Object.keys(snapshot ?? {})).not.toContain("OPENCLAW_STATE_DIR");
 }
 
 beforeEach(() => {
@@ -95,59 +135,20 @@ beforeEach(() => {
 });
 
 it("keeps the selector's Windows state snapshot through a caller environment change", async () => {
-  const platform = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
-  const env = callerEnvironment();
-  const entered = createDeferredCore();
-  const projectRead = createDeferredCore<ProjectRegistryRecord>();
-  let captured: OpenClawStateWorkerContext | undefined;
-  mocks.execute.mockImplementation(async (context: OpenClawStateWorkerContext) => {
-    captured = context;
-    entered.resolve();
-    return await projectRead.promise;
-  });
-  const selection = selectStoredProjectRegistry(project.id, { env });
-  const joined = selection.then(
-    () => undefined,
-    () => undefined,
+  await withPausedProject(
+    (env) => selectStoredProjectRegistry(project.id, { env }),
+    async (selected, env) => {
+      expect(selected?.project).toEqual(project);
+      await selected?.withRollback(async () => undefined);
+      const checkoutOptions = mocks.checkout.mock.calls[0]?.[1];
+      expect(checkoutOptions?.path).toBe(path.join(root, "state", "openclaw.sqlite"));
+      expect(checkoutOptions?.env.OPENCLAW_SUPERVISOR_MODE).toBe("external");
+      expectSnapshot(checkoutOptions?.env, env);
+    },
   );
-  try {
-    await Promise.race([
-      entered.promise,
-      selection.then(() => {
-        throw new Error("Selection completed before the project read");
-      }),
-    ]);
-    env.OpenClaw_State_Dir = path.resolve("/changed-project-state");
-    env.OpenClaw_Supervisor_Mode = "other";
-    projectRead.resolve(project);
-    const selected = await selection;
-    expect(selected?.project).toEqual(project);
-    expect(captured?.environment).toEqual({
-      OPENCLAW_STATE_DIR: root,
-      OPENCLAW_SUPERVISOR_MODE: "external",
-    });
-    expect(captured?.admission.databasePath).toBe(path.join(root, "state", "openclaw.sqlite"));
-    await selected?.withRollback(async () => undefined);
-    const checkoutOptions = mocks.checkout.mock.calls[0]?.[1];
-    expect(checkoutOptions?.path).toBe(path.join(root, "state", "openclaw.sqlite"));
-    expect(checkoutOptions?.env.OPENCLAW_STATE_DIR).toBe(root);
-    expect(checkoutOptions?.env.OPENCLAW_SUPERVISOR_MODE).toBe("external");
-    expect(checkoutOptions?.env).not.toBe(env);
-    expect(Object.keys(checkoutOptions.env)).toContain("OpenClaw_State_Dir");
-    expect(Object.keys(checkoutOptions.env)).not.toContain("OPENCLAW_STATE_DIR");
-    expect(mocks.forbiddenSqlite).not.toHaveBeenCalled();
-  } finally {
-    projectRead.resolve(project);
-    await joined;
-    platform.mockRestore();
-  }
 });
 
 it("keeps the migration's Windows state snapshot through the awaited project resolution", async () => {
-  const platform = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
-  const env = callerEnvironment();
-  const entered = createDeferredCore();
-  const projectRead = createDeferredCore<ProjectRegistryRecord>();
   const sessionKey = "agent:main:dashboard:env-migration";
   const databasePath = path.resolve("/synthetic-agent/openclaw.sqlite");
   const entry: SessionEntry = {
@@ -156,14 +157,8 @@ it("keeps the migration's Windows state snapshot through the awaited project res
     projectId: project.id,
     worktree: { id: "worktree", branch: "task", repoRoot: path.resolve("/synthetic-repository") },
   };
-  let captured: OpenClawStateWorkerContext | undefined;
   let patchEnv: NodeJS.ProcessEnv | undefined;
   mocks.readAgent.mockReturnValue({ found: true, value: [{ databasePath, entry, sessionKey }] });
-  mocks.execute.mockImplementation(async (context: OpenClawStateWorkerContext) => {
-    captured = context;
-    entered.resolve();
-    return await projectRead.promise;
-  });
   mocks.patch.mockImplementation(
     async (
       scope: { env?: NodeJS.ProcessEnv },
@@ -173,40 +168,21 @@ it("keeps the migration's Windows state snapshot through the awaited project res
       return { ...entry, ...update(entry) };
     },
   );
-  const migration = migrateManagedWorktreeCanonicalWorkspaces({
-    mode: "doctor-fix",
-    agentId: "main",
-    cfg: {},
-    env,
-    storePath: databasePath,
-  });
-  const joined = migration.then(
-    () => undefined,
-    () => undefined,
-  );
-  try {
-    await Promise.race([
-      entered.promise,
-      migration.then(() => {
-        throw new Error("Migration completed before the project read");
+  await withPausedProject(
+    (env) =>
+      migrateManagedWorktreeCanonicalWorkspaces({
+        mode: "doctor-fix",
+        agentId: "main",
+        cfg: {},
+        env,
+        storePath: databasePath,
       }),
-    ]);
-    env.OpenClaw_State_Dir = path.resolve("/changed-project-state");
-    projectRead.resolve(project);
-    await expect(migration).resolves.toEqual({ found: 1, repaired: 1 });
-    expect(captured?.environment.OPENCLAW_STATE_DIR).toBe(root);
-    expect(captured?.admission.databasePath).toBe(path.join(root, "state", "openclaw.sqlite"));
-    expect(mocks.listWorktrees.mock.calls[0]?.[0].OPENCLAW_STATE_DIR).toBe(root);
-    expect(patchEnv?.OPENCLAW_STATE_DIR).toBe(root);
-    expect(patchEnv).not.toBe(env);
-    expect(Object.keys(patchEnv ?? {})).toContain("OpenClaw_State_Dir");
-    expect(Object.keys(patchEnv ?? {})).not.toContain("OPENCLAW_STATE_DIR");
-    expect(env.OpenClaw_State_Dir).toBe(path.resolve("/changed-project-state"));
-    expect(Object.hasOwn(env, "OPENCLAW_STATE_DIR")).toBe(false);
-    expect(mocks.forbiddenSqlite).not.toHaveBeenCalled();
-  } finally {
-    projectRead.resolve(project);
-    await joined;
-    platform.mockRestore();
-  }
+    (result, env) => {
+      expect(result).toEqual({ found: 1, repaired: 1 });
+      expect(mocks.listWorktrees.mock.calls[0]?.[0].OPENCLAW_STATE_DIR).toBe(root);
+      expectSnapshot(patchEnv, env);
+      expect(env.OpenClaw_State_Dir).toBe(path.resolve("/changed-project-state"));
+      expect(Object.hasOwn(env, "OPENCLAW_STATE_DIR")).toBe(false);
+    },
+  );
 });
