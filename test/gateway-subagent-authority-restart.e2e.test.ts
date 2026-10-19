@@ -21,11 +21,16 @@ import {
 import { createOpenClawTestInstance } from "./helpers/openclaw-test-instance.js";
 import { runQaGatewayFixture } from "./helpers/qa-gateway-cleanup.js";
 
-function writeTool(response: ServerResponse, name: string, args: Record<string, unknown>) {
+function writeTool(
+  response: ServerResponse,
+  name: string,
+  args: Record<string, unknown>,
+  ordinal: number,
+) {
   const item = {
     type: "function_call",
-    id: `fc_${name}`,
-    call_id: `call_${name}`,
+    id: `fc_${name}_${ordinal}`,
+    call_id: `call_${name}_${ordinal}`,
     name,
     arguments: JSON.stringify(args),
     status: "completed",
@@ -46,7 +51,7 @@ function writeTool(response: ServerResponse, name: string, args: Record<string, 
     {
       type: "response.completed",
       response: {
-        id: `resp_${name}`,
+        id: `resp_${name}_${ordinal}`,
         status: "completed",
         output: [item],
         usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12 },
@@ -56,12 +61,14 @@ function writeTool(response: ServerResponse, name: string, args: Record<string, 
 }
 
 it.skipIf(process.platform === "win32")(
-  "restores an identified parent's completion authority after a hard Gateway crash",
+  "keeps a recovered parent's follow-up alive after its old completion settles",
   { timeout: 600_000 },
   async () => {
     const sessionKey = "agent:main:subagent-authority-restart";
     let parentRequests = 0;
     let childRequests = 0;
+    let childSessionKey: string | undefined;
+    let followupResponse: ServerResponse | undefined;
     const model = await startOpenAiResponsesModelServer({
       modelId: "subagent-restart-proof",
       bindError: "model did not bind",
@@ -70,16 +77,36 @@ it.skipIf(process.platform === "win32")(
         if (JSON.stringify(body).includes("PARENT_RESTART_TASK")) {
           parentRequests += 1;
           if (parentRequests === 1) {
-            writeTool(response, "sessions_spawn", {
-              task: "CHILD_RESTART_TASK: wait for the model response.",
-              taskName: "restart_child",
-              mode: "run",
-              cleanup: "keep",
-              completionTarget: "parent",
-              context: "isolated",
-            });
+            writeTool(
+              response,
+              "sessions_spawn",
+              {
+                task: "CHILD_RESTART_TASK: wait for the model response.",
+                taskName: "restart_child",
+                mode: "run",
+                cleanup: "keep",
+                completionTarget: "parent",
+                context: "isolated",
+              },
+              parentRequests,
+            );
           } else if (parentRequests === 2) {
-            writeTool(response, "sessions_yield", {});
+            writeTool(response, "sessions_yield", {}, parentRequests);
+          } else if (parentRequests === 3) {
+            expect(childSessionKey).toBeDefined();
+            writeTool(
+              response,
+              "sessions_send",
+              {
+                sessionKey: childSessionKey,
+                mode: "followup",
+                timeoutSeconds: 0,
+                message: "Finish the retained child task.",
+              },
+              parentRequests,
+            );
+          } else if (parentRequests === 4) {
+            writeTool(response, "sessions_yield", {}, parentRequests);
           } else {
             writeOpenAiResponsesText(response, {
               text: "PARENT_RECOVERED",
@@ -90,6 +117,9 @@ it.skipIf(process.platform === "win32")(
         } else {
           childRequests += 1;
           // Keep the child in flight until its Gateway command is killed.
+          if (childRequests === 2) {
+            followupResponse = response;
+          }
         }
       },
     });
@@ -108,6 +138,7 @@ it.skipIf(process.platform === "win32")(
           reasoning: false,
           toolProfile: "minimal",
         });
+        config.models = { ...config.models, catalogRefresh: { enabled: false } };
         config.plugins = { enabled: false };
         config.tools = {
           allow: ["sessions_spawn", "sessions_yield", "sessions_send", "subagents"],
@@ -161,15 +192,52 @@ it.skipIf(process.platform === "win32")(
           },
           { timeout: 60_000 },
         );
+        const initialRows = await client.request<SessionsListResult>("sessions.list", {
+          agentId: "main",
+        });
+        childSessionKey = initialRows.sessions.find((row) => row.key.includes(":subagent:"))?.key;
         await client.stopAndWait();
         client = undefined;
         await instance.crashGateway();
         await instance.startGateway();
         client = await connect();
-        await vi.waitFor(() => expect(parentRequests, instance.logs()).toBe(3), {
-          timeout: 60_000,
-        });
+        await vi.waitFor(
+          () =>
+            expect({ parentRequests, childRequests }, instance.logs()).toEqual({
+              parentRequests: 4,
+              childRequests: 2,
+            }),
+          {
+            timeout: 60_000,
+          },
+        );
         const observer = client;
+        await vi.waitFor(
+          async () => {
+            const history = await observer.request<{
+              messages: Array<{ role: string; toolName?: string }>;
+            }>("chat.history", { sessionKey });
+            expect(
+              history.messages.filter(
+                (message) => message.role === "toolResult" && message.toolName === "sessions_yield",
+              ),
+            ).toHaveLength(2);
+            const rows = await observer.request<SessionsListResult>("sessions.list", {
+              agentId: "main",
+            });
+            expect(
+              rows.sessions.find((row) => row.key === childSessionKey),
+              instance.logs(),
+            ).toMatchObject({ status: "running", hasActiveRun: true });
+          },
+          { timeout: 60_000 },
+        );
+        expect(followupResponse).toBeDefined();
+        writeOpenAiResponsesText(followupResponse!, {
+          text: "CHILD_FOLLOWUP_FINISHED",
+          messageId: "msg_child_followup",
+          responseId: "resp_child_followup",
+        });
         await vi.waitFor(
           async () => {
             const sessions = await observer.request<SessionsListResult>("sessions.list", {
@@ -179,6 +247,14 @@ it.skipIf(process.platform === "win32")(
               sessions.sessions.find((row) => row.key === sessionKey),
               instance.logs(),
             ).toMatchObject({ status: "done", hasActiveRun: false });
+            expect(
+              sessions.sessions.find((row) => row.key === childSessionKey),
+              instance.logs(),
+            ).toMatchObject({ status: "done", hasActiveRun: false });
+            const childHistory = await observer.request("chat.history", {
+              sessionKey: childSessionKey,
+            });
+            expect(JSON.stringify(childHistory)).toContain("CHILD_FOLLOWUP_FINISHED");
             const history = await observer.request<{ messages: unknown[] }>("chat.history", {
               sessionKey,
             });
@@ -191,6 +267,8 @@ it.skipIf(process.platform === "win32")(
           },
           { timeout: 60_000 },
         );
+        expect(parentRequests).toBe(5);
+        expect(childRequests).toBe(2);
       },
       () => client?.stopAndWait(),
       () => instance.cleanup(),
