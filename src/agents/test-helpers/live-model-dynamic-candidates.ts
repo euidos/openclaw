@@ -1,8 +1,3 @@
-/**
- * Dynamic live-model candidate expansion.
- * Adds prioritized plugin-discovered live models to static catalog candidates
- * while keeping the hot catalog path provider-agnostic.
- */
 import {
   findNormalizedProviderValue,
   normalizeProviderId,
@@ -108,8 +103,7 @@ export function getHighSignalLiveModelPriorityIndex(ref: ModelRef): number | nul
 }
 
 export function isPrioritizedHighSignalLiveModelRef(ref: ModelRef): boolean {
-  const key = canonicalLiveModelRef(ref);
-  return key !== undefined && highSignalPriorityIndex.has(key);
+  return getHighSignalLiveModelPriorityIndex(ref) !== null;
 }
 
 export function isSmallLiveModelRef(ref: ModelRef): boolean {
@@ -340,12 +334,6 @@ async function normalizeDynamicModelDefault(
   return normalizeDiscoveredAgentModel(model, agentDir, options);
 }
 
-function liveModelKey(provider: string, id: string): string | null {
-  const normalizedProvider = normalizeProviderId(provider);
-  const normalizedId = normalizeLowercaseStringOrEmpty(id);
-  return normalizedProvider && normalizedId ? `${normalizedProvider}/${normalizedId}` : null;
-}
-
 export function resolveLiveProviderDiscoveryProviderIds(params: {
   providerFilter: ReadonlySet<string> | null;
   explicitRefs: readonly { provider: string; id: string }[];
@@ -358,10 +346,7 @@ export function resolveLiveProviderDiscoveryProviderIds(params: {
       providers.add(normalized);
     }
   }
-  for (const ref of params.explicitRefs) {
-    providers.add(ref.provider);
-  }
-  for (const ref of params.priorityRefs ?? []) {
+  for (const ref of [...params.explicitRefs, ...(params.priorityRefs ?? [])]) {
     providers.add(ref.provider);
   }
   return providers.size > 0
@@ -441,7 +426,7 @@ export async function appendLiveModelCandidates(params: {
   const refs = params.refs ?? listPrioritizedHighSignalLiveModelRefs();
   const seen = new Set<string>();
   for (const model of params.models) {
-    const key = liveModelKey(model.provider, model.id);
+    const key = canonicalLiveModelRef(model);
     if (key) {
       seen.add(key);
     }
@@ -451,7 +436,7 @@ export async function appendLiveModelCandidates(params: {
   const added: Model[] = [];
   let discoveryStores: Promise<LiveModelDiscoveryStores> | undefined;
   for (const ref of refs) {
-    const requestedKey = liveModelKey(ref.provider, ref.id);
+    const requestedKey = canonicalLiveModelRef(ref);
     if (!requestedKey || seen.has(requestedKey)) {
       continue;
     }
@@ -481,22 +466,14 @@ export async function appendLiveModelCandidates(params: {
         modelRegistry: params.modelRegistry,
         providerConfig,
       };
-      const prepared = await prepareDynamicModel({
+      const request = {
         provider: ref.provider,
         config: params.config,
         workspaceDir: params.workspaceDir,
         env: params.env,
         context,
-      });
-      const resolved =
-        prepared ??
-        (await resolveDynamicModel({
-          provider: ref.provider,
-          config: params.config,
-          workspaceDir: params.workspaceDir,
-          env: params.env,
-          context,
-        }));
+      };
+      const resolved = (await prepareDynamicModel(request)) ?? (await resolveDynamicModel(request));
       if (!resolved) {
         continue;
       }
@@ -510,7 +487,7 @@ export async function appendLiveModelCandidates(params: {
     if (!model) {
       continue;
     }
-    const resolvedKey = liveModelKey(model.provider, model.id);
+    const resolvedKey = canonicalLiveModelRef(model);
     // De-dupe against the resolved identity as well as the requested ref; hooks
     // may canonicalize provider ids or return aliases.
     if (!resolvedKey || seen.has(resolvedKey)) {

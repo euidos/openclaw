@@ -37,8 +37,7 @@ import {
 } from "../live-cache-test-support.js";
 import { shouldSkipLiveProviderDrift } from "../live-test-provider-drift.js";
 
-const OPENAI_TIMEOUT_MS = 120_000;
-const ANTHROPIC_TIMEOUT_MS = 120_000;
+const CACHE_TIMEOUT_MS = 120_000;
 const LIVE_CACHE_LANE_RETRIES = 1;
 const OPENAI_CACHE_REASONING = "none" as unknown as never;
 const OPENAI_PREFIX = buildStableCachePrefix("openai");
@@ -76,11 +75,7 @@ const MCP_TOOL: Tool = {
 };
 
 function makeUserTurn(content: Extract<Message, { role: "user" }>["content"]): Message {
-  return {
-    role: "user",
-    content,
-    timestamp: Date.now(),
-  };
+  return { role: "user", content, timestamp: Date.now() };
 }
 
 function makeImageUserTurn(text: string, pngBase64: string): Message {
@@ -136,7 +131,6 @@ async function runToolOnlyTurn(params: {
   systemPrompt: string;
   tool: Tool;
 }) {
-  const timeoutMs = params.providerTag === "openai" ? OPENAI_TIMEOUT_MS : ANTHROPIC_TIMEOUT_MS;
   const options = {
     apiKey: params.apiKey,
     cacheRetention: params.cacheRetention,
@@ -145,24 +139,8 @@ async function runToolOnlyTurn(params: {
     temperature: 0,
     ...(params.providerTag === "openai" ? { reasoning: OPENAI_CACHE_REASONING } : {}),
   };
-  let prompt = `Call the tool \`${params.tool.name}\` with {}. IMPORTANT: respond ONLY with the tool call and no other text.`;
-  let response = await completeSimpleWithLiveTimeout(
-    params.model,
-    {
-      systemPrompt: params.systemPrompt,
-      messages: [makeUserTurn(prompt)],
-      tools: [params.tool],
-    },
-    options,
-    `${params.providerTag} ${params.tool.name} tool-only turn`,
-    timeoutMs,
-  );
-
-  let toolCall = extractFirstToolCall(response);
-  let text = extractEmbeddedAssistantText(response);
-  for (let attempt = 0; attempt < 2 && (!toolCall || text.length > 0); attempt += 1) {
-    prompt = `Return only a tool call for \`${params.tool.name}\` with {}. No text.`;
-    response = await completeSimpleWithLiveTimeout(
+  const complete = (prompt: string, label: string) =>
+    completeSimpleWithLiveTimeout(
       params.model,
       {
         systemPrompt: params.systemPrompt,
@@ -170,9 +148,17 @@ async function runToolOnlyTurn(params: {
         tools: [params.tool],
       },
       options,
-      `${params.providerTag} ${params.tool.name} tool-only retry ${attempt + 1}`,
-      timeoutMs,
+      `${params.providerTag} ${params.tool.name} tool-only ${label}`,
+      CACHE_TIMEOUT_MS,
     );
+  let prompt = `Call the tool \`${params.tool.name}\` with {}. IMPORTANT: respond ONLY with the tool call and no other text.`;
+  let response = await complete(prompt, "turn");
+
+  let toolCall = extractFirstToolCall(response);
+  let text = extractEmbeddedAssistantText(response);
+  for (let attempt = 0; attempt < 2 && (!toolCall || text.length > 0); attempt += 1) {
+    prompt = `Return only a tool call for \`${params.tool.name}\` with {}. No text.`;
+    response = await complete(prompt, `retry ${attempt + 1}`);
     toolCall = extractFirstToolCall(response);
     text = extractEmbeddedAssistantText(response);
   }
@@ -184,11 +170,7 @@ async function runToolOnlyTurn(params: {
   );
   assert(toolCall.type === "toolCall", `expected toolCall block for ${params.tool.name}`);
 
-  return {
-    prompt,
-    response,
-    toolCall,
-  };
+  return { prompt, response, toolCall };
 }
 
 async function completeCacheProbe(params: {
@@ -203,7 +185,6 @@ async function completeCacheProbe(params: {
   tools?: Tool[];
   maxTokens?: number;
 }): Promise<CacheRun> {
-  const timeoutMs = params.providerTag === "openai" ? OPENAI_TIMEOUT_MS : ANTHROPIC_TIMEOUT_MS;
   for (let attempt = 1; attempt <= 1 + LIVE_CACHE_RESPONSE_RETRIES; attempt += 1) {
     const response = await completeSimpleWithLiveTimeout(
       params.model,
@@ -224,37 +205,24 @@ async function completeCacheProbe(params: {
         ...(params.providerTag === "openai" ? { reasoning: OPENAI_CACHE_REASONING } : {}),
       },
       `${params.providerTag} cache lane ${params.suffix}`,
-      timeoutMs,
+      CACHE_TIMEOUT_MS,
     );
     const text = extractEmbeddedAssistantText(response);
     const usage = normalizeCacheUsage(response.usage);
-    if (
-      shouldAcceptEmptyCacheProbe({
-        providerTag: params.providerTag,
-        text,
-        usage,
-      })
-    ) {
+    if (shouldAcceptEmptyCacheProbe({ providerTag: params.providerTag, text, usage })) {
       logLiveCache(
         `${params.providerTag} cache lane ${params.suffix} accepted empty text with usage ${formatUsage(usage)}`,
       );
-      return {
-        suffix: params.suffix,
-        text,
-        usage,
-        hitRate: computeCacheHitRate(usage),
-      };
-    }
-    if (shouldRetryCacheProbeText({ attempt, suffix: params.suffix, text })) {
+    } else if (shouldRetryCacheProbeText({ attempt, suffix: params.suffix, text })) {
       logLiveCache(
         `${params.providerTag} cache lane ${params.suffix} response mismatch; retrying: ${JSON.stringify(text)} stop=${response.stopReason} error=${response.errorMessage ?? ""} ${formatUsage(usage)}`,
       );
       continue;
-    }
-    const responseTextLower = normalizeLowercaseStringOrEmpty(text);
-    const suffixLower = normalizeLowercaseStringOrEmpty(params.suffix);
-    const markerLower = `cache-ok ${suffixLower}`;
-    if (!responseTextLower.includes(markerLower)) {
+    } else if (
+      !normalizeLowercaseStringOrEmpty(text).includes(
+        `cache-ok ${normalizeLowercaseStringOrEmpty(params.suffix)}`,
+      )
+    ) {
       throw new CacheProbeTextMismatchError(params.suffix, text);
     }
     return {
@@ -284,78 +252,54 @@ async function runRepeatedLane(params: {
       : ANTHROPIC_PREFIX;
   const systemPrompt = `${systemPromptBase}\nRun token: ${params.runToken}\nLane: ${params.providerTag}-${params.lane}\n`;
 
-  const run =
-    params.lane === "stable"
-      ? (suffix: string) =>
-          completeCacheProbe({
-            apiKey: params.fixture.apiKey,
-            cacheRetention: "short",
-            messages: [makeUserTurn(`Reply with exactly CACHE-OK ${suffix}.`)],
-            model: params.fixture.model,
-            providerTag: params.providerTag,
-            sessionId: params.sessionId,
-            suffix,
-            systemPrompt,
-            maxTokens: 32,
-          })
-      : params.lane === "image"
-        ? (suffix: string) =>
-            completeCacheProbe({
-              apiKey: params.fixture.apiKey,
-              cacheRetention: "short",
-              messages: [
-                makeImageUserTurn(
-                  "An image is attached. Ignore image semantics but keep the bytes in history.",
-                  params.pngBase64,
-                ),
-                buildAssistantHistoryTurn("IMAGE HISTORY ACKNOWLEDGED", params.fixture.model),
-                makeUserTurn("Keep the earlier image turn stable in context."),
-                buildAssistantHistoryTurn("IMAGE HISTORY PRESERVED", params.fixture.model),
-                makeUserTurn(`Reply with exactly CACHE-OK ${suffix}.`),
-              ],
-              model: params.fixture.model,
-              providerTag: params.providerTag,
-              sessionId: params.sessionId,
-              suffix,
-              systemPrompt,
-            })
-        : async (suffix: string) => {
-            const tool = params.lane === "mcp" ? MCP_TOOL : NOOP_TOOL;
-            const toolText = params.lane === "mcp" ? "FROM-BUNDLE" : "ok";
-            const historyPrefix = params.lane === "mcp" ? "MCP TOOL HISTORY" : "TOOL HISTORY";
-            const toolTurn = await runToolOnlyTurn({
-              apiKey: params.fixture.apiKey,
-              cacheRetention: "short",
-              model: params.fixture.model,
-              providerTag: params.providerTag,
-              sessionId: params.sessionId,
-              systemPrompt,
-              tool,
-            });
-            return await completeCacheProbe({
-              apiKey: params.fixture.apiKey,
-              cacheRetention: "short",
-              messages: [
-                makeUserTurn(toolTurn.prompt),
-                toolTurn.response,
-                makeToolResultMessage(toolTurn.toolCall.id, tool.name, toolText),
-                buildAssistantHistoryTurn(`${historyPrefix} ACKNOWLEDGED`, params.fixture.model),
-                makeUserTurn(
-                  params.lane === "mcp"
-                    ? "Keep the MCP tool output stable in history."
-                    : "Keep the tool output stable in history.",
-                ),
-                buildAssistantHistoryTurn(`${historyPrefix} PRESERVED`, params.fixture.model),
-                makeUserTurn(`Reply with exactly CACHE-OK ${suffix}.`),
-              ],
-              model: params.fixture.model,
-              providerTag: params.providerTag,
-              sessionId: params.sessionId,
-              suffix,
-              systemPrompt,
-              tools: [tool],
-            });
-          };
+  const common = {
+    apiKey: params.fixture.apiKey,
+    cacheRetention: "short" as const,
+    model: params.fixture.model,
+    providerTag: params.providerTag,
+    sessionId: params.sessionId,
+    systemPrompt,
+  };
+  const run = async (suffix: string) => {
+    const history: Message[] = [];
+    let tools: Tool[] | undefined;
+    if (params.lane === "image") {
+      history.push(
+        makeImageUserTurn(
+          "An image is attached. Ignore image semantics but keep the bytes in history.",
+          params.pngBase64,
+        ),
+        buildAssistantHistoryTurn("IMAGE HISTORY ACKNOWLEDGED", params.fixture.model),
+        makeUserTurn("Keep the earlier image turn stable in context."),
+        buildAssistantHistoryTurn("IMAGE HISTORY PRESERVED", params.fixture.model),
+      );
+    } else if (params.lane !== "stable") {
+      const tool = params.lane === "mcp" ? MCP_TOOL : NOOP_TOOL;
+      const toolText = params.lane === "mcp" ? "FROM-BUNDLE" : "ok";
+      const historyPrefix = params.lane === "mcp" ? "MCP TOOL HISTORY" : "TOOL HISTORY";
+      const toolTurn = await runToolOnlyTurn({ ...common, tool });
+      tools = [tool];
+      history.push(
+        makeUserTurn(toolTurn.prompt),
+        toolTurn.response,
+        makeToolResultMessage(toolTurn.toolCall.id, tool.name, toolText),
+        buildAssistantHistoryTurn(`${historyPrefix} ACKNOWLEDGED`, params.fixture.model),
+        makeUserTurn(
+          params.lane === "mcp"
+            ? "Keep the MCP tool output stable in history."
+            : "Keep the tool output stable in history.",
+        ),
+        buildAssistantHistoryTurn(`${historyPrefix} PRESERVED`, params.fixture.model),
+      );
+    }
+    return completeCacheProbe({
+      ...common,
+      suffix,
+      messages: [...history, makeUserTurn(`Reply with exactly CACHE-OK ${suffix}.`)],
+      ...(tools ? { tools } : {}),
+      ...(params.lane === "stable" ? { maxTokens: 32 } : {}),
+    });
+  };
 
   const warmup = await run(`${suffixBase}-warmup`);
   const hitA = await run(`${suffixBase}-hit-a`);
@@ -542,6 +486,30 @@ export async function runLiveCacheRegression(): Promise<LiveCacheRegressionResul
   if (!openaiSummary || !anthropicSummary) {
     throw new Error("Live cache summary providers were not initialized");
   }
+  const recordLane = (
+    provider: "openai" | "anthropic",
+    lane: CacheLane,
+    attempt?: Awaited<ReturnType<typeof runRepeatedLaneWithBaselineRetry>>,
+  ) => {
+    const target = provider === "openai" ? openaiSummary : anthropicSummary;
+    if (!attempt) {
+      target[lane] = { skipped: true };
+      return;
+    }
+    const { result, attempts, findings } = attempt;
+    for (const sample of ["warmup", "best"] as const) {
+      logLiveCache(
+        `${provider} ${lane} ${sample} ${formatUsage(result[sample]?.usage ?? {})} rate=${result[sample]?.hitRate.toFixed(3) ?? "0.000"}`,
+      );
+    }
+    target[lane] = {
+      best: result.best?.usage,
+      hitRate: result.best?.hitRate,
+      attempts,
+      warmup: result.warmup?.usage,
+    };
+    appendBaselineFindings({ regressions, warnings }, findings);
+  };
   const openai = await resolveLiveCacheProviderPool({
     config: {
       provider: "openai",
@@ -574,26 +542,13 @@ export async function runLiveCacheRegression(): Promise<LiveCacheRegressionResul
         runToken,
         pngBase64,
       });
-      const openaiResult = openaiAttempt.result;
-      logLiveCache(
-        `openai ${lane} warmup ${formatUsage(openaiResult.warmup?.usage ?? {})} rate=${openaiResult.warmup?.hitRate.toFixed(3) ?? "0.000"}`,
-      );
-      logLiveCache(
-        `openai ${lane} best ${formatUsage(openaiResult.best?.usage ?? {})} rate=${openaiResult.best?.hitRate.toFixed(3) ?? "0.000"}`,
-      );
-      openaiSummary[lane] = {
-        best: openaiResult.best?.usage,
-        hitRate: openaiResult.best?.hitRate,
-        attempts: openaiAttempt.attempts,
-        warmup: openaiResult.warmup?.usage,
-      };
-      appendBaselineFindings({ regressions, warnings }, openaiAttempt.findings);
+      recordLane("openai", lane, openaiAttempt);
     } else {
-      openaiSummary[lane] = { skipped: true };
+      recordLane("openai", lane);
     }
 
     if (!anthropic) {
-      anthropicSummary[lane] = { skipped: true };
+      recordLane("anthropic", lane);
       continue;
     }
     const { attempt: anthropicAttempt } = await runAnthropicCacheLane({
@@ -604,24 +559,7 @@ export async function runLiveCacheRegression(): Promise<LiveCacheRegressionResul
       pngBase64,
       warnings,
     });
-    if (!anthropicAttempt) {
-      anthropicSummary[lane] = { skipped: true };
-      continue;
-    }
-    const anthropicResult = anthropicAttempt.result;
-    logLiveCache(
-      `anthropic ${lane} warmup ${formatUsage(anthropicResult.warmup?.usage ?? {})} rate=${anthropicResult.warmup?.hitRate.toFixed(3) ?? "0.000"}`,
-    );
-    logLiveCache(
-      `anthropic ${lane} best ${formatUsage(anthropicResult.best?.usage ?? {})} rate=${anthropicResult.best?.hitRate.toFixed(3) ?? "0.000"}`,
-    );
-    anthropicSummary[lane] = {
-      best: anthropicResult.best?.usage,
-      hitRate: anthropicResult.best?.hitRate,
-      attempts: anthropicAttempt.attempts,
-      warmup: anthropicResult.warmup?.usage,
-    };
-    appendBaselineFindings({ regressions, warnings }, anthropicAttempt.findings);
+    recordLane("anthropic", lane, anthropicAttempt);
   }
 
   const disabled = anthropic

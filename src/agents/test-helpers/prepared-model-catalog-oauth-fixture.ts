@@ -30,14 +30,15 @@ import type {
 } from "../auth-profiles/types.js";
 import { createPreparedModelCatalogWorkerInput } from "../prepared-model-catalog-worker.js";
 import {
+  catalogInput,
   createCatalogFixture,
+  makeCatalogAgentFacts,
   PROVIDER_ID,
 } from "../prepared-model-catalog-worker.test-support.js";
 import type {
   PreparedModelCatalogWorkerTask,
   PreparedModelWorkerResult,
 } from "../prepared-model-catalog-worker.types.js";
-import { AuthStorage } from "../sessions/auth-storage.js";
 
 type HeldCatalogOAuthRefresh = {
   pending: Promise<PreparedModelWorkerResult>;
@@ -184,25 +185,7 @@ api.registerProvider({
           workspaceDir: fixture.workspaceDir,
         });
         const input = createPreparedModelCatalogWorkerInput({
-          agentFacts: {
-            input: {
-              agentId: "main",
-              agentDir: fixture.agentDir,
-              inheritedAuthDir: fixture.agentDir,
-              workspaceDir: fixture.workspaceDir,
-              config: fixture.config,
-              env: fixture.env,
-            },
-            env: fixture.env,
-            authStore,
-            credentials: {},
-            templateAuthStorage: AuthStorage.inMemory({}),
-            providerIds: [PROVIDER_ID],
-            configuredModelRefs: [],
-            configuredRuntimeModels: [],
-            runtimeCapabilityModels: [],
-            configuredGeneratedCatalogPluginIds: [],
-          },
+          agentFacts: makeCatalogAgentFacts(catalogInput(fixture), { authStore }),
           pluginMetadataSnapshot: metadata,
         });
         pool = new WorkerTaskPool({
