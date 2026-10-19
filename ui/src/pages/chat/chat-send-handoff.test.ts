@@ -11,7 +11,8 @@ import { findChatSendPayload, makeChatHost } from "./chat-host.test-support.ts";
 import { chatOutboxOwner } from "./chat-outbox-owner.ts";
 import { readQueuedMessageById } from "./chat-queue.ts";
 import { handleSendChat } from "./chat-send-submit.ts";
-import { admitInitialTurnHandoff, prepareInitialTurnHandoff } from "./initial-turn-handoff.ts";
+import { admitInitialTurnHandoff } from "./initial-turn-handoff-admission.ts";
+import { prepareInitialTurnHandoff } from "./initial-turn-handoff.ts";
 import { useChatSendBrowserFixture } from "./outbox-browser.test-support.ts";
 
 useChatSendBrowserFixture();
