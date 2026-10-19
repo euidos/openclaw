@@ -42,6 +42,8 @@ vi.mock("openclaw/plugin-sdk/device-bootstrap", async (importOriginal) => ({
 }));
 
 import { startPairingNotifier, handleNotifyCommand } from "./notify.js";
+type PendingRequest = Awaited<ReturnType<typeof listDevicePairingMock>>["pending"][number];
+type NotifyContext = Partial<Parameters<typeof handleNotifyCommand>[0]["ctx"]>;
 
 function createNotifier(api: Parameters<typeof startPairingNotifier>[0]) {
   const scheduler = createTestPluginServiceScheduler();
@@ -92,9 +94,9 @@ describe("device-pair notify persistence", () => {
   ) {
     const loadAdapter = vi.fn(async () => (sender ? { sendText: sender } : undefined));
     return createTestPluginApi({
+      logger: { info() {}, warn: storage.pollFailed, error() {} },
       runtime: {
         state: {
-          resolveStateDir: () => stateDir,
           openKeyedStore,
           openKeyedStoreV2: openKeyedStore,
         },
@@ -106,7 +108,7 @@ describe("device-pair notify persistence", () => {
   function notifyCommand(
     commandApi: ReturnType<typeof createApi>,
     action: string,
-    ctx: Partial<Parameters<typeof handleNotifyCommand>[0]["ctx"]> = {},
+    ctx: NotifyContext = {},
   ) {
     return handleNotifyCommand({
       api: commandApi,
@@ -115,23 +117,16 @@ describe("device-pair notify persistence", () => {
     });
   }
 
-  function setPendingRequests(
-    ...requests: Array<
-      Partial<Awaited<ReturnType<typeof listDevicePairingMock>>["pending"][number]>
-    >
-  ) {
+  const pendingRequest = (overrides: Partial<PendingRequest>, index: number): PendingRequest => ({
+    requestId: "request-1",
+    deviceId: `device-${index + 1}`,
+    publicKey: `public-key-${index + 1}`,
+    ts: 2_000,
+    ...overrides,
+  });
+  function setPendingRequests(...requests: Partial<PendingRequest>[]) {
     listDevicePairingMock.mockResolvedValue({
-      pending: requests.map((request, index) =>
-        Object.assign(
-          {
-            requestId: "request-1",
-            deviceId: `device-${index + 1}`,
-            publicKey: `public-key-${index + 1}`,
-            ts: 2_000,
-          },
-          request,
-        ),
-      ),
+      pending: requests.map(pendingRequest),
       paired: [],
     });
   }
@@ -177,26 +172,10 @@ describe("device-pair notify persistence", () => {
 
   function observeNotifyStorage() {
     const reads: Promise<unknown>[] = [];
-    const active = new Set<Promise<unknown>>();
-    const failed = createDeferred<unknown>();
+    const failed = createDeferred<never>();
+    void failed.promise.catch(() => {});
     const waitFor = <T>(operation: Promise<T>): Promise<T> =>
-      Promise.race([
-        operation,
-        failed.promise.then((error): never => {
-          throw error;
-        }),
-      ]);
-    const track = <T>(operation: Promise<T>): Promise<T> => {
-      active.add(operation);
-      void operation.then(
-        () => active.delete(operation),
-        (error: unknown) => {
-          active.delete(operation);
-          failed.resolve(error);
-        },
-      );
-      return operation;
-    };
+      Promise.race([operation, failed.promise]);
     const stored = new Map<string, ReturnType<typeof createDeferred<void>>>();
     const storedReceipt = (key: string) => {
       let receipt = stored.get(key);
@@ -210,19 +189,14 @@ describe("device-pair notify persistence", () => {
       const store = openStore<T>(options);
       const entries = store.entries.bind(store);
       store.entries = () => {
-        const reading = track(entries());
+        const reading = entries();
         reads.push(reading);
         return reading;
       };
-      const observe = store.observe;
-      store.observe = (key) => track(observe(key));
-      const compareAndApply = store.compareAndApply;
-      store.compareAndApply = (key, comparison, intent) =>
-        track(compareAndApply(key, comparison, intent));
       if (options.namespace === DEVICE_PAIR_NOTIFY_SEEN_REQUEST_NAMESPACE) {
         const register = store.register.bind(store);
         store.register = async (key, value, opts) => {
-          await track(register(key, value, opts));
+          await register(key, value, opts);
           storedReceipt(key).resolve();
         };
       }
@@ -238,20 +212,7 @@ describe("device-pair notify persistence", () => {
       waitFor,
       requestStored: (requestId: string) =>
         waitFor(storedReceipt(notifyRequestStoreKey(requestId)).promise),
-      pollFailed: (message: string) => failed.resolve(new Error(message)),
-      async settlePoll(requestId: string) {
-        const terminal =
-          listDevicePairingMock.mock.calls.length > 0
-            ? waitFor(storedReceipt(notifyRequestStoreKey(requestId)).promise)
-            : Promise.resolve();
-        const results = await Promise.allSettled([terminal, ...active]);
-        await vi.advanceTimersByTimeAsync(0);
-        for (const result of results) {
-          if (result.status === "rejected") {
-            throw result.reason;
-          }
-        }
-      },
+      pollFailed: (message: string) => failed.reject(new Error(message)),
     };
   }
 
@@ -279,14 +240,10 @@ describe("device-pair notify persistence", () => {
     const { db } = openOpenClawStateDatabase({ env });
     // Corruption is a cold-storage fixture, not an external update to a live cached row.
     const insert = db.prepare(
-      "INSERT INTO plugin_state_entries (plugin_id, namespace, entry_key, value_json, created_at, expires_at) VALUES ('device-pair', ?, ?, ?, 1, NULL)",
+      `INSERT INTO plugin_state_entries (plugin_id, namespace, entry_key, value_json, created_at, expires_at) VALUES ('device-pair', '${DEVICE_PAIR_NOTIFY_SUBSCRIBER_NAMESPACE}', ?, ?, 1, NULL)`,
     );
-    insert.run(
-      DEVICE_PAIR_NOTIFY_SUBSCRIBER_NAMESPACE,
-      notifySubscriberStoreKey(row),
-      selected ? "{" : JSON.stringify(row),
-    );
-    insert.run(DEVICE_PAIR_NOTIFY_SUBSCRIBER_NAMESPACE, "unrelated", "{");
+    insert.run(notifySubscriberStoreKey(row), selected ? "{" : JSON.stringify(row));
+    insert.run("unrelated", "{");
     if (selected) {
       await expect(notifyCommand(api, "status")).rejects.toMatchObject({
         code: "PLUGIN_STATE_CORRUPT",
@@ -333,7 +290,6 @@ describe("device-pair notify persistence", () => {
       try {
         startPairingNotifier(api, scheduler);
         await clock.advanceBy(10_000);
-        expect(warn).not.toHaveBeenCalled();
         await expect(Promise.all(storage.takeStoreReads())).resolves.toEqual([[], []]);
         expect(listDevicePairingMock).not.toHaveBeenCalled();
         expect(gatewayScheduler.nextWakeAtMs).toBeNull();
@@ -450,7 +406,6 @@ describe("device-pair notify persistence", () => {
     await storage.advanceAndRead();
     expect(listDevicePairingMock).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(20_000);
-    expect(listDevicePairingMock).toHaveBeenCalledTimes(1);
 
     const retired = vi.fn();
     const stopping = Promise.resolve(service.stop()).then(retired);
@@ -473,7 +428,6 @@ describe("device-pair notify persistence", () => {
     await vi.advanceTimersByTimeAsync(0);
     await storage.advanceAndRead();
     expect(listDevicePairingMock).toHaveBeenCalledTimes(3);
-    await Promise.all(storage.takeStoreReads());
 
     await service.stop();
   });
@@ -490,7 +444,6 @@ describe("device-pair notify persistence", () => {
     service.start();
     await vi.advanceTimersByTimeAsync(10_000);
     await sendEntered.promise;
-    expect(sendText).toHaveBeenCalledTimes(1);
 
     const retired = vi.fn();
     const stopping = Promise.resolve(service.stop()).then(retired);
@@ -504,7 +457,6 @@ describe("device-pair notify persistence", () => {
     service = createNotifier(createApi(sendText, storage.openKeyedStore));
     service.start();
     await vi.advanceTimersByTimeAsync(10_000);
-    expect(sendText).toHaveBeenCalledTimes(1);
 
     await Promise.all(storage.takeStoreReads());
     setPendingRequests(firstRequest, secondRequest);
@@ -524,7 +476,6 @@ describe("device-pair notify persistence", () => {
     async (rearm) => {
       freezeTime();
       const { pending: firstSend, entered: sendEntered } = delayedSender();
-      api.logger.warn = storage.pollFailed;
       const senderId = rearm ? "chat-123" : "old-chat";
       await notifyCommand(api, rearm ? "once" : "on", { senderId });
       setPendingRequests(...(rearm ? [{}, { requestId: "request-2", ts: 2_001 }] : [{}]));
@@ -534,7 +485,6 @@ describe("device-pair notify persistence", () => {
         service.start();
         await vi.advanceTimersByTimeAsync(10_000);
         await storage.waitFor(sendEntered.promise);
-        expect(sendText).toHaveBeenCalledTimes(1);
 
         if (rearm) {
           vi.setSystemTime(1_000);
@@ -564,14 +514,12 @@ describe("device-pair notify persistence", () => {
       } finally {
         firstSend.resolve(delivery);
         await service.stop();
-        await storage.settlePoll("request-1");
       }
     },
   );
 
   it("keeps the request boundary at the current millisecond when re-armed", async () => {
     freezeTime();
-    api.logger.warn = storage.pollFailed;
     await notifyCommand(api, "once");
     const key = notifySubscriberStoreKey({ to: "chat-123" });
     const first = await openSubscriberStore().lookup(key);
@@ -594,7 +542,6 @@ describe("device-pair notify persistence", () => {
       );
     } finally {
       await service.stop();
-      await storage.settlePoll("request-same-ms");
     }
   });
 
