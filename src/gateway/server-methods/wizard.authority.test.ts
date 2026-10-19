@@ -1,5 +1,6 @@
 import { expectDefined } from "@openclaw/normalization-core/expect";
 import { afterEach, expect, it, vi } from "vitest";
+import type { WizardStartResult } from "../../../packages/gateway-protocol/src/schema/wizard.js";
 import * as embeddedAgent from "../../agents/embedded-agent.js";
 import {
   getPluginRuntimeGatewayRequestScope,
@@ -37,7 +38,7 @@ it.each([
   { revoked: false, progress: true },
   { revoked: true, progress: true },
 ])(
-  "runs the post-start setup-inference probe under wizard.next authority (revoked=$revoked, progress=$progress)",
+  "wizard.next probe authority (revoked=$revoked, progress=$progress)",
   async ({ revoked, progress }) => {
     await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
       const client = createOperatorClient({
@@ -47,30 +48,24 @@ it.each([
       const context = Object.assign(createContext(), createWizardSessionTracker());
       const connection = new AbortController();
       const continueProbe = createDeferredCore();
-      let captureError: unknown;
       let probe: Awaited<ReturnType<typeof runSetupInferenceTurn>> | undefined;
-      vi.spyOn(embeddedAgent, "runEmbeddedAgent").mockImplementation(async () => {
+      const run = vi.spyOn(embeddedAgent, "runEmbeddedAgent").mockImplementation(async () => {
         if (revoked) {
           invalidateGatewayDeviceRevocation(context, "wizard-device", "operator");
         }
         const scope = expectDefined(getPluginRuntimeGatewayRequestScope(), "probe scope");
+        const captured = expectDefined(
+          await captureGatewayOperatorRunAuthority({
+            ...scope,
+            context,
+            client: scope.client ?? null,
+          }),
+          "probe operator authority",
+        );
         try {
-          const captured = expectDefined(
-            await captureGatewayOperatorRunAuthority({
-              client: scope.client ?? null,
-              context,
-              hasCurrentClientAuthority: scope.hasCurrentClientAuthority,
-            }),
-            "probe operator authority",
-          );
-          try {
-            captured.authority.assertCurrent();
-          } finally {
-            captured.release();
-          }
-        } catch (error) {
-          captureError = error;
-          throw error;
+          captured.authority.assertCurrent();
+        } finally {
+          captured.release();
         }
         return {
           payloads: [{ text: "OK" }],
@@ -134,12 +129,7 @@ it.each([
           );
           expect(respond).toHaveBeenCalledOnce();
           expect(respond.mock.calls[0]?.[0]).toBe(true);
-          return respond.mock.calls[0]?.[1] as {
-            sessionId: string;
-            step: { id: string };
-            status: string;
-            error?: string;
-          };
+          return respond.mock.calls[0]?.[1] as WizardStartResult;
         } finally {
           authority.release();
         }
@@ -151,7 +141,7 @@ it.each([
       try {
         let result = await request("wizard.next", {
           sessionId: start.sessionId,
-          answer: { stepId: start.step.id, value: true },
+          answer: { stepId: expectDefined(start.step, "initial step").id, value: true },
         });
         if (progress) {
           expect(result).toMatchObject({ status: "running", step: { type: "progress" } });
@@ -160,13 +150,12 @@ it.each([
         }
         if (revoked) {
           expect(result.status).toBe("error");
-          expect(captureError).toMatchObject({
+          await expect(run.mock.results[0]?.value).rejects.toMatchObject({
             message: "Gateway caller authority is no longer active.",
           });
           expect(probe).toMatchObject({ ok: false });
         } else {
-          expect(result.error).toBeUndefined();
-          expect(result).toMatchObject({ status: "done" });
+          expect([result.status, result.error]).toEqual(["done", undefined]);
           expect(probe).toMatchObject({ ok: true, text: "OK" });
         }
       } finally {
