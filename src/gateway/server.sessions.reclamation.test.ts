@@ -55,38 +55,30 @@ function seedTranscriptState(storePath: string): void {
   // unrelated background index rebuild during the deletion measurement.
   const insertActive = database.db.prepare(
     `INSERT INTO session_transcript_active_events
-       (session_id, active_position, event_seq, message_position, context_eligible)
-     VALUES (?, ?, ?, ?, 1)`,
+     (session_id, active_position, event_seq, message_position, context_eligible) VALUES (?, ?, ?, ?, 1)`,
   );
   const ftsFields = { text: "phase3 e2e transcript message", role: "user", timestamp: now };
   const insertIndex = database.db.prepare(
-    `INSERT INTO session_transcript_index_state (
-       session_id, indexed_seq, needs_rebuild, active_event_count,
-       active_message_count, updated_at
-     ) VALUES (?, ?, 0, ?, ?, ?)`,
+    `INSERT INTO session_transcript_index_state
+     (session_id, indexed_seq, needs_rebuild, active_event_count, active_message_count, updated_at)
+     VALUES (?, ?, 0, ?, ?, ?)`,
   );
   const insertWatermark = database.db.prepare(
-    `INSERT INTO transcript_rewrite_watermarks (session_id, generation, updated_at)
-     VALUES (?, ?, ?)`,
+    `INSERT INTO transcript_rewrite_watermarks (session_id, generation, updated_at) VALUES (?, ?, ?)`,
   );
   // sqlite-allow-raw -- bulk fixture setup stays outside the measured delete path.
   database.db.exec("BEGIN IMMEDIATE");
   try {
     database.db
       .prepare(
-        `INSERT INTO session_windows (
-           session_id, session_key, reason, session_scope, created_at, updated_at
-         )
+        `INSERT INTO session_windows (session_id, session_key, reason, session_scope, created_at, updated_at)
          SELECT ?, session_key, 'initial', session_scope, ?, ?
-         FROM session_windows
-         WHERE session_id = ?`,
+         FROM session_windows WHERE session_id = ?`,
       )
       .run(HISTORICAL_SESSION_ID, now - 1, now - 1, SESSION_ID);
     database.db
       .prepare(
-        `UPDATE session_windows
-         SET previous_session_id = ?, reason = 'reset'
-         WHERE session_id = ?`,
+        "UPDATE session_windows SET previous_session_id = ?, reason = 'reset' WHERE session_id = ?",
       )
       .run(HISTORICAL_SESSION_ID, SESSION_ID);
     for (const [sessionId, rows, generation] of [
@@ -96,16 +88,8 @@ function seedTranscriptState(storePath: string): void {
     ] as const) {
       const insertEvent = createTranscriptEventInserter(database.db, sessionId);
       const insertFts = createSessionTranscriptFtsInserter(database.db, sessionId);
-      const event =
-        sessionId === UNRELATED_SESSION_ID
-          ? JSON.stringify({
-              type: "message",
-              id: `${UNRELATED_SESSION_ID}-message-0`,
-              message: { content: "unrelated transcript message", role: "assistant" },
-            })
-          : eventJson;
       for (let index = 0; index < rows; index += 1) {
-        insertEvent({ seq: index, eventJson: event, createdAt: now + index });
+        insertEvent({ seq: index, eventJson, createdAt: now + index });
         insertActive.run(sessionId, index, index, index);
       }
       insertFts(
@@ -155,12 +139,12 @@ test("sessions.delete reclaims a large session off the Gateway thread", async ()
   };
   diagnostics.subscribe(recordReclamation);
   // Allow slow hosts; worker facts below independently prove off-thread execution.
-  const deleted = await rpcReq<{
-    archived: string[];
-    deleted: boolean;
-    key: string;
-    ok: true;
-  }>(ws, "sessions.delete", { key: SESSION_KEY }, 60_000).finally(() => {
+  const deleted = await rpcReq<{ archived: string[] }>(
+    ws,
+    "sessions.delete",
+    { key: SESSION_KEY },
+    60_000,
+  ).finally(() => {
     diagnostics.unsubscribe(recordReclamation);
     ws.close();
   });
@@ -173,19 +157,16 @@ test("sessions.delete reclaims a large session off the Gateway thread", async ()
        WHERE session_id IN (?, ?)
        ORDER BY session_id`,
     )
-    .all(SESSION_ID, HISTORICAL_SESSION_ID) as Array<{
-    archive_bytes: number | bigint;
-    archive_sha256: string;
-    published_at: number | null;
-    session_id: string;
-  }>;
+    .all(SESSION_ID, HISTORICAL_SESSION_ID);
 
-  expect(deleted.ok).toBe(true);
-  expect(deleted.payload).toMatchObject({
-    archived: [expect.any(String), expect.any(String)],
-    deleted: true,
-    key: CANONICAL_SESSION_KEY,
+  expect(deleted).toMatchObject({
     ok: true,
+    payload: {
+      archived: [expect.any(String), expect.any(String)],
+      deleted: true,
+      key: CANONICAL_SESSION_KEY,
+      ok: true,
+    },
   });
   expect(deleted.payload?.archived.every((archivePath) => fs.existsSync(archivePath))).toBe(true);
   for (const [sessionId, expected] of [
@@ -210,27 +191,27 @@ test("sessions.delete reclaims a large session off the Gateway thread", async ()
       );
     }
   }
-  expect(archives).toHaveLength(2);
-  for (const [index, archive] of archives.entries()) {
-    expect(archive).toEqual({
+  expect(archives).toEqual(
+    [SESSION_ID, HISTORICAL_SESSION_ID].map((session_id) => ({
       archive_bytes: expect.any(Number),
       archive_sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
       published_at: expect.any(Number),
-      session_id: index === 0 ? SESSION_ID : HISTORICAL_SESSION_ID,
-    });
+      session_id,
+    })),
+  );
+  for (const archive of archives) {
     expect(Number(archive.archive_bytes)).toBeGreaterThan(0);
   }
-  expect(reclamations.map((record) => record.reclamationKind)).toEqual([
-    "historical-generation",
-    "entry",
-  ]);
-  for (const record of reclamations) {
-    expect(record).toMatchObject({
+  expect(reclamations).toMatchObject(
+    ["historical-generation", "entry"].map((reclamationKind) => ({
+      reclamationKind,
       operation: "session.reclamation.worker-commit",
       outcome: "ok",
       threadId,
       writer: "worker",
-    });
+    })),
+  );
+  for (const record of reclamations) {
     expect(record.workerThreadId).toBeGreaterThan(0);
     expect(record.workerThreadId).not.toBe(threadId);
   }
