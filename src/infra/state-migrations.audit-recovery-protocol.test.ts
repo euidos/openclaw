@@ -14,6 +14,7 @@ import { storageProcessTestEntrypoints } from "./storage-process-runtime.test-su
 
 const sourceRaw = Buffer.from("legacy audit row\n");
 const scrubPattern = Buffer.from(" \t".repeat(16));
+const scrubbed = Buffer.alloc(sourceRaw.length, scrubPattern);
 const refused = {
   restored: false,
   warnings: [expect.stringContaining("no longer matches its restore journal target")],
@@ -39,10 +40,7 @@ describe("legacy audit recovery identity persistence", () => {
       const cases: {
         directory: string;
         file: string;
-        restorePath: string;
-        progressPath: string;
         journal: string;
-        scrubbed: Buffer;
         replaced: boolean;
         observedIno?: string;
         upgrade?: boolean;
@@ -97,13 +95,12 @@ describe("legacy audit recovery identity persistence", () => {
           }),
           { mode: 0o600 },
         );
-        const scrubbed = Buffer.alloc(sourceRaw.length, scrubPattern);
         await fs.writeFile(file, scrubbed);
         if (replaced) {
           await fs.rename(file, `${file}.original`);
           await fs.writeFile(file, scrubbed, { mode: 0o600 });
         }
-        cases.push({ directory, file, restorePath, progressPath, journal, scrubbed, ...scenario });
+        cases.push({ directory, file, journal, ...scenario });
       }
       // Bun on Windows releases retained SQLite resources when the owning process exits.
       const result = await fixture.track(
@@ -133,15 +130,9 @@ describe("legacy audit recovery identity persistence", () => {
         upgraded("-1"),
         refused,
       ]);
-      for (const {
-        file,
-        restorePath,
-        progressPath,
-        journal,
-        scrubbed,
-        replaced,
-        upgrade,
-      } of cases) {
+      for (const { file, journal, replaced, upgrade } of cases) {
+        const restorePath = `${file}.doctor-scrub-restore`;
+        const progressPath = `${file}.doctor-scrub-progress`;
         if (replaced) {
           expect(await fs.readFile(file)).toEqual(scrubbed);
           expect(await fs.readFile(restorePath, "utf8")).toBe(journal);
@@ -190,20 +181,15 @@ describe("legacy audit recovery identity persistence", () => {
   it("projects high-bit observations as released unsigned stats without changing retained numbers", () => {
     const observed = { dev: "-9223372036854775808", ino: "-1" };
     const legacy = { dev: 9_223_372_036_854_775_808, ino: 18_446_744_073_709_552_000 };
-    expect(legacyAuditFileIdentitiesMatch(legacy, observed)).toBe(true);
-    expect(legacyAuditFileIdentitiesMatch(observed, legacy)).toBe(true);
-    expect(legacyAuditFileIdentitiesMatch(observed, { ...observed, ino: "-2" })).toBe(false);
-    expect(legacyAuditFileIdentitiesMatch({ dev: 1, ino: -1 }, { dev: "1", ino: "-1" })).toBe(
-      false,
-    );
-    expect(legacyAuditFileIdentitiesMatch({ dev: 1, ino: -1 }, { dev: 1, ino: legacy.ino })).toBe(
-      false,
-    );
-    expect(
-      legacyAuditFileIdentitiesMatch(
-        { dev: 1, ino: legacy.ino },
-        { dev: "1", ino: "18446744073709552000" },
-      ),
-    ).toBe(true);
+    for (const [left, right, matches] of [
+      [legacy, observed, true],
+      [observed, legacy, true],
+      [observed, { ...observed, ino: "-2" }, false],
+      [{ dev: 1, ino: -1 }, { dev: "1", ino: "-1" }, false],
+      [{ dev: 1, ino: -1 }, { dev: 1, ino: legacy.ino }, false],
+      [{ dev: 1, ino: legacy.ino }, { dev: "1", ino: "18446744073709552000" }, true],
+    ] as const) {
+      expect(legacyAuditFileIdentitiesMatch(left, right)).toBe(matches);
+    }
   });
 });

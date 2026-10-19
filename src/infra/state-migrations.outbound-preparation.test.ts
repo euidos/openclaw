@@ -25,6 +25,7 @@ import { createUnmodifiedPreparedOutboundBatch } from "./outbound/prepared-batch
 import { autoMigrateLegacyState } from "./state-migrations.doctor.js";
 
 const temporary = useAutoCleanupTempDirTracker(afterEach);
+const pluginId = "doctor-outbound-fixture";
 let stateDir: string;
 let pluginFile: string;
 let eventsFile: string;
@@ -78,18 +79,14 @@ beforeEach(async () => {
   await fs.mkdir(stateDir, { recursive: true });
   await fs.writeFile(
     path.join(pluginDir, "openclaw.plugin.json"),
-    JSON.stringify({
-      id: "doctor-outbound-fixture",
-      channels: ["matrix"],
-      configSchema: { type: "object" },
-    }),
+    JSON.stringify({ id: pluginId, channels: ["matrix"], configSchema: { type: "object" } }),
   );
   await writePluginFixture();
   cfg = {
     plugins: {
-      allow: ["doctor-outbound-fixture"],
+      allow: [pluginId],
       load: { paths: [pluginFile] },
-      entries: { "doctor-outbound-fixture": { enabled: true } },
+      entries: { [pluginId]: { enabled: true } },
       slots: { memory: "none" },
     },
     channels: { matrix: { enabled: true } },
@@ -142,12 +139,17 @@ function seed(queueName: string, entry: QueuedDelivery | LegacyQueuedDelivery) {
 const load = (queue: string, id: string) => loadDeliveryQueueEntry(queue, id, stateDir);
 const deliveryReceipt = (result: Awaited<ReturnType<typeof repair>>) =>
   result.stepReceipts.find((receipt) => receipt.id === "delivery-queues");
+const expectEvents = async () =>
+  expect(await fs.readFile(eventsFile, "utf8")).toBe("reply\nmessage\ndispose\n");
 
 describe("Doctor outbound preparation", () => {
-  it.each(["sqlite", "claimed"] as const)(
-    "prepares %s custody with real plugin modifiers once without publishing a registry",
+  it.each(["sqlite", "claimed", "disposal-failure"] as const)(
+    "handles %s preparation with real plugin modifiers",
     async (kind) => {
-      seed(kind === "sqlite" ? "outbound" : "outbound-legacy-preparing-v1", {
+      if (kind === "disposal-failure") {
+        await writePluginFixture({ failDisposal: true });
+      }
+      seed(kind === "claimed" ? "outbound-legacy-preparing-v1" : "outbound", {
         ...legacy("from-sqlite"),
         ...(kind === "claimed" ? { legacyPreparationState: "claimed" } : {}),
       });
@@ -159,54 +161,49 @@ describe("Doctor outbound preparation", () => {
       const active = getActivePluginRegistry();
       expect(getGlobalHookRunner()).toBeNull();
       const result = await repair();
+      await expectEvents();
+      if (kind === "disposal-failure") {
+        expect(deliveryReceipt(result)).toMatchObject({
+          outcome: "refused",
+          refusal: { code: "step-threw" },
+        });
+        return;
+      }
       expect(result.warnings).toEqual([]);
       expect(deliveryReceipt(result)).toMatchObject({ outcome: "completed" });
       expect(load("outbound-prepared-v1", "from-sqlite")).toMatchObject({
         preparedBatch: { entries: [{ payload: { text: "original|reply|message" } }] },
       });
-      expect(await fs.readFile(eventsFile, "utf8")).toBe("reply\nmessage\ndispose\n");
       expect(getActivePluginRegistry()).toBe(active);
       expect(getGlobalHookRunner()).toBeNull();
       await repair();
-      expect(await fs.readFile(eventsFile, "utf8")).toBe("reply\nmessage\ndispose\n");
+      await expectEvents();
     },
   );
 
-  it("records a refused delivery migration when its resource disposer fails", async () => {
-    await writePluginFixture({ failDisposal: true });
-    seed("outbound", legacy("disposal-failure"));
-
-    const result = await repair();
-
-    expect(deliveryReceipt(result)).toMatchObject({
-      outcome: "refused",
-      refusal: { code: "step-threw" },
-    });
-    expect(await fs.readFile(eventsFile, "utf8")).toBe("reply\nmessage\ndispose\n");
-  });
-
-  it("preserves an unclaimed SQLite legacy row when its plugin cannot load", async () => {
-    const entry = legacy("sqlite-only");
-    seed("outbound", entry);
-    await fs.writeFile(pluginFile, 'throw new Error("synthetic plugin unavailable");');
-    const result = await repair();
-    expect(result.warnings.join("\n")).toContain("synthetic plugin unavailable");
-    expect(load("outbound", entry.id)).toEqual(entry);
-    expect(load("outbound-legacy-preparing-v1", entry.id)).toBeNull();
-  });
-
-  it("finishes prepared checkpoints without loading an unavailable plugin", async () => {
-    const entry: QueuedDelivery = {
-      ...baseEntry("checkpoint"),
-      preparedBatch: createUnmodifiedPreparedOutboundBatch([{ text: "already prepared" }]),
-    };
-    seed("outbound-prepared-migration-v1", entry);
-    await fs.writeFile(pluginFile, 'throw new Error("synthetic plugin unavailable");');
-    const result = await repair();
-    expect(result.warnings).toEqual([]);
-    expect(load("outbound-prepared-v1", "checkpoint")).toMatchObject({
-      preparedBatch: { entries: [{ payload: { text: "already prepared" } }] },
-    });
-    await expect(fs.stat(eventsFile)).rejects.toMatchObject({ code: "ENOENT" });
-  });
+  it.each([false, true])(
+    "handles an unavailable plugin (already prepared: %s)",
+    async (prepared) => {
+      const entry = prepared
+        ? {
+            ...baseEntry("checkpoint"),
+            preparedBatch: createUnmodifiedPreparedOutboundBatch([{ text: "already prepared" }]),
+          }
+        : legacy("sqlite-only");
+      seed(prepared ? "outbound-prepared-migration-v1" : "outbound", entry);
+      await fs.writeFile(pluginFile, 'throw new Error("synthetic plugin unavailable");');
+      const result = await repair();
+      if (prepared) {
+        expect(result.warnings).toEqual([]);
+        expect(load("outbound-prepared-v1", entry.id)).toMatchObject({
+          preparedBatch: { entries: [{ payload: { text: "already prepared" } }] },
+        });
+        await expect(fs.stat(eventsFile)).rejects.toMatchObject({ code: "ENOENT" });
+      } else {
+        expect(result.warnings.join("\n")).toContain("synthetic plugin unavailable");
+        expect(load("outbound", entry.id)).toEqual(entry);
+        expect(load("outbound-legacy-preparing-v1", entry.id)).toBeNull();
+      }
+    },
+  );
 });

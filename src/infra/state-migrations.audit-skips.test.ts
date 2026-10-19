@@ -49,24 +49,35 @@ const seedApprovals = (state: OpenClawTestState) =>
     defaults: { security: "allowlist", ask: "on-miss" },
     agents: {},
   });
+const receipt = (result: Awaited<ReturnType<typeof autoMigrateLegacyState>>, id: string) =>
+  result.stepReceipts.find((entry) => entry.id === id);
+async function expectContinued(
+  result: Awaited<ReturnType<typeof autoMigrateLegacyState>>,
+  file: string,
+) {
+  expect(() => throwIfDoctorStateMigrationRefused(result.stepReceipts)).not.toThrow();
+  expect(receipt(result, "exec-approvals")).toMatchObject({ outcome: "completed" });
+  await expect(fs.access(file)).rejects.toMatchObject({ code: "ENOENT" });
+}
 
 describe("Doctor legacy audit skips", () => {
   it.each([
     ["checkpointless whitespace", "checkpointless raw archive begins with ambiguous whitespace"],
     ["checkpoint capacity", "durable raw-archive checkpoint capacity is exhausted"],
     ["hard links unavailable", "filesystem rejects native no-replace rename and hard links"],
-  ])("continues later repairs after %s and preserves recovery inputs", async (shape, warning) => {
-    await withDoctorAudit(async (state, audit, migrate) => {
+  ])("continues later repairs after %s and preserves recovery inputs", (shape, warning) =>
+    withDoctorAudit(async (state, audit, migrate) => {
+      const { source, raw, sanitized } = audit.config;
       const record = configAuditRecord("***");
-      let preservedPath = audit.config.raw;
+      let preservedPath = raw;
       if (shape === "checkpointless whitespace") {
         await audit.seedRawArchive(audit.config, buildAuditScrubbedContent(512));
         await audit.writeJsonLines(
-          audit.config.sanitized,
+          sanitized,
           Array.from({ length: 45 }, () => record),
         );
       } else if (shape === "checkpoint capacity") {
-        await audit.writeJsonLines(audit.config.source, [record]);
+        await audit.writeJsonLines(source, [record]);
         expect((await audit.migrate()).warnings).toEqual([]);
         const store = openLegacyAuditRawCheckpointStore(state.stateDir);
         const checkpoint = store.entries()[0]!;
@@ -77,40 +88,36 @@ describe("Doctor legacy audit skips", () => {
             value: { ...checkpoint.value, generationKey: `retained-generation-${index}` },
           })),
         );
-        await audit.writeJsonLines(audit.config.source, [record]);
-        preservedPath = audit.config.source;
+        await audit.writeJsonLines(source, [record]);
+        preservedPath = source;
       } else {
-        await audit.writeJsonLines(audit.config.source, [record]);
-        preservedPath = audit.config.source;
-        failAuditMove(audit, audit.config.source);
+        await audit.writeJsonLines(source, [record]);
+        preservedPath = source;
+        failAuditMove(audit, source);
       }
       const sourceBytes = await fs.readFile(preservedPath);
       const sanitizedBytes =
-        shape === "hard links unavailable" ? undefined : await fs.readFile(audit.config.sanitized);
+        shape === "hard links unavailable" ? undefined : await fs.readFile(sanitized);
       const execPath = await seedApprovals(state);
 
       const result = await migrate();
 
-      expect(result.stepReceipts.find((receipt) => receipt.id === "audit-logs")).toMatchObject({
+      expect(receipt(result, "audit-logs")).toMatchObject({
         outcome: "skipped",
         changes: [],
         warnings: [expect.stringContaining(warning)],
       });
-      expect(() => throwIfDoctorStateMigrationRefused(result.stepReceipts)).not.toThrow();
       const warnings = result.warnings.join("\n");
       expect(warnings).toContain(warning);
       if (shape === "hard links unavailable") {
-        expect(warnings).toContain(audit.config.source);
+        expect(warnings).toContain(source);
         expect(warnings).toContain("OPENCLAW_STATE_DIR=");
         expect(warnings).toContain(state.stateDir);
         expect(warnings).toContain("openclaw doctor --fix");
       } else {
         expect(warnings).toContain("https://docs.openclaw.ai/cli/update/repair-and-recovery");
       }
-      expect(result.stepReceipts.find((receipt) => receipt.id === "exec-approvals")).toMatchObject({
-        outcome: "completed",
-      });
-      await expect(fs.access(execPath)).rejects.toMatchObject({ code: "ENOENT" });
+      await expectContinued(result, execPath);
       expect(
         openOpenClawStateDatabase({ env: state.env })
           .db.prepare(
@@ -119,19 +126,17 @@ describe("Doctor legacy audit skips", () => {
           .get()?.default_security,
       ).toBe("allowlist");
       const repeated = await migrate();
-      expect(repeated.stepReceipts.find((receipt) => receipt.id === "audit-logs")?.outcome).toBe(
-        "skipped",
-      );
+      expect(receipt(repeated, "audit-logs")?.outcome).toBe("skipped");
       expect(repeated.warnings.join("\n")).toContain(warning);
       expect(() => throwIfDoctorStateMigrationRefused(repeated.stepReceipts)).not.toThrow();
       await expect(fs.readFile(preservedPath)).resolves.toEqual(sourceBytes);
       if (sanitizedBytes) {
-        await expect(fs.readFile(audit.config.sanitized)).resolves.toEqual(sanitizedBytes);
+        await expect(fs.readFile(sanitized)).resolves.toEqual(sanitizedBytes);
       } else {
-        await expect(fs.access(audit.config.sanitized)).rejects.toMatchObject({ code: "ENOENT" });
+        await expect(fs.access(sanitized)).rejects.toMatchObject({ code: "ENOENT" });
       }
-    });
-  });
+    }),
+  );
 
   it.each([
     "rewritten",
@@ -140,8 +145,8 @@ describe("Doctor legacy audit skips", () => {
     "checkpointless empty",
     "append-only",
     "missing",
-  ])("preserves migrated history and continues Doctor after a %s raw archive", async (shape) => {
-    await withDoctorAudit(async (state, audit, migrate) => {
+  ])("preserves migrated history and continues Doctor after a %s raw archive", (shape) =>
+    withDoctorAudit(async (state, audit, migrate) => {
       const records = [0, 1, 2].map((index) =>
         configAuditRecord("***", { ts: `2026-07-01T00:00:0${index}.000Z` }),
       );
@@ -173,11 +178,7 @@ describe("Doctor legacy audit skips", () => {
 
       const result = await migrate();
 
-      expect(() => throwIfDoctorStateMigrationRefused(result.stepReceipts)).not.toThrow();
-      expect(result.stepReceipts.find((receipt) => receipt.id === "exec-approvals")?.outcome).toBe(
-        "completed",
-      );
-      await expect(fs.access(execPath)).rejects.toMatchObject({ code: "ENOENT" });
+      await expectContinued(result, execPath);
       const quarantines = (await fs.readdir(path.dirname(audit.config.raw))).filter((name) =>
         name.includes(".quarantined-"),
       );
@@ -200,11 +201,11 @@ describe("Doctor legacy audit skips", () => {
       await expect(fs.readFile(backup, "utf8")).resolves.toBe(" \t\n");
       await expect(fs.readFile(`${audit.config.source}.bak`)).resolves.toEqual(sanitized);
       expect((await migrate()).warnings).toEqual([]);
-    });
-  });
+    }),
+  );
 
-  it("keeps an unsafe interrupted recovery refusing alongside an independent skip", async () => {
-    await withDoctorAudit(async (_state, audit, migrate) => {
+  it("keeps an unsafe interrupted recovery refusing alongside an independent skip", () =>
+    withDoctorAudit(async (_state, audit, migrate) => {
       await audit.seedRawArchive(audit.config, buildAuditScrubbedContent(512));
       const original = `${JSON.stringify(systemAuditEvent("original archive"))}\n`;
       const changed = original.replace("original archive", " ".repeat(16));
@@ -215,14 +216,11 @@ describe("Doctor legacy audit skips", () => {
 
       expect(result.warnings.join("\n")).toContain("ambiguous whitespace");
       expect(result.warnings.join("\n")).toContain("no longer matches its restore journal target");
-      expect(result.stepReceipts.find((receipt) => receipt.id === "audit-logs")?.outcome).toBe(
-        "refused",
-      );
+      expect(receipt(result, "audit-logs")?.outcome).toBe("refused");
       expect(() => throwIfDoctorStateMigrationRefused(result.stepReceipts)).toThrow(
         "Doctor stopped",
       );
       await expect(fs.readFile(audit.system.raw, "utf8")).resolves.toBe(changed);
       await fs.access(audit.system.restore);
-    });
-  });
+    }));
 });
