@@ -40,6 +40,19 @@ async function expectPathMissing(targetPath: string): Promise<void> {
   await expect(fs.stat(targetPath)).rejects.toMatchObject({ code: "ENOENT" });
 }
 
+const removeOptions = { recursive: true, force: true, maxRetries: 20, retryDelay: 25 };
+function makeAuthStore() {
+  return {
+    version: 1,
+    profiles: { "openai:test": { type: "api_key" as const, provider: "openai", key: "sk-test" } },
+  };
+}
+const readEnv = (keys: string[], env = process.env) =>
+  Object.fromEntries(keys.map((key) => [key, env[key]]));
+function expectEnv(expected: NodeJS.ProcessEnv, env = process.env) {
+  expect(readEnv(Object.keys(expected), env)).toEqual(expected);
+}
+
 describe("openclaw test state", () => {
   it("retains failed pre-handoff state rollback through the cleanup verifier", async () => {
     const lifetimeRoot = await fs.mkdtemp(path.join(os.tmpdir(), "state-rollback-owner-"));
@@ -236,14 +249,7 @@ describe("openclaw test state", () => {
           { status: "rejected", reason: fault },
         ]);
         expect.soft(process.env.OPENCLAW_STATE_DIR).toBe(state.stateDir);
-        expect
-          .soft(
-            await fs.stat(state.root).then(
-              () => true,
-              () => false,
-            ),
-          )
-          .toBe(true);
+        await expect.soft(fs.stat(state.root)).resolves.toBeDefined();
       } finally {
         // The injected drain has settled and owns no real work. Dispose this
         // deliberately retained fixture without borrowing a failed release API.
@@ -294,7 +300,7 @@ describe("openclaw test state", () => {
               "OPENCLAW_ACQUISITION_EMPTY",
               "OPENCLAW_ACQUISITION_ABSENT",
             ];
-            const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+            const previous = readEnv(keys);
             const rollbackObservation = createDeferredCore<typeof previous>();
             const snapshot = captureEnv(keys);
             const fault = new Error(`failed ${stage} acquisition`);
@@ -318,11 +324,7 @@ describe("openclaw test state", () => {
                           faultSpy.mockRestore();
                           // This runs at the first microtask boundary after the
                           // partial write; rollback must already have restored env.
-                          queueMicrotask(() =>
-                            rollbackObservation.resolve(
-                              Object.fromEntries(keys.map((name) => [name, process.env[name]])),
-                            ),
-                          );
+                          queueMicrotask(() => rollbackObservation.resolve(readEnv(keys)));
                           throw fault;
                         }
                         return result;
@@ -355,9 +357,7 @@ describe("openclaw test state", () => {
               }
               await lifetime.cleanup();
               expect(() => owner.assertReleased()).not.toThrow();
-              expect(Object.fromEntries(keys.map((key) => [key, process.env[key]]))).toEqual(
-                previous,
-              );
+              expectEnv(previous);
               expect((await fs.readdir(parent)).toSorted()).toEqual([
                 ".vitest-resource-owner",
                 "unrelated",
@@ -373,9 +373,7 @@ describe("openclaw test state", () => {
                 applyEnv: false,
               });
               try {
-                expect(Object.fromEntries(keys.map((key) => [key, process.env[key]]))).toEqual(
-                  previous,
-                );
+                expectEnv(previous);
                 expect(recovered.configPath).toBe(
                   path.join(recovered.root, "config", "openclaw.json"),
                 );
@@ -387,9 +385,7 @@ describe("openclaw test state", () => {
                 await recovered.cleanup();
               }
               await recovered.cleanup();
-              expect(Object.fromEntries(keys.map((key) => [key, process.env[key]]))).toEqual(
-                previous,
-              );
+              expectEnv(previous);
               expect((await fs.readdir(parent)).toSorted()).toEqual([
                 ".vitest-resource-owner",
                 "unrelated",
@@ -419,15 +415,14 @@ describe("openclaw test state", () => {
     await withEnvAsync(previous, async () => {
       const state = await createOpenClawTestState({ label: "late-env" });
       try {
-        Object.assign(state.envVars, {
+        const first = {
           OPENCLAW_TEST_LATE_ABSENT: "first",
           OPENCLAW_TEST_LATE_EMPTY: "first",
           OPENCLAW_TEST_LATE_PRESENT: undefined,
-        });
+        };
+        Object.assign(state.envVars, first);
         state.applyEnv();
-        expect(process.env.OPENCLAW_TEST_LATE_ABSENT).toBe("first");
-        expect(process.env.OPENCLAW_TEST_LATE_EMPTY).toBe("first");
-        expect(process.env.OPENCLAW_TEST_LATE_PRESENT).toBeUndefined();
+        expectEnv(first);
         for (const key of Object.keys(previous)) {
           state.envVars[key] = "second";
         }
@@ -440,10 +435,8 @@ describe("openclaw test state", () => {
       }
       await state.cleanup();
       await withOpenClawTestState({ label: "after-late-env" }, async (next) => {
-        for (const [key, value] of Object.entries(previous)) {
-          expect(process.env[key]).toBe(value);
-          expect(next.env[key]).toBe(value);
-        }
+        expectEnv(previous);
+        expectEnv(previous, next.env);
       });
     });
   });
@@ -468,27 +461,25 @@ describe("openclaw test state", () => {
 
         try {
           const expectedAgentDir = agentEnv === "main" ? state.agentDir() : undefined;
-          expect(state.env.OPENCLAW_AGENT_DIR).toBe(expectedAgentDir);
-          expect(state.env.PI_CODING_AGENT_DIR).toBeUndefined();
-          expect(process.env.OPENCLAW_AGENT_DIR).toBe(
-            applyEnv ? expectedAgentDir : inherited.OPENCLAW_AGENT_DIR,
-          );
-          expect(process.env.PI_CODING_AGENT_DIR).toBe(
-            applyEnv ? undefined : inherited.PI_CODING_AGENT_DIR,
-          );
+          const selectors = {
+            OPENCLAW_AGENT_DIR: expectedAgentDir,
+            PI_CODING_AGENT_DIR: undefined,
+          };
+          expectEnv(selectors, state.env);
+          expectEnv(applyEnv ? selectors : inherited);
           expect(state.agentDir()).toBe(path.join(state.stateDir, "agents", "main", "agent"));
         } finally {
           await state.cleanup();
         }
 
-        expect(process.env.OPENCLAW_AGENT_DIR).toBe(inherited.OPENCLAW_AGENT_DIR);
-        expect(process.env.PI_CODING_AGENT_DIR).toBe(inherited.PI_CODING_AGENT_DIR);
+        expectEnv(inherited);
       });
     },
   );
 
   it("allows explicit agent-dir overrides over main selection and restores absent or empty selectors", async () => {
-    await withEnvAsync({ OPENCLAW_AGENT_DIR: undefined, PI_CODING_AGENT_DIR: "" }, async () => {
+    const previous = { OPENCLAW_AGENT_DIR: undefined, PI_CODING_AGENT_DIR: "" };
+    await withEnvAsync(previous, async () => {
       const overrides = {
         OPENCLAW_AGENT_DIR: "/tmp/explicit-openclaw-agent",
         PI_CODING_AGENT_DIR: "/tmp/explicit-legacy-agent",
@@ -499,51 +490,29 @@ describe("openclaw test state", () => {
         env: overrides,
       });
       try {
-        expect(state.env.OPENCLAW_AGENT_DIR).toBe(overrides.OPENCLAW_AGENT_DIR);
-        expect(state.env.PI_CODING_AGENT_DIR).toBe(overrides.PI_CODING_AGENT_DIR);
-        expect(process.env.OPENCLAW_AGENT_DIR).toBeUndefined();
-        expect(process.env.PI_CODING_AGENT_DIR).toBe("");
+        expectEnv(overrides, state.env);
+        expectEnv(previous);
         state.applyEnv();
-        expect(process.env.OPENCLAW_AGENT_DIR).toBe(overrides.OPENCLAW_AGENT_DIR);
-        expect(process.env.PI_CODING_AGENT_DIR).toBe(overrides.PI_CODING_AGENT_DIR);
+        expectEnv(overrides);
       } finally {
         await state.cleanup();
       }
-      expect(process.env.OPENCLAW_AGENT_DIR).toBeUndefined();
-      expect(process.env.PI_CODING_AGENT_DIR).toBe("");
+      expectEnv(previous);
     });
   });
 
   it("writes scenario configs and auth profile stores", async () => {
-    await withOpenClawTestState(
-      {
-        scenario: "update-stable",
-      },
-      async (state) => {
-        expect(JSON.parse(await fs.readFile(state.configPath, "utf8"))).toEqual({
-          update: {
-            channel: "stable",
-          },
-          plugins: {},
-        });
-
-        const profilePath = await state.writeAuthProfiles({
-          version: 1,
-          profiles: {
-            "openai:test": {
-              type: "api_key",
-              provider: "openai",
-              key: "sk-test",
-            },
-          },
-        });
-
-        expect(profilePath).toBe(path.join(state.agentDir(), "openclaw-agent.sqlite"));
-        const profiles = loadPersistedAuthProfileStore(state.agentDir());
-        expect(profiles?.version).toBe(1);
-        expect(profiles?.profiles["openai:test"]?.provider).toBe("openai");
-      },
-    );
+    await withOpenClawTestState({ scenario: "update-stable" }, async (state) => {
+      expect(JSON.parse(await fs.readFile(state.configPath, "utf8"))).toEqual({
+        update: { channel: "stable" },
+        plugins: {},
+      });
+      const profilePath = await state.writeAuthProfiles(makeAuthStore());
+      expect(profilePath).toBe(path.join(state.agentDir(), "openclaw-agent.sqlite"));
+      const profiles = loadPersistedAuthProfileStore(state.agentDir());
+      expect(profiles?.version).toBe(1);
+      expect(profiles?.profiles["openai:test"]?.provider).toBe("openai");
+    });
   });
 
   it.each(["state", "configured"])(
@@ -561,16 +530,7 @@ describe("openclaw test state", () => {
         layout: "state-only",
         label: "database-cleanup",
       });
-      const authStore = {
-        version: 1,
-        profiles: {
-          "openai:test": {
-            type: "api_key" as const,
-            provider: "openai",
-            key: "sk-test",
-          },
-        },
-      };
+      const authStore = makeAuthStore();
       const fixtureAuthDir =
         location === "configured" ? state.path("configured-auth") : state.agentDir("auth-reader");
       const fixtureAuthPath = resolveAuthProfileDatabasePath(fixtureAuthDir);
@@ -645,12 +605,7 @@ describe("openclaw test state", () => {
         await state.cleanup();
 
         expect(process.env.OPENCLAW_STATE_DIR).toBe(previousStateDir);
-        expect(rmSpy).toHaveBeenCalledWith(state.root, {
-          recursive: true,
-          force: true,
-          maxRetries: 20,
-          retryDelay: 25,
-        });
+        expect(rmSpy).toHaveBeenCalledWith(state.root, removeOptions);
         await expectPathMissing(state.root);
         expect(unrelatedAuthReader.isOpen).toBe(true);
         expect(unrelatedShared.db.isOpen).toBe(true);
@@ -667,18 +622,8 @@ describe("openclaw test state", () => {
         closeOpenClawStateDatabaseByPath(unrelatedShared.path);
         openSpy.mockRestore();
         rmSpy.mockRestore();
-        await fs.rm(state.root, {
-          recursive: true,
-          force: true,
-          maxRetries: 20,
-          retryDelay: 25,
-        });
-        await fs.rm(unrelatedRoot, {
-          recursive: true,
-          force: true,
-          maxRetries: 20,
-          retryDelay: 25,
-        });
+        await fs.rm(state.root, removeOptions);
+        await fs.rm(unrelatedRoot, removeOptions);
       }
     },
   );
@@ -816,31 +761,21 @@ describe("openclaw test state", () => {
   );
 
   it("creates upgrade survivor fixture state", async () => {
-    await withOpenClawTestState(
-      {
-        scenario: "upgrade-survivor",
-      },
-      async (state) => {
-        const config = JSON.parse(await fs.readFile(state.configPath, "utf8"));
-        expect(config.update?.channel).toBe("stable");
-        expect(config.plugins?.enabled).toBe(true);
-        expect(config.plugins?.allow).toStrictEqual(["discord", "telegram", "whatsapp", "memory"]);
-      },
-    );
+    await withOpenClawTestState({ scenario: "upgrade-survivor" }, async (state) => {
+      const config = JSON.parse(await fs.readFile(state.configPath, "utf8"));
+      expect(config.update?.channel).toBe("stable");
+      expect(config.plugins?.enabled).toBe(true);
+      expect(config.plugins?.allow).toStrictEqual(["discord", "telegram", "whatsapp", "memory"]);
+    });
   });
 
   it("keeps external-service env scoped to the fixture", async () => {
     const previousPolicy = process.env.OPENCLAW_SERVICE_REPAIR_POLICY;
 
-    await withOpenClawTestState(
-      {
-        scenario: "external-service",
-      },
-      async (state) => {
-        expect(process.env.OPENCLAW_SERVICE_REPAIR_POLICY).toBe("external");
-        expect(state.env.OPENCLAW_SERVICE_REPAIR_POLICY).toBe("external");
-      },
-    );
+    await withOpenClawTestState({ scenario: "external-service" }, async (state) => {
+      expect(process.env.OPENCLAW_SERVICE_REPAIR_POLICY).toBe("external");
+      expect(state.env.OPENCLAW_SERVICE_REPAIR_POLICY).toBe("external");
+    });
 
     expect(process.env.OPENCLAW_SERVICE_REPAIR_POLICY).toBe(previousPolicy);
   });
