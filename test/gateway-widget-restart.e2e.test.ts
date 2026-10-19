@@ -367,6 +367,12 @@ it.skipIf(process.platform === "win32")(
             }
             expect(instance.logs()).not.toContain("Session transcript keyed user is outside");
             expect(instance.logs()).toContain("startup-orphaned main session(s)");
+            const handoff = await instance.cli(["dashboard", "--json"]);
+            expect(handoff.code, JSON.stringify(handoff)).toBe(0);
+            expect(JSON.parse(handoff.stdout)).toMatchObject({
+              ok: true,
+              browserUrl: expect.stringContaining("#bootstrapToken="),
+            });
           },
           async () => {
             provider.release();

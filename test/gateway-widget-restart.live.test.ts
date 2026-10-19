@@ -245,7 +245,7 @@ it.skipIf(!isLiveTestEnabled() || process.platform === "win32")(
         );
 
         const handoff = await instance.cli(["dashboard", "--json"]);
-        expect(handoff.code, handoff.stderr).toBe(0);
+        expect(handoff.code, JSON.stringify(handoff)).toBe(0);
         const issued = JSON.parse(handoff.stdout) as { browserUrl: string };
         const url = new URL(
           controlUiSessionUrl(`http://127.0.0.1:${instance.port}/`, SESSION_KEY, "dashboard"),
