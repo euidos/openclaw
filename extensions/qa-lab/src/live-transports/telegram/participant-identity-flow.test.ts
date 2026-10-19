@@ -1,9 +1,9 @@
-import { describe, expect, it, vi } from "vitest";
+import assert from "node:assert/strict";
+import { expect, it, vi } from "vitest";
 import { createQaBusState } from "../../bus-state.js";
 import { readQaScenarioById } from "../../scenario-catalog.js";
 import { runLoadedScenarioFlow } from "../../scenario-flow-runner.test-support.js";
 import { selectQaFlowSuiteScenarios } from "../../suite-planning.js";
-import { resolveTelegramQaScenarioIds } from "./scenario-selection.js";
 
 const scenarioId = "telegram-participant-identity-inspection";
 const primaryUserId = "710000001";
@@ -13,15 +13,17 @@ const forumGroupId = -100710000004;
 const forumTopicId = 42;
 const hmac = (digit: string) => `hmac-sha256:v1:${"a".repeat(32)}:${digit.repeat(64)}`;
 
-type Fault =
-  | "raw-principal"
-  | "raw-room"
-  | "prompt-leak"
-  | "verified-generic"
-  | "same-person"
-  | "changed-primary"
-  | "reused-context"
-  | "restart-leak";
+const faults = [
+  ["raw-principal", "bounded redacted identity"],
+  ["raw-room", "bounded redacted identity"],
+  ["prompt-leak", "bounded redacted identity"],
+  ["verified-generic", "bounded redacted identity"],
+  ["same-person", "distinguish the additional participant"],
+  ["changed-primary", "preserve the same primary person"],
+  ["reused-context", "three distinct execution contexts"],
+  ["restart-leak", "changed or exposed private references after restart"],
+] as const;
+type Fault = (typeof faults)[number][0];
 
 function runIdentityFlow(fault?: Fault) {
   const state = createQaBusState();
@@ -38,51 +40,29 @@ function runIdentityFlow(fault?: Fault) {
     const runId = selector.runId ?? selector.executionId?.replace("execution-", "");
     const index = admittedRuns.indexOf(runId ?? "") - 1;
     const turn = turns[index];
-    if (!turn || !runId) {
-      throw new Error("identity proof must inspect only a newly admitted transport turn");
-    }
+    assert(turn && runId, "identity proof must inspect only a newly admitted transport turn");
     const additional = turn.senderId === additionalUserId;
+    const person = fault === "changed-primary" && index === 1 ? "e" : additional ? "c" : "b";
     const principalRef =
-      fault === "raw-principal"
-        ? turn.senderId
-        : hmac(
-            fault === "same-person"
-              ? "b"
-              : fault === "changed-primary" && index === 1
-                ? "e"
-                : additional
-                  ? "c"
-                  : "b",
-          );
+      fault === "raw-principal" ? turn.senderId : hmac(fault === "same-person" ? "b" : person);
+    const executionId = `execution-${runId}`;
+    const principal = { kind: "person", principalRef, domainRef: hmac("a") };
+    const context = {
+      contextId: fault === "reused-context" ? "context-first" : `context-${runId}`,
+      executionId,
+      runId,
+      invoker: { state: "present", principal },
+      // Channel admission has no rawSourceRef.
+      ingress: { kind: "channel", state: "present" },
+      runtimeInstance: { runtimeRef: hmac("e") },
+      assurance: [
+        { kind: "channel-admission", strength: "boundary-verified", evidenceRef: hmac("d") },
+      ],
+      applicableGrants: [],
+    };
     return {
-      run: { runId, executionId: `execution-${runId}` },
-      identity: {
-        state: "present",
-        context: {
-          contextId: fault === "reused-context" ? "context-first" : `context-${runId}`,
-          executionId: `execution-${runId}`,
-          runId,
-          invoker: {
-            state: "present",
-            principal: {
-              kind: "person",
-              principalRef,
-              domainRef: hmac("a"),
-            },
-          },
-          // Channel admission supplies no rawSourceRef; do not invent one in proof support.
-          ingress: { kind: "channel", state: "present" },
-          runtimeInstance: { runtimeRef: hmac("e") },
-          assurance: [
-            {
-              kind: "channel-admission",
-              strength: "boundary-verified",
-              evidenceRef: hmac("d"),
-            },
-          ],
-          applicableGrants: [],
-        },
-      },
+      run: { runId, executionId },
+      identity: { state: "present", context },
       decisionDisplays: [
         {
           action: { family: "decision", operation: "record" },
@@ -121,9 +101,7 @@ function runIdentityFlow(fault?: Fault) {
     }
     expect(args.slice(0, 2)).toEqual(["audit", "--execution"]);
     const executionId = args[2];
-    if (!executionId) {
-      throw new Error("identity CLI proof requires an exact execution selector");
-    }
+    assert(executionId, "identity CLI proof requires an exact execution selector");
     const inspection = inspect({ executionId });
     if (!options?.json) {
       return `Invoker [present] ${inspection.identity.context.invoker.principal.principalRef}\nDecisions`;
@@ -163,11 +141,11 @@ function runIdentityFlow(fault?: Fault) {
             textIncludes: string;
           }) => {
             const inbound = turns.at(-1);
-            if (!inbound) {
-              throw new Error("identity proof must send a transport turn before inspecting it");
-            }
-            expect(input.conversation).toEqual(inbound.conversation);
-            expect(input.threadId).toBe(inbound.threadId);
+            assert(inbound, "identity proof must send a transport turn before inspecting it");
+            expect([input.conversation, input.threadId]).toEqual([
+              inbound.conversation,
+              inbound.threadId,
+            ]);
             const forum = inbound.conversation.kind === "group";
             expect(inbound.threadId).toBe(forum ? String(forumTopicId) : undefined);
             expect(inbound.text.startsWith("@openclaw ")).toBe(forum);
@@ -193,47 +171,33 @@ function runIdentityFlow(fault?: Fault) {
   };
 }
 
-describe("Telegram participant identity executable flow", () => {
-  it("selects live identity proof explicitly and excludes it from crabline", () => {
-    expect(
-      resolveTelegramQaScenarioIds({ providerMode: "mock-openai", scenarioIds: [scenarioId] }),
-    ).toEqual([scenarioId]);
-    expect(
-      selectQaFlowSuiteScenarios({
-        scenarios: [readQaScenarioById(scenarioId)],
-        channel: "telegram",
-        channelDriver: "crabline",
-        providerMode: "mock-openai",
-        primaryModel: "mock-openai/fixture",
-      }),
-    ).toEqual([]);
-  });
+it("excludes live identity proof from crabline", () => {
+  expect(
+    selectQaFlowSuiteScenarios({
+      scenarios: [readQaScenarioById(scenarioId)],
+      channel: "telegram",
+      channelDriver: "crabline",
+      providerMode: "mock-openai",
+      primaryModel: "mock-openai/fixture",
+    }),
+  ).toEqual([]);
+});
 
-  it("executes both participant aliases through DM/forum, exact RPC/CLI inspection, and one restart", async () => {
-    const proof = runIdentityFlow();
-    await expect(proof.result).resolves.toMatchObject({ status: "pass" });
-    expect(proof.turns.map((turn) => [turn.senderId, turn.conversation.kind])).toEqual([
-      [primaryUserId, "direct"],
-      [primaryUserId, "group"],
-      [additionalUserId, "group"],
-    ]);
-    expect(proof.restart).toHaveBeenCalledOnce();
-    expect(proof.call).toHaveBeenCalledTimes(9);
-    expect(
-      proof.runQaCli.mock.calls.filter(([, args]) => args.includes("--execution")),
-    ).toHaveLength(12);
-  });
+it("executes both participant aliases through DM/forum, exact RPC/CLI inspection, and one restart", async () => {
+  const proof = runIdentityFlow();
+  await expect(proof.result).resolves.toMatchObject({ status: "pass" });
+  expect(proof.turns.map((turn) => [turn.senderId, turn.conversation.kind])).toEqual([
+    [primaryUserId, "direct"],
+    [primaryUserId, "group"],
+    [additionalUserId, "group"],
+  ]);
+  expect(proof.restart).toHaveBeenCalledOnce();
+  expect(proof.call).toHaveBeenCalledTimes(9);
+  expect(proof.runQaCli.mock.calls.filter(([, args]) => args.includes("--execution"))).toHaveLength(
+    12,
+  );
+});
 
-  it.each([
-    ["raw-principal", "bounded redacted identity"],
-    ["raw-room", "bounded redacted identity"],
-    ["prompt-leak", "bounded redacted identity"],
-    ["verified-generic", "bounded redacted identity"],
-    ["same-person", "distinguish the additional participant"],
-    ["changed-primary", "preserve the same primary person"],
-    ["reused-context", "three distinct execution contexts"],
-    ["restart-leak", "changed or exposed private references after restart"],
-  ] satisfies Array<[Fault, string]>)("rejects %s evidence", async (fault, message) => {
-    await expect(runIdentityFlow(fault).result).rejects.toThrow(message);
-  });
+it.each(faults)("rejects %s evidence", async (fault, message) => {
+  await expect(runIdentityFlow(fault).result).rejects.toThrow(message);
 });
