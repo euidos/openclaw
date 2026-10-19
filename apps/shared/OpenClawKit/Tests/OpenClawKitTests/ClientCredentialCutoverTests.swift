@@ -109,6 +109,36 @@ struct ClientCredentialCutoverTests {
         #expect(!app.owns(root: root))
     }
 
+    @Test func `app startup imports pending JSON before credential inspections`() throws {
+        let roots = [self.root(), self.root()]
+        defer { roots.forEach { try? FileManager.default.removeItem(at: $0) } }
+        let material = DeviceIdentityStore.generateMaterial()
+        let identity = try JSONSerialization.data(withJSONObject: [
+            "version": 1,
+            "deviceId": material.identity.deviceId,
+            "publicKeyPem": material.publicKeyPEM,
+            "privateKeyPem": material.privateKeyPEM,
+            "createdAtMs": material.identity.createdAtMs,
+        ])
+        for root in roots {
+            let owner = try OpenClawClientCredentialStore(rootURL: root)
+            owner.close()
+            _ = try self.writeLegacyAuth(root: root, material: material)
+            try identity.write(to: root.appendingPathComponent("identity/device.json"))
+        }
+        let custody = try AppClientCredentialCustody(roots: roots, independentRoots: [])
+        defer { custody.close() }
+        for root in roots {
+            try custody.withOwner(root: root, inspection: true) { owner in
+                let identity = try owner.readIdentity(key: "primary")
+                let token = try owner.readToken(deviceID: material.identity.deviceId, role: "operator")
+                #expect(identity?.deviceID == material.identity.deviceId)
+                #expect(token?.token == "json-token")
+            }
+            #expect(try Data(contentsOf: root.appendingPathComponent("identity/device.json")) == identity)
+        }
+    }
+
     @Test func `owner read and create reject a corrupt persisted winner without replacing it`() throws {
         let root = self.root()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -333,13 +363,28 @@ struct ClientCredentialCutoverTests {
         defer { try? FileManager.default.removeItem(at: root) }
         let material = DeviceIdentityStore.generateMaterial()
         try self.createLegacy(root: root, material: material)
+        let scopesJSON = " [\"scope a\", \"é\", \"scope a\"] "
+        do {
+            let source = try OpenClawNativeStateSQLite(
+                databaseURL: root.appendingPathComponent("state/openclaw.sqlite"))
+            try source.execute("UPDATE device_identities SET created_at_ms=0, updated_at_ms=9007199254740991")
+            let token = try source
+                .prepare("UPDATE device_auth_tokens SET scopes_json=?, updated_at_ms=9007199254740991")
+            try token.bindText(scopesJSON, at: 1)
+            _ = try token.step()
+        }
         let owner = try OpenClawClientCredentialStore(rootURL: root, migration: true)
         defer { owner.close() }
         let before = try snapshot(root)
         try NativeClientCredentialMigration.prepare(root: root, owner: owner, allowIndependentSource: true)
         #expect(try self.snapshot(root) == before)
         #expect(try owner.readIdentity(key: "primary")?.privateKeyPEM == material.privateKeyPEM)
+        #expect(try owner.readIdentity(key: "primary")?.createdAtMs == 0)
+        #expect(try owner.readIdentity(key: "primary")?.updatedAtMs == 9_007_199_254_740_991)
         #expect(try owner.readToken(deviceID: material.identity.deviceId, role: "node")?.token == "retained-token")
+        #expect(try owner.readToken(deviceID: material.identity.deviceId, role: "node")?.scopesJSON == scopesJSON)
+        #expect(try owner.readToken(deviceID: material.identity.deviceId, role: "node")?
+            .updatedAtMs == 9_007_199_254_740_991)
         var refresh = ClientCredentialOperation(kind: .tokenReplace)
         refresh.key = .init(deviceID: material.identity.deviceId, role: "node")
         refresh.token = .init(
@@ -356,6 +401,43 @@ struct ClientCredentialCutoverTests {
         #expect(try owner.execute(remove).changed == true)
         try NativeClientCredentialMigration.prepare(root: root, owner: owner, allowIndependentSource: true)
         #expect(try owner.readToken(deviceID: material.identity.deviceId, role: "node") == nil)
+        #expect(try self.snapshot(root) == before)
+    }
+
+    @Test(arguments: [
+        "UPDATE device_identities SET created_at_ms=-1",
+        "UPDATE device_identities SET created_at_ms=9007199254740992",
+        "UPDATE device_identities SET updated_at_ms=-1",
+        "UPDATE device_identities SET updated_at_ms=9007199254740992",
+        "UPDATE device_auth_tokens SET updated_at_ms=-1",
+        "UPDATE device_auth_tokens SET updated_at_ms=9007199254740992",
+        "UPDATE device_auth_tokens SET scopes_json='[\"node\",1]'",
+        "UPDATE device_auth_tokens SET scopes_json='{}'",
+        "UPDATE device_auth_tokens SET scopes_json='not-json'",
+    ])
+    func `invalid native rows preserve the source and previous credential copy`(_ mutation: String) throws {
+        let root = self.root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let material = DeviceIdentityStore.generateMaterial()
+        try self.createLegacy(root: root, material: material)
+        let owner = try OpenClawClientCredentialStore(rootURL: root, migration: true)
+        defer { owner.close() }
+        try NativeClientCredentialMigration.prepare(root: root, owner: owner, allowIndependentSource: true)
+        let identity = try owner.readIdentity(key: "primary")
+        let token = try owner.readToken(deviceID: material.identity.deviceId, role: "node")
+        let receipt = try owner.readReceipt()?.receipt.source
+        do {
+            let source = try OpenClawNativeStateSQLite(
+                databaseURL: root.appendingPathComponent("state/openclaw.sqlite"))
+            try source.execute(mutation)
+        }
+        let before = try self.snapshot(root)
+        #expect(throws: Error.self) {
+            try NativeClientCredentialMigration.prepare(root: root, owner: owner, allowIndependentSource: true)
+        }
+        #expect(try owner.readIdentity(key: "primary") == identity)
+        #expect(try owner.readToken(deviceID: material.identity.deviceId, role: "node") == token)
+        #expect(try owner.readReceipt()?.receipt.source == receipt)
         #expect(try self.snapshot(root) == before)
     }
 

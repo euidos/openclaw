@@ -4,6 +4,9 @@ import OpenClawNativeState
 
 /// Independent native input remains untouched so the previous app can still use it.
 enum NativeClientCredentialMigration {
+    /// Timestamps must be exactly representable by the TypeScript credential owner.
+    private static let timestampRange: ClosedRange<Int64> = 0...9_007_199_254_740_991
+
     private struct Rows: Encodable {
         let authTablePresent: Bool
         let identities: [OpenClawClientCredentialStore.Identity]
@@ -99,6 +102,11 @@ enum NativeClientCredentialMigration {
                     privateKeyPEM: rows.requiredText(at: 3, field: "private key"),
                     createdAtMs: rows.int64(at: 4),
                     updatedAtMs: rows.int64(at: 5))
+                guard self.timestampRange.contains(row.createdAtMs), self.timestampRange.contains(row.updatedAtMs)
+                else {
+                    throw OpenClawNativeStateError(
+                        "Native device identity timestamps are invalid; source preserved. Run openclaw doctor --fix")
+                }
                 _ = try DeviceIdentityStore.material(
                     deviceId: row.deviceID,
                     publicKeyPEM: row.publicKeyPEM,
@@ -121,12 +129,19 @@ enum NativeClientCredentialMigration {
                     "SELECT device_id,role,token,scopes_json,updated_at_ms " +
                         "FROM device_auth_tokens ORDER BY device_id COLLATE BINARY,role COLLATE BINARY")
             while try rows.step() == .row {
-                try tokenRows.append(.init(
+                let row = try OpenClawClientCredentialStore.Token(
                     deviceID: rows.requiredText(at: 0, field: "device id"),
                     role: rows.requiredText(at: 1, field: "role"),
                     token: rows.requiredText(at: 2, field: "token"),
                     scopesJSON: rows.requiredText(at: 3, field: "scopes"),
-                    updatedAtMs: rows.int64(at: 4)))
+                    updatedAtMs: rows.int64(at: 4))
+                guard self.timestampRange.contains(row.updatedAtMs), DeviceAuthStore.decodeScopes(row.scopesJSON) != nil
+                else {
+                    throw OpenClawNativeStateError(
+                        "Native device token timestamp or scopes are invalid; source preserved. " +
+                            "Run openclaw doctor --fix")
+                }
+                tokenRows.append(row)
             }
         }
         return tokenRows

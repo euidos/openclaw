@@ -17,9 +17,6 @@ public enum DeviceCredentialAccess {
         let roots = separate ? [identityRoot, executionRoot] : [identityRoot]
         let custody = try AppClientCredentialCustody(roots: roots, independentRoots: separate ? [identityRoot] : [])
         self.configuration.withLock { $0.appCustody = custody }
-        for root in roots {
-            try self.withOwner(root: root) { _ in }
-        }
     }
 
     public static func install(executor: @escaping Executor) {
@@ -241,7 +238,7 @@ public enum DeviceCredentialAccess {
         return try operation(owner)
     }
 
-    private static func prepareLegacy(owner: OpenClawClientCredentialStore, root: URL) throws {
+    fileprivate static func prepareLegacy(owner: OpenClawClientCredentialStore, root: URL) throws {
         for profile in [GatewayDeviceIdentityProfile.primary, .node, .shareExtension] {
             let sources: [DeviceIdentityPaths.LegacyIdentitySource]
             if try OpenClawClientCredentialStore.canonicalPath(root) ==
@@ -288,6 +285,11 @@ final class AppClientCredentialCustody: @unchecked Sendable {
     init(roots: [URL], independentRoots: [URL]) throws {
         self.roots = try Set(roots.map(OpenClawClientCredentialStore.canonicalPath))
         self.independentRoots = try Set(independentRoots.map(OpenClawClientCredentialStore.canonicalPath))
+        for root in roots {
+            try self.withOwner(root: root) { owner in
+                try DeviceCredentialAccess.prepareLegacy(owner: owner, root: root)
+            }
+        }
     }
 
     func owns(root: URL) -> Bool {

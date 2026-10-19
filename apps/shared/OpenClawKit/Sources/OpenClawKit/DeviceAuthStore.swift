@@ -271,13 +271,9 @@ public enum DeviceAuthStore {
         return DeviceAuthStoreFile(version: 1, deviceId: decoded.deviceId, tokens: tokens)
     }
 
-    private static func decodeScopes(_ rawJSON: String) -> [String]? {
-        guard let values = jsonArray(rawJSON) else { return nil }
-        return self.normalizeScopes(values.compactMap { $0 as? String })
-    }
-
-    private static func jsonArray(_ rawJSON: String) -> [Any]? {
-        try? JSONSerialization.jsonObject(with: Data(rawJSON.utf8)) as? [Any]
+    static func decodeScopes(_ rawJSON: String) -> [String]? {
+        guard let scopes = try? JSONDecoder().decode([String].self, from: Data(rawJSON.utf8)) else { return nil }
+        return self.normalizeScopes(scopes)
     }
 
     private static func decodeTokenKey(_ key: String) -> (role: String, gatewayID: String?) {

@@ -46,12 +46,15 @@ export async function ensureExecApprovalsSocket(
 
 export async function attachExecApprovalsSocket(
   snapshot: ExecApprovalsSnapshot,
-  context: Pick<OpenClawStateWorkerContext, "environment" | "admission">,
+  context: Pick<
+    OpenClawStateWorkerContext,
+    "environment" | "initializationEnvironment" | "admission"
+  >,
   assertCurrent?: () => void,
   requested?: ExecApprovalsFile["socket"],
 ): Promise<ExecApprovalsSnapshot> {
   const socket = await ensureExecApprovalsSocket(
-    context.environment,
+    context.initializationEnvironment ?? context.environment,
     {
       assertCurrent: () => {
         context.admission.assertCurrent();
