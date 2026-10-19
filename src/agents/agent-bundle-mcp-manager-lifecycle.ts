@@ -10,7 +10,7 @@ import type { GatewayScheduler, GatewayScheduledJob } from "../infra/gateway-sch
 import { logWarn } from "../logger.js";
 import { enqueueKeyedTask } from "../plugin-sdk/keyed-async-queue.js";
 import { parseAgentSessionKey } from "../routing/session-key.js";
-import { compareMcpCatalogTools } from "./agent-bundle-mcp-names.js";
+import { compareMcpCatalogTools, mcpCatalogToolsSignature } from "./agent-bundle-mcp-names.js";
 import { sessionMcpRuntimeOwners } from "./agent-bundle-mcp-runtime-owner.js";
 import {
   SessionMcpRuntimeCapacityError,
@@ -54,6 +54,7 @@ type StaticCatalogBinding = {
 type StaticCatalogEntry = StaticCatalogBinding & { catalog: McpToolCatalog | null };
 
 type RuntimeDisposalReceipt = {
+  sessionId: string;
   pending: Set<Promise<void>>;
   failure?: PromiseRejectedResult;
   agentId?: string;
@@ -101,22 +102,6 @@ export type SessionMcpRuntimeManagerLifecycle = ReturnType<
   typeof createSessionMcpRuntimeManagerLifecycle
 >;
 
-function scopedCatalogToolsSignature(tools: readonly McpCatalogTool[]): string {
-  return JSON.stringify(
-    tools.map((tool) => [
-      tool.serverName,
-      tool.safeServerName,
-      tool.toolName,
-      tool.title ?? "",
-      tool.description ?? "",
-      tool.fallbackDescription,
-      tool.inputSchema,
-      tool.uiResourceUri ?? "",
-      tool.uiVisibility ?? null,
-    ]),
-  );
-}
-
 export function createSessionMcpRuntimeManagerLifecycle(
   options: SessionMcpRuntimeManagerOpts,
   createSessionMcpRuntime: CreateSessionMcpRuntime,
@@ -151,8 +136,8 @@ export function createSessionMcpRuntimeManagerLifecycle(
   };
   let schedulerScope = store.scheduler.scope();
   let capacityNoticeActive = false;
-  const capacityRefusal = () => {
-    const refusal = new SessionMcpRuntimeCapacityError(!capacityNoticeActive);
+  const capacityRefusal = (message?: string) => {
+    const refusal = new SessionMcpRuntimeCapacityError(!capacityNoticeActive, message);
     if (refusal.notify) {
       logWarn(`bundle-mcp: ${refusal.message}`);
     }
@@ -160,9 +145,15 @@ export function createSessionMcpRuntimeManagerLifecycle(
     return refusal;
   };
   const reserveRuntimeSlot = async (
+    runtimeKey: string,
     existing: SessionMcpRuntime | undefined,
     hasServers: boolean,
   ): Promise<{ idleTtlMs: number }> => {
+    if (hasServers && store.pendingDisposals.get(runtimeKey)?.failure) {
+      throw capacityRefusal(
+        "MCP tools are temporarily unavailable: the previous runtime has not confirmed shutdown. This turn will continue without MCP tools; restart the Gateway before retrying.",
+      );
+    }
     const slot = (existing && store.runtimeSlots.get(existing)) ?? { idleTtlMs: 0 };
     if (!hasServers || store.liveRuntimeSlots.has(slot)) {
       return slot;
@@ -226,13 +217,17 @@ export function createSessionMcpRuntimeManagerLifecycle(
       }
     }
   };
-  const disposeRuntime = async (runtime: SessionMcpRuntime, releaseSlot = true) => {
-    const agentId = runtimeAgentId(runtime);
-    const receipt: RuntimeDisposalReceipt = store.pendingDisposals.get(runtime.sessionId) ?? {
+  const disposeRuntime = async (
+    runtimeKey: string,
+    runtime: SessionMcpRuntime,
+    releaseSlot = true,
+  ) => {
+    const receipt: RuntimeDisposalReceipt = store.pendingDisposals.get(runtimeKey) ?? {
+      sessionId: runtime.sessionId,
       pending: new Set(),
     };
-    receipt.agentId ??= agentId;
-    store.pendingDisposals.set(runtime.sessionId, receipt);
+    receipt.agentId ??= runtimeAgentId(runtime);
+    store.pendingDisposals.set(runtimeKey, receipt);
     try {
       await runtime.dispose();
       if (!runtime.joinCleanup) {
@@ -251,7 +246,7 @@ export function createSessionMcpRuntimeManagerLifecycle(
       throw error;
     } finally {
       if (receipt.pending.size === 0 && !receipt.failure) {
-        store.pendingDisposals.delete(runtime.sessionId);
+        store.pendingDisposals.delete(runtimeKey);
       }
     }
   };
@@ -274,7 +269,10 @@ export function createSessionMcpRuntimeManagerLifecycle(
         pruneSessionBookkeeping();
       });
     for (const runtimeKey of runtimeKeys) {
-      const pending = store.pendingDisposals.get(runtimeKey) ?? { pending: new Set() };
+      const pending = store.pendingDisposals.get(runtimeKey) ?? {
+        sessionId: parseRuntimeCacheSessionId(runtimeKey),
+        pending: new Set(),
+      };
       store.pendingDisposals.set(runtimeKey, pending);
       pending.pending.add(disposal);
     }
@@ -395,7 +393,9 @@ export function createSessionMcpRuntimeManagerLifecycle(
       expired.map(({ runtimeKey, runtime }) => {
         // Reserve the evicted key through physical cleanup, even if admission
         // stops waiting. Reacquisition must not overlap the original process.
-        const closing = runExclusiveOnRuntimeKeys([runtimeKey], () => disposeRuntime(runtime));
+        const closing = runExclusiveOnRuntimeKeys([runtimeKey], () =>
+          disposeRuntime(runtimeKey, runtime),
+        );
         return trackDisposal([runtimeKey], () => closing);
       }),
     );
@@ -464,7 +464,7 @@ export function createSessionMcpRuntimeManagerLifecycle(
     store.runtimesBySessionId.delete(runtimeKey);
     store.connectionMetaByRuntimeKey.delete(runtimeKey);
     if (runtime) {
-      await disposeRuntime(runtime);
+      await disposeRuntime(runtimeKey, runtime);
     }
   };
 
@@ -540,8 +540,10 @@ export function createSessionMcpRuntimeManagerLifecycle(
         if (staticCatalog && staticCatalog.agentId !== deletion.agentId) {
           return;
         }
-        const failed = store.pendingDisposals.get(sessionId ?? "");
-        if (failed?.failure && failed.agentId === deletion.agentId) {
+        const failed = runtimeKeys
+          .map((key) => store.pendingDisposals.get(key))
+          .find((receipt) => receipt?.failure && receipt.agentId === deletion.agentId);
+        if (failed?.failure) {
           throw failed.failure.reason;
         }
         // A captured session id can be rebound while earlier acquisition finishes.
@@ -690,7 +692,7 @@ export function createSessionMcpRuntimeManagerLifecycle(
       const tools = (toolsByServerName.get(serverName) ?? []).toSorted((a, b) =>
         a.toolName.localeCompare(b.toolName),
       );
-      const signature = scopedCatalogToolsSignature(tools);
+      const signature = mcpCatalogToolsSignature(tools);
       // Identity compare: overwrite only when the listed tool surface changes.
       if (entry.signaturesByServer.get(serverName) === signature) {
         continue;

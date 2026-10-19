@@ -548,8 +548,8 @@ export function createSessionMcpRuntimeManager(opts: SessionMcpRuntimeManagerOpt
           ...[...store.runtimesBySessionId.values()].flatMap((runtime) =>
             sessionMcpRuntimeOwners.get(runtime)?.agentId === agentId ? [runtime.sessionId] : [],
           ),
-          ...[...store.pendingDisposals].flatMap(([sessionId, receipt]) =>
-            receipt.agentId === agentId ? [sessionId] : [],
+          ...[...store.pendingDisposals.values()].flatMap((receipt) =>
+            receipt.agentId === agentId ? [receipt.sessionId] : [],
           ),
           ...[...store.staticCatalogBySessionId].flatMap(([sessionId, entry]) =>
             entry.agentId === agentId ? [sessionId] : [],

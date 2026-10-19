@@ -301,4 +301,61 @@ describe("MCP capacity catalog continuity", () => {
     expect(retired.tools).toEqual([]);
     await retired.dispose();
   });
+
+  it.each(["static", "requester"])(
+    "refuses replacement after failed %s eviction cleanup without blocking another key",
+    async (scope) => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      vi.setSystemTime(1_000);
+      const { manager, factory } = setup();
+      try {
+        await withRequester(async () => {
+          const acquire = async (sessionId: string, sender = "alice") => {
+            const lease =
+              scope === "static"
+                ? await manager.acquire({ ...params, sessionId })
+                : (await manager.acquireRequesterScoped({
+                    ...mixedParams,
+                    sessionId,
+                    requesterSenderId: sender,
+                  }))!;
+            held.push(lease);
+            return lease;
+          };
+          const original = await acquire("uncertain");
+          original.runtime.joinCleanup = async () => {
+            throw new Error("child cleanup uncertain");
+          };
+          original.releaseLease();
+          const healthy = await acquire("healthy");
+          healthy.releaseLease();
+          for (let index = 0; index < 254; index++) {
+            await acquire(`busy-${index}`);
+          }
+          const admitted = await acquire("admitted");
+          admitted.releaseLease();
+          expect(original.runtime.dispose).toHaveBeenCalledOnce();
+          expect(factory).toHaveBeenCalledTimes(257);
+          expect(manager.listSessionIdsForAgent("test")).toContain("uncertain");
+
+          const refused = await acquire("uncertain");
+          expect(factory).toHaveBeenCalledTimes(257);
+          expect((await refused.runtime.getCatalog()).diagnostics?.[0]?.message).toContain(
+            "previous runtime has not confirmed shutdown",
+          );
+          expect(admitted.runtime.dispose).not.toHaveBeenCalled();
+
+          // A failed requester partition does not poison another sender in the session.
+          const unrelated = await acquire(scope === "requester" ? "uncertain" : "unrelated", "bob");
+          expect(factory).toHaveBeenCalledTimes(258);
+          expect((await unrelated.runtime.getCatalog()).diagnostics).toBeUndefined();
+          await expect(
+            manager.retireSessionForAgentDeletion("uncertain", "test", () => {}),
+          ).rejects.toThrow("child cleanup uncertain");
+        });
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
 });

@@ -16,10 +16,11 @@ export const SESSION_MCP_RUNTIME_SWEEP_INTERVAL_MS = 60 * 1000;
 export const SESSION_MCP_MAX_LIVE_RUNTIMES = 256;
 
 export class SessionMcpRuntimeCapacityError extends Error {
-  constructor(readonly notify: boolean) {
-    super(
-      "MCP tools are temporarily unavailable: all 256 Gateway MCP runtimes are in use. This turn will continue without MCP tools; retry on the next turn.",
-    );
+  constructor(
+    readonly notify: boolean,
+    message = "MCP tools are temporarily unavailable: all 256 Gateway MCP runtimes are in use. This turn will continue without MCP tools; retry on the next turn.",
+  ) {
+    super(message);
   }
 }
 
