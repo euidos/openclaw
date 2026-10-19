@@ -148,16 +148,15 @@ test.each(inventorySizes)(
             owner: { actor: { id: selected.id } },
             group: SELECTED_GROUP,
           });
-          expect(row).not.toHaveProperty("messages");
-          expect(row).not.toHaveProperty("derivedTitle");
-          expect(row).not.toHaveProperty("lastMessagePreview");
+          for (const field of ["messages", "derivedTitle", "lastMessagePreview"]) {
+            expect(row).not.toHaveProperty(field);
+          }
           return row.key;
         });
         expect(returnedKeys).toEqual(expectedKeys);
-        for (const transcript of transcripts) {
-          expect(transcript).not.toHaveBeenCalled();
+        for (const spy of spies) {
+          expect(spy).not.toHaveBeenCalled();
         }
-        expect(fullLookup).not.toHaveBeenCalled();
       }
     } finally {
       projection.dispose();

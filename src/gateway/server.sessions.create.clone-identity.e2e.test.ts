@@ -9,7 +9,6 @@ import { requireGit } from "../agents/worktrees/git.js";
 import { managedWorktrees } from "../agents/worktrees/service.js";
 import { getRuntimeConfig } from "../config/io.js";
 import { setRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
-import type { SessionEntry } from "../config/sessions/types.js";
 import * as processExec from "../process/exec.js";
 import { captureSessionControllerSettlement } from "../sessions/session-controller.lifecycle.js";
 import { getRpcSource } from "../sessions/session-controller.rpc-sources.js";
@@ -53,7 +52,7 @@ test.each(
     vi.stubEnv("OPENCLAW_STATE_DIR", git.root);
     vi.stubEnv("GH_TOKEN", "");
     vi.stubEnv("GITHUB_TOKEN", "");
-    const { storePath } = await createSessionStoreDir();
+    await createSessionStoreDir();
     const profileId = "ghp_11111111111111111111111111111111";
     const profileDir = resolveManagedGitHubProfileDir({
       agentId: "main",
@@ -69,10 +68,7 @@ test.each(
     setRuntimeConfigSnapshot(selected);
     const runCommand = processExec.runCommandWithTimeout;
     vi.spyOn(processExec, "runCommandWithTimeout").mockImplementation((argv, options) => {
-      if (
-        argv[0] !== "git" ||
-        !argv.some((arg) => arg === REPOSITORY_URL || arg === git.endpoint)
-      ) {
+      if (argv[0] !== "git" || !argv.some((arg) => [REPOSITORY_URL, git.endpoint].includes(arg))) {
         return runCommand(argv, options);
       }
       // Translate HTTPS into this owned authenticated endpoint; the production
@@ -91,7 +87,6 @@ test.each(
       counts: { block: 0, final: 0, tool: 0 },
     });
     const broadcast = vi.fn();
-    const context = { broadcast };
     let sequence = 0;
     const errors = () =>
       JSON.stringify(
@@ -100,7 +95,7 @@ test.each(
           .map(([, data]) => data.errorMessage),
       );
     const create = async (worktree = false) => {
-      const created = await directSessionReq<{ key: string; runId: string; entry: SessionEntry }>(
+      const created = await directSessionReq<{ key: string; runId: string }>(
         "sessions.create",
         {
           agentId: "main",
@@ -115,21 +110,20 @@ test.each(
               }
             : {}),
         },
-        { ...controlUiClient, context },
+        { ...controlUiClient, context: { broadcast } },
       );
       expect(created.ok, JSON.stringify(created.error)).toBe(true);
       expect(created.payload).toMatchObject({ runStarted: true });
       const { key, runId } = created.payload!;
       const target = await loadGatewaySessionEntryReadOnlyAsync(key, { agentId: "main" });
-      const released = captureSessionControllerSettlement({
+      await captureSessionControllerSettlement({
         scope: target.storePath,
         identities: [key],
       });
-      await released;
       expect(getRpcSource(runId)).toBeUndefined();
       const entry = (await loadGatewaySessionEntryReadOnlyAsync(key, { agentId: "main" })).entry;
-      expect(entry, JSON.stringify({ key, storePath, errors: errors() })).toBeDefined();
-      return { key, runId, entry };
+      expect(entry, errors()).toBeDefined();
+      return { runId, entry };
     };
     if (operation === "refresh") {
       const warm = await create();

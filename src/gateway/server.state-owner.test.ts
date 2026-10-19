@@ -80,49 +80,47 @@ afterEach(async () => {
   vi.unstubAllEnvs();
 });
 
-it("refuses a second direct Gateway until the first finishes closing", async () => {
-  const first = await startGatewayServer(18701);
-  const closed = createDeferredCore();
-  const closing = createDeferredCore();
-  runtime.close = async () => {
-    closing.resolve();
-    await closed.promise;
-  };
-  const stop = first.close();
-  await closing.promise;
-  try {
-    await expect(startGatewayServer(18702)).rejects.toThrow("gateway state ownership");
-    expect(await readActiveGatewayLockIdentity()).toMatchObject({ pid: process.pid, port: 18701 });
-  } finally {
-    closed.resolve();
-    await stop;
-  }
-  runtime.close = async () => {};
-  const successor = await startGatewayServer(18702);
-  await successor.close();
-  expect(await readActiveGatewayLockIdentity()).toBeUndefined();
-});
-
-it("joins a lost direct owner's close once before releasing its lock", async () => {
-  const closing = createDeferredCore();
-  const closed = createDeferredCore();
-  runtime.close = vi.fn(async () => {
-    closing.resolve();
-    await closed.promise;
+function barrier() {
+  const entered = createDeferredCore();
+  const released = createDeferredCore();
+  const run = vi.fn(async () => {
+    entered.resolve();
+    await released.promise;
   });
-  const server = await startGatewayServer(18701);
-  runtime.ownerLoss.abort(new Error("ownership lost: /state/owner.lock: EIO"));
-  await closing.promise;
-  const joined = server.close();
-  try {
-    expect(runtime.close).toHaveBeenCalledOnce();
-    expect(await readActiveGatewayLockIdentity()).toMatchObject({ port: 18701 });
-  } finally {
-    closed.resolve();
-    await joined;
-  }
-  expect(await readActiveGatewayLockIdentity()).toBeUndefined();
-});
+  return { entered: entered.promise, release: () => released.resolve(), run };
+}
+
+it.each(["direct close", "owner loss"])(
+  "holds ownership until cleanup finishes: %s",
+  async (cause) => {
+    const closing = barrier();
+    runtime.close = closing.run;
+    const server = await startGatewayServer(18701);
+    if (cause === "owner loss") {
+      runtime.ownerLoss.abort(new Error("ownership lost: /state/owner.lock: EIO"));
+      await closing.entered;
+    }
+    const joined = server.close();
+    await closing.entered;
+    try {
+      expect(runtime.close).toHaveBeenCalledOnce();
+      await expect(startGatewayServer(18702)).rejects.toThrow("gateway state ownership");
+      expect(await readActiveGatewayLockIdentity()).toMatchObject({
+        pid: process.pid,
+        port: 18701,
+      });
+    } finally {
+      closing.release();
+      await joined;
+    }
+    expect(await readActiveGatewayLockIdentity()).toBeUndefined();
+    runtime.close = async () => {};
+    runtime.ownerLoss = new AbortController();
+    const successor = await startGatewayServer(18702);
+    await successor.close();
+    expect(await readActiveGatewayLockIdentity()).toBeUndefined();
+  },
+);
 
 it("requests hosted recovery only for the current server generation", async () => {
   const lock = await acquireGatewayLock({ port: 18701 });
@@ -145,21 +143,17 @@ it("requests hosted recovery only for the current server generation", async () =
 });
 
 it("closes a server opened during custody loss before rejecting startup", async () => {
-  const starting = createDeferredCore();
-  const started = createDeferredCore();
-  runtime.start = async () => {
-    starting.resolve();
-    await started.promise;
-  };
+  const starting = barrier();
+  runtime.start = starting.run;
   runtime.close = vi.fn(async () => {
     expect(await readActiveGatewayLockIdentity()).toMatchObject({ port: 18701 });
   });
   const pending = startGatewayServer(18701);
-  await starting.promise;
+  await starting.entered;
   const failure = new Error("ownership lost: /state/owner.lock: EIO");
   runtime.ownerLoss.abort(failure);
   const rejected = expect(pending).rejects.toBe(failure);
-  started.resolve();
+  starting.release();
   await rejected;
   expect(runtime.close).toHaveBeenCalledOnce();
   expect(await readActiveGatewayLockIdentity()).toBeUndefined();

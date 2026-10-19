@@ -1,5 +1,6 @@
 /** Gateway durable session-face behavior. */
 import path from "node:path";
+import { expectDefined } from "@openclaw/normalization-core";
 import { expect, test } from "vitest";
 import { SqliteBoardStore } from "../boards/sqlite-board-store.js";
 import { replaceSessionEntrySync } from "../config/sessions/session-accessor.entry.js";
@@ -115,25 +116,17 @@ test("sessions.list filters dashboard sessions by board existence instead of sav
   ]);
 
   await withClient(["operator.read", "operator.write"], async (ws) => {
-    const listed = await request<BoardList>(ws, "sessions.list", {
-      hasBoard: true,
-      rowMode: "compact",
-      limit: 50,
-    });
-
-    expect(listed.totalCount).toBe(1);
-    expect(listed.sessions).toEqual([
-      expect.objectContaining({ key: "agent:main:board", boardFace: "chat", hasBoard: true }),
-    ]);
-
-    const withoutBoards = await request<BoardList>(ws, "sessions.list", {
-      hasBoard: false,
-      limit: 50,
-    });
-    expect(withoutBoards.totalCount).toBe(1);
-    expect(withoutBoards.sessions).toEqual([
-      expect.objectContaining({ key: "agent:main:faceonly", hasBoard: false }),
-    ]);
+    for (const hasBoard of [true, false]) {
+      const listed = await request<BoardList>(ws, "sessions.list", {
+        hasBoard,
+        limit: 50,
+        ...(hasBoard ? { rowMode: "compact" } : {}),
+      });
+      const row = hasBoard
+        ? { key: "agent:main:board", boardFace: "chat", hasBoard }
+        : { key: "agent:main:faceonly", hasBoard };
+      expect(listed).toMatchObject({ totalCount: 1, sessions: [row] });
+    }
 
     await request(ws, "sessions.subscribe", {});
     const changed = onceMessage(
@@ -156,10 +149,7 @@ test("sessions.list filters dashboard sessions by board existence instead of sav
 });
 
 test("sessions.list ignores a same-owner sentinel board in an unselected store", async () => {
-  const rootStateDir = process.env.OPENCLAW_STATE_DIR;
-  if (!rootStateDir) {
-    throw new Error("OPENCLAW_STATE_DIR is required for gateway session tests");
-  }
+  const rootStateDir = expectDefined(process.env.OPENCLAW_STATE_DIR, "gateway state directory");
   const stateDir = path.join(rootStateDir, "board-selected-store-later");
   await withEnvAsync({ OPENCLAW_STATE_DIR: stateDir }, async () => {
     const firstPath = path.join(stateDir, "a-first.sqlite");
@@ -192,13 +182,7 @@ test("sessions.list ignores a same-owner sentinel board in an unselected store",
         sessions: Array<{ key: string; agentId: string; sessionId: string }>;
       }>("sessions.list", { configuredAgentsOnly: true, includeUnknown: true, hasBoard });
       expect(result.ok).toBe(true);
-      expect(
-        result.payload?.sessions.map(({ key, agentId, sessionId }) => ({
-          key,
-          agentId,
-          sessionId,
-        })),
-      ).toEqual(
+      expect(result.payload?.sessions).toMatchObject(
         !hasBoard ? [{ key: "unknown", agentId: "main", sessionId: "selected-first" }] : [],
       );
     }

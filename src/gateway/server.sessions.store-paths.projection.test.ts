@@ -62,30 +62,15 @@ test("automatic list and search projection reuse conventional state-directory pr
         const config = loadGatewayTestConfig();
         setRuntimeConfigSnapshot(config);
         const metadata = resolvePluginMetadataSnapshot({ config, allowCurrent: false });
-        // Normal Gateway requests inherit the immutable metadata prepared at startup.
         await withPluginMetadataSnapshotScope(
           metadata,
           async () => {
-            const stateDirectoryProbes: Error[] = [];
             for (const agentRuntimeOverride of ["openclaw", undefined] as const) {
-              // Search changes only the request; reuse each runtime's admitted stores.
               await seedStores(storeTemplate, agentRuntimeOverride);
               for (const search of [undefined, "unmatched-runtime-search", "openclaw"]) {
                 const request = { configuredAgentsOnly: true, includeGlobal: false, search };
-                const warm = await directSessionReq("sessions.list", request);
-                expect(warm.ok).toBe(true);
-                stateDirectoryProbes.length = 0;
-                const existsSync = fsSync.existsSync;
-                const exists = vi.spyOn(fsSync, "existsSync").mockImplementation((pathname) => {
-                  // Retain bounded provenance for probes that only reproduce in shared CI shards.
-                  if (
-                    stateDirectoryProbes.length < 3 &&
-                    (pathname === stateDir || pathname === legacyStateDir)
-                  ) {
-                    stateDirectoryProbes.push(new Error("Unexpected state-directory probe"));
-                  }
-                  return existsSync(pathname);
-                });
+                expect((await directSessionReq("sessions.list", request)).ok).toBe(true);
+                const exists = vi.spyOn(fsSync, "existsSync");
                 const environments = vi.spyOn(runtimePaths, "captureRuntimeStateEnvironment");
                 syncBuiltinESMExports();
                 try {
@@ -98,11 +83,11 @@ test("automatic list and search projection reuse conventional state-directory pr
                     search === "unmatched-runtime-search" ? 0 : agentIds.length,
                   );
                   expect.soft(environments.mock.calls.length, search ?? "list").toBe(0);
+                  const probes = exists.mock.calls.filter(
+                    ([pathname]) => pathname === stateDir || pathname === legacyStateDir,
+                  );
                   expect
-                    .soft(
-                      stateDirectoryProbes,
-                      `${search ?? "list"}: ${agentRuntimeOverride ?? "auto"}`,
-                    )
+                    .soft(probes, `${search ?? "list"}: ${agentRuntimeOverride ?? "auto"}`)
                     .toEqual([]);
                 } finally {
                   for (const spy of [exists, environments]) {
@@ -136,6 +121,7 @@ test("configured-only multi-store target preparation is reused across distinct l
     const readlink = vi.spyOn(fsSync, "readlinkSync");
     const realpath = vi.spyOn(fsSync.realpathSync, "native");
     const stat = vi.spyOn(fsSync, "statSync");
+    const spies = { matcher, lstat, readlink, realpath, stat };
     syncBuiltinESMExports();
     try {
       const first = await directSessionReq<{ path: string }>("sessions.list", {
@@ -143,13 +129,11 @@ test("configured-only multi-store target preparation is reused across distinct l
         includeGlobal: false,
       });
       expect(first).toMatchObject({ ok: true, payload: { path: "(multiple)" } });
-      expect(matcher).not.toHaveBeenCalled();
-      expect({
-        realpath: realpath.mock.calls.length,
-        stat: stat.mock.calls.length,
-      }).toEqual({ realpath: 0, stat: 0 });
+      for (const spy of [matcher, realpath, stat]) {
+        expect(spy).not.toHaveBeenCalled();
+      }
 
-      for (const spy of [matcher, lstat, readlink, realpath, stat]) {
+      for (const spy of Object.values(spies)) {
         spy.mockClear();
       }
       const second = await directSessionReq<{ path: string }>("sessions.list", {
@@ -158,15 +142,11 @@ test("configured-only multi-store target preparation is reused across distinct l
       });
 
       expect(second).toMatchObject({ ok: true, payload: { path: "(multiple)" } });
-      expect({
-        lstat: lstat.mock.calls.length,
-        matcher: matcher.mock.calls.length,
-        readlink: readlink.mock.calls.length,
-        realpath: realpath.mock.calls.length,
-        stat: stat.mock.calls.length,
-      }).toEqual({ lstat: 0, matcher: 0, readlink: 0, realpath: 0, stat: 0 });
+      for (const spy of Object.values(spies)) {
+        expect(spy).not.toHaveBeenCalled();
+      }
     } finally {
-      for (const spy of [matcher, lstat, readlink, realpath, stat]) {
+      for (const spy of Object.values(spies)) {
         spy.mockRestore();
       }
       syncBuiltinESMExports();

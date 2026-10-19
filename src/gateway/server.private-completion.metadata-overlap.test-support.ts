@@ -21,7 +21,6 @@ export function holdMetadataThroughSubagentStop(target: {
   const markerScope = new AsyncLocalStorage<boolean>();
   const nativeResultHeld = createDeferredCore();
   const releaseResult = createDeferredCore();
-  const restores: Array<() => void> = [];
   const label = `concurrent metadata ${target.sessionId}`;
   let intercepted = false;
   let resultHeld = false;
@@ -29,7 +28,6 @@ export function holdMetadataThroughSubagentStop(target: {
   let markerEnqueued = false;
   let producerPath: string | undefined;
   let releaseReason: "marker-enqueued" | "bookkeeping-error" | "cleanup" | "test-abort" | undefined;
-  let producer: Promise<void> | undefined;
   let producerOutcome: Promise<{ ok: true } | { ok: false; error: unknown }> | undefined;
   let disposal: Promise<void> | undefined;
   const release = (reason: NonNullable<typeof releaseReason>) => {
@@ -88,7 +86,6 @@ export function holdMetadataThroughSubagentStop(target: {
     }
     return pending;
   });
-  restores.push(() => queueSpy.mockRestore());
 
   const captureExecution = executionOwner.captureOpenClawAgentDatabaseExecution;
   const executionSpy = vi
@@ -124,7 +121,6 @@ export function holdMetadataThroughSubagentStop(target: {
         },
       });
     });
-  restores.push(() => executionSpy.mockRestore());
 
   const persistMarker = killSession.persistSubagentAbortedLastRun;
   const markerSpy = vi
@@ -139,7 +135,6 @@ export function holdMetadataThroughSubagentStop(target: {
       }
       return markerScope.run(true, () => persistMarker(params));
     });
-  restores.push(() => markerSpy.mockRestore());
 
   const completeBookkeeping = bookkeeping.completeCleanupBookkeeping;
   const bookkeepingSpy = vi
@@ -156,7 +151,7 @@ export function holdMetadataThroughSubagentStop(target: {
       target.beforeMetadata?.();
       // A new root alone retains the RPC's AsyncWorkScope. This producer must not block
       // that scope while waiting for the mandatory marker which the RPC has yet to enqueue.
-      producer = runOutsideAsyncWorkScope(() =>
+      const producer = runOutsideAsyncWorkScope(() =>
         runWithGatewayIndependentRootWorkAdmission(
           () => producerScope.run(true, writeMetadata),
           "test:private-completion-metadata",
@@ -184,15 +179,12 @@ export function holdMetadataThroughSubagentStop(target: {
         throw error;
       }
     });
-  restores.push(() => bookkeepingSpy.mockRestore());
 
   return {
     label,
     async assertCompleted() {
-      expect(intercepted).toBe(true);
-      expect(resultHeld).toBe(true);
-      expect(bookkeepingReturned).toBe(true);
-      expect(markerEnqueued).toBe(true);
+      const progress = [intercepted, resultHeld, bookkeepingReturned, markerEnqueued];
+      expect(progress).toEqual([true, true, true, true]);
       expect(releaseReason).toBe("marker-enqueued");
       expect(await producerOutcome).toEqual({ ok: true });
     },
@@ -209,8 +201,8 @@ export function holdMetadataThroughSubagentStop(target: {
             throw outcome.error;
           }
         } finally {
-          for (const restore of restores.toReversed()) {
-            restore();
+          for (const spy of [bookkeepingSpy, markerSpy, executionSpy, queueSpy]) {
+            spy.mockRestore();
           }
           producerScope.disable();
           markerScope.disable();
