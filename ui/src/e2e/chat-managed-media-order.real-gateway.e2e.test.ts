@@ -438,6 +438,13 @@ suite.define(() => {
                   .toEqual([true, true]);
               };
               await assertDecoded();
+              // The terminal session recap arrives independently of final text and image decode.
+              // It adds height beside the bubble, so admit it before freezing live ancestry.
+              await page
+                .locator(".chat-group.assistant")
+                .filter({ hasText: intro })
+                .locator(".chat-turn-recap")
+                .waitFor({ state: "visible" });
               const liveNodes = await bubble.evaluateHandle((element) => ({
                 bubble: element,
                 row: element.closest("[data-chat-row-key]"),
