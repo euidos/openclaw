@@ -10,7 +10,7 @@ import "../components/app-topbar-solid.tsx";
 import "../components/assistant-panel-solid.tsx";
 import type { RouteId } from "../app-routes.ts";
 import "../components/resizable-divider.ts";
-import type { AppSidebarBase } from "../components/app-sidebar-base.ts";
+import type { AppSidebarElement } from "../components/app-sidebar.tsx";
 import type { CommandPaletteTargetDetail } from "../components/command-palette-contract.ts";
 import { askBrandLabel } from "../components/theme-brand-label.ts";
 import type { ThemeModeChangeDetail } from "../components/theme-mode-toggle.ts";
@@ -119,9 +119,12 @@ export class ShellOwner
   // Moving its element preserves session controllers and the resident pet
   // instead of resetting their lifecycle at every responsive breakpoint.
   readonly navigationSidebar: HTMLElement &
-    Partial<Pick<AppSidebarBase, "navigationVisible" | "updateComplete">> = document.createElement(
-    APP_SIDEBAR_ELEMENT.tagName,
-  );
+    Partial<
+      Pick<
+        AppSidebarElement,
+        "navigationVisible" | "updateComplete" | "findSidebarHovercardRowByKey"
+      >
+    > = document.createElement(APP_SIDEBAR_ELEMENT.tagName);
   // Where "Back to app" / Escape leaves the settings takeover; falls back to
   // chat (the app default route) when settings was the entry point.
   lastWorkspaceLocation: ShellNavigationHost["lastWorkspaceLocation"] = null;
@@ -513,14 +516,7 @@ export class ShellOwner
 
   readonly openNewSession = this.shellNavigation.openNewSession.bind(this.shellNavigation);
 
-  // Shipped Mac app builds without web chrome still drive these handlers.
-  readonly handleNativeToggleSidebar = this.toggleNavigationSurface;
-  readonly handleNativeOpenSearch = this.shellChrome.openPalette;
-  readonly handleNativeToggleSearch = this.shellChrome.handleNativeToggleSearch;
   readonly handleNativeNewSession = this.shellChrome.handleNativeNewSession;
-  readonly handleNativeNavigate = this.shellChrome.handleNativeNavigate;
-  readonly handleWindowResize = this.shellChrome.handleWindowResize;
-  readonly handleDocumentKeydown = this.shellChrome.handleDocumentKeydown;
   get pendingDebugOverlayMode() {
     return this.shellChrome.pendingDebugOverlayMode;
   }
@@ -545,7 +541,6 @@ export class ShellOwner
       ),
     });
   };
-  readonly handleShellNavDrawerToggle = this.shellChrome.handleShellNavDrawerToggle;
   readonly handleCommandPaletteSlashCommand = this.shellChrome.handleCommandPaletteSlashCommand;
   readonly restorePendingLazyAction = this.shellChrome.restorePendingLazyAction;
   readonly nativeNavCollapsed = this.shellChrome.nativeNavCollapsed;
