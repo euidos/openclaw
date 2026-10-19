@@ -1,29 +1,27 @@
 import { execFileSync } from "node:child_process";
 import fs, { type FileHandle } from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { createAgentToolExecutionBudget } from "./agent-tool-source-execution-guard.js";
 import { createHostWorkspaceEditTool, createHostWorkspaceWriteTool } from "./agent-tools.read.js";
 import { createApplyPatchTool } from "./apply-patch.js";
 import { withGatewayToolCallerIdentity } from "./tools/gateway-caller-context.js";
 
 describe("unrestricted host tool writes", () => {
+  const tempDirs = useAutoCleanupTempDirTracker(afterEach);
   let tempDir = "";
-
-  afterEach(async () => {
-    vi.restoreAllMocks();
-    if (tempDir) {
-      await fs.rm(tempDir, { recursive: true, force: true });
-      tempDir = "";
-    }
-  });
+  afterEach(() => vi.restoreAllMocks());
 
   async function createFile(content: string) {
-    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-host-write-"));
+    tempDir = tempDirs.make("openclaw-host-write-");
     const filePath = path.join(tempDir, "important.txt");
     await fs.writeFile(filePath, content);
     return filePath;
+  }
+
+  function write(filePath: string, content: string) {
+    return createHostWorkspaceWriteTool(tempDir).execute("write", { path: filePath, content });
   }
 
   it.each([
@@ -45,25 +43,20 @@ describe("unrestricted host tool writes", () => {
         isCurrent: () => budgetCurrent,
       });
       let prepared = false;
-      const realOpen = fs.open.bind(fs);
-      vi.spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
-        const handle = await realOpen(target, flags as never, mode as never);
-        if (String(target) === filePath && flags === "r+") {
-          const read = handle.read.bind(handle);
-          handle.read = (async (...args: Parameters<typeof read>) => {
-            const result = await read(...args);
-            prepared = true;
-            if (authority === "aborted") {
-              generation.abort(new Error("Permission change"));
-            } else if (authority === "revoked") {
-              currentClaim = undefined;
-            } else if (authority === "budget-revoked") {
-              budgetCurrent = false;
-            }
-            return result;
-          }) as typeof handle.read;
-        }
-        return handle;
+      interceptUpdate(filePath, (handle) => {
+        const read = handle.read.bind(handle);
+        handle.read = (async (...args: Parameters<typeof read>) => {
+          const result = await read(...args);
+          prepared = true;
+          if (authority === "aborted") {
+            generation.abort(new Error("Permission change"));
+          } else if (authority === "revoked") {
+            currentClaim = undefined;
+          } else if (authority === "budget-revoked") {
+            budgetCurrent = false;
+          }
+          return result;
+        }) as typeof handle.read;
       });
       const options = { workspaceOnly: false, abortSignal: generation.signal };
       const execute = () => {
@@ -221,13 +214,9 @@ describe("unrestricted host tool writes", () => {
   );
 
   it("writes empty content", async () => {
-    const content = "";
     const filePath = await createFile("replace me\n");
-
-    const tool = createHostWorkspaceWriteTool(tempDir);
-    await tool.execute("call-1", { path: filePath, content });
-
-    await expect(fs.readFile(filePath, "utf8")).resolves.toBe(content);
+    await write(filePath, "");
+    await expect(fs.readFile(filePath, "utf8")).resolves.toBe("");
   });
 
   it.runIf(process.platform !== "win32")("writes through an existing symlink", async () => {
@@ -235,8 +224,7 @@ describe("unrestricted host tool writes", () => {
     const linkPath = path.join(tempDir, "linked.txt");
     await fs.symlink(targetPath, linkPath);
 
-    const tool = createHostWorkspaceWriteTool(tempDir);
-    await tool.execute("call-1", { path: linkPath, content: "replacement" });
+    await write(linkPath, "replacement");
 
     expect((await fs.lstat(linkPath)).isSymbolicLink()).toBe(true);
     await expect(fs.readFile(targetPath, "utf8")).resolves.toBe("replacement");
@@ -249,10 +237,7 @@ describe("unrestricted host tool writes", () => {
     const filePath = await createFile(originalContent);
     await fs.chmod(filePath, 0o222);
 
-    const tool = createHostWorkspaceWriteTool(tempDir);
-    await expect(
-      tool.execute("call-1", { path: filePath, content: "replacement" }),
-    ).rejects.toMatchObject({ code: "EACCES" });
+    await expect(write(filePath, "replacement")).rejects.toMatchObject({ code: "EACCES" });
 
     await fs.chmod(filePath, 0o644);
     await expect(fs.readFile(filePath, "utf8")).resolves.toBe(originalContent);
@@ -266,8 +251,7 @@ describe("unrestricted host tool writes", () => {
     await fs.link(filePath, aliasPath);
     const before = await fs.stat(filePath);
 
-    const tool = createHostWorkspaceWriteTool(tempDir);
-    await tool.execute("call-1", { path: filePath, content });
+    await write(filePath, content);
 
     const after = await fs.stat(filePath);
     expect(after.ino).toBe(before.ino);
@@ -294,8 +278,7 @@ describe("unrestricted host tool writes", () => {
     });
     const fallback = vi.spyOn(fs, "writeFile").mockResolvedValue(undefined);
 
-    const tool = createHostWorkspaceWriteTool(tempDir);
-    await tool.execute("call-1", { path: fifoPath, content: "replacement" }).catch(() => undefined);
+    await write(fifoPath, "replacement").catch(() => undefined);
 
     expect(fallback).toHaveBeenCalledWith(fifoPath, "replacement", "utf-8");
     expect(fifoOpenFlags).toEqual([]);

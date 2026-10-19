@@ -15,6 +15,17 @@ import { withGatewayToolCallerIdentity } from "./tools/gateway-caller-context.js
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
+function writer(root: string, options?: Parameters<typeof createHostWorkspaceWriteTool>[1]) {
+  const tool = createHostWorkspaceWriteTool(root, options);
+  return (filePath: string, content: string) => tool.execute("write", { path: filePath, content });
+}
+
+function editor(root: string, options?: Parameters<typeof createHostWorkspaceEditTool>[1]) {
+  const tool = createHostWorkspaceEditTool(root, options);
+  return (filePath: string, oldText: string, newText: string) =>
+    tool.execute("edit", { path: filePath, edits: [{ oldText, newText }] });
+}
+
 describe("workspace mutation authority", () => {
   afterEach(() => {
     __setFsSafeTestHooksForTest();
@@ -88,15 +99,9 @@ describe("workspace mutation authority", () => {
           );
         }
         if (kind === "edit") {
-          return createHostWorkspaceEditTool(root, options).execute("workspace-edit", {
-            path: "memory.md",
-            edits: [{ oldText: "original", newText: "replacement" }],
-          });
+          return editor(root, options)("memory.md", "original", "replacement");
         }
-        return createHostWorkspaceWriteTool(root, options).execute("workspace-write", {
-          path: "memory.md",
-          content: "replacement\n",
-        });
+        return writer(root, options)("memory.md", "replacement\n");
       };
 
       const pending = withGatewayToolCallerIdentity(
@@ -142,14 +147,14 @@ describe("workspace mutation authority", () => {
           }
         },
       });
-      const tool = createHostWorkspaceWriteTool(root, { workspaceOnly: true });
+      const write = writer(root, { workspaceOnly: true });
       const pending = withGatewayToolCallerIdentity(
         {
           agentId: "main",
           sessionKey: "agent:main:workspace-mkdir",
           receiptAuthority: () => current,
         },
-        () => tool.execute("workspace-mkdir", { path: "nested/file.txt", content: "new" }),
+        () => write("nested/file.txt", "new"),
       );
 
       await expect(pending).rejects.toThrow("authority is no longer active");
@@ -164,14 +169,8 @@ describe("workspace mutation authority", () => {
     const filePath = path.join(root, "~", "file.txt");
     const options = { workspaceOnly: true };
 
-    await createHostWorkspaceWriteTool(root, options).execute("literal-tilde-write", {
-      path: filePath,
-      content: "original",
-    });
-    await createHostWorkspaceEditTool(root, options).execute("literal-tilde-edit", {
-      path: filePath,
-      edits: [{ oldText: "original", newText: "replacement" }],
-    });
+    await writer(root, options)(filePath, "original");
+    await editor(root, options)(filePath, "original", "replacement");
 
     await expect(fs.readFile(filePath, "utf8")).resolves.toBe("replacement");
   });
@@ -182,9 +181,7 @@ describe("workspace mutation authority", () => {
       const root = tempDirs.make("openclaw-workspace-root-link-");
       const alias = path.join(root, "self");
       await fs.symlink(root, alias, "dir");
-      const tool = createHostWorkspaceWriteTool(root, { workspaceOnly: true });
-
-      await tool.execute("workspace-root-link", { path: "self/file.txt", content: "new" });
+      await writer(root, { workspaceOnly: true })("self/file.txt", "new");
 
       await expect(fs.readFile(path.join(root, "file.txt"), "utf8")).resolves.toBe("new");
       expect((await fs.lstat(alias)).isSymbolicLink()).toBe(true);
@@ -201,14 +198,8 @@ describe("host file paths", () => {
     const modelPath = path.join("~", path.relative(home, filePath));
 
     await withEnvAsync({ OPENCLAW_HOME: openclawHome }, async () => {
-      await createHostWorkspaceWriteTool(openclawHome).execute("write", {
-        path: modelPath,
-        content: "original",
-      });
-      await createHostWorkspaceEditTool(openclawHome).execute("edit", {
-        path: modelPath,
-        edits: [{ oldText: "original", newText: "replacement" }],
-      });
+      await writer(openclawHome)(modelPath, "original");
+      await editor(openclawHome)(modelPath, "original", "replacement");
       expect(await fs.readFile(filePath, "utf8")).toBe("replacement");
       expect(await fs.readdir(openclawHome)).toEqual([]);
     });
@@ -224,10 +215,7 @@ describe("host file paths", () => {
     await fs.symlink(outside, path.join(root, "escape"));
 
     await expect(
-      createHostWorkspaceEditTool(root, { workspaceOnly: true }).execute("escape", {
-        path: "escape/secret.txt",
-        edits: [{ oldText: "secret", newText: "changed" }],
-      }),
+      editor(root, { workspaceOnly: true })("escape/secret.txt", "secret", "changed"),
     ).rejects.toThrow("Path escapes workspace root");
     expect(await fs.readFile(path.join(outside, "secret.txt"), "utf8")).toBe("secret");
   });

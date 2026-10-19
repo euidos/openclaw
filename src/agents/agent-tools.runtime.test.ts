@@ -1,5 +1,6 @@
 import { expectDefined } from "@openclaw/normalization-core";
 import { describe, expect, it, vi } from "vitest";
+import { createDeferred as deferred } from "../../test/helpers/promise.js";
 import "./test-helpers/fast-coding-tools.js";
 import "./test-helpers/fast-openclaw-tools.js";
 import { wrapToolWithAbortSignal } from "./agent-tools.abort.js";
@@ -24,16 +25,6 @@ function tool(execute: AnyAgentTool["execute"], name = "tool"): AnyAgentTool {
   return { ...stubTool(name), label: name, execute };
 }
 
-function deferred<T = void>() {
-  let resolve!: (value: T) => void;
-  let reject!: (reason: unknown) => void;
-  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
-}
-
 async function flushMicrotasks() {
   await Promise.resolve();
   await Promise.resolve();
@@ -44,6 +35,21 @@ function yieldTool(runAbort: AbortController, onYield = () => runAbort.abort(han
     createSessionsYieldTool({ sessionId: "requester", claimYield: () => true, onYield }),
     runAbort.signal,
   );
+}
+
+function prepareWithAbort(
+  runAbort: AbortController,
+  source: NonNullable<ReturnType<typeof getInternalToolExecutionPreparer>>,
+) {
+  return expectDefined(
+    getInternalToolExecutionPreparer(
+      wrapToolWithAbortSignal(
+        attachInternalToolExecutionPreparer(tool(vi.fn()), source),
+        runAbort.signal,
+      ),
+    ),
+    "abort-adapted preparer",
+  )({ toolCallId: "aborted", args: {} });
 }
 
 describe("wrapToolWithAbortSignal", () => {
@@ -184,15 +190,7 @@ describe("wrapToolWithAbortSignal", () => {
     }));
     const runAbort = new AbortController();
     runAbort.abort();
-    const wrapped = wrapToolWithAbortSignal(
-      attachInternalToolExecutionPreparer(tool(vi.fn()), source),
-      runAbort.signal,
-    );
-    const prepare = expectDefined(
-      getInternalToolExecutionPreparer(wrapped),
-      "abort-adapted preparer",
-    );
-    await expect(prepare({ toolCallId: "aborted", args: {} })).rejects.toMatchObject({
+    await expect(prepareWithAbort(runAbort, source)).rejects.toMatchObject({
       name: "AbortError",
     });
     expect(source).not.toHaveBeenCalled();
@@ -209,15 +207,7 @@ describe("wrapToolWithAbortSignal", () => {
       return { kind: "ready" as const, args: {}, execute: body, dispose };
     });
     const runAbort = new AbortController();
-    const wrapped = wrapToolWithAbortSignal(
-      attachInternalToolExecutionPreparer(tool(vi.fn()), source),
-      runAbort.signal,
-    );
-    const prepare = expectDefined(
-      getInternalToolExecutionPreparer(wrapped),
-      "abort-adapted preparer",
-    );
-    const preparing = prepare({ toolCallId: "aborted", args: {} });
+    const preparing = prepareWithAbort(runAbort, source);
     await started.promise;
     runAbort.abort();
     await expect(preparing).rejects.toMatchObject({ name: "AbortError" });
@@ -229,14 +219,7 @@ describe("wrapToolWithAbortSignal", () => {
 });
 
 vi.mock("./channel-tools.js", () => ({
-  listChannelAgentTools: () => [
-    {
-      name: "plugin_login",
-      description: "plugin_login stub",
-      parameters: { type: "object", properties: {} },
-      execute: vi.fn(),
-    },
-  ],
+  listChannelAgentTools: () => [stubTool("plugin_login")],
   copyChannelAgentToolMeta: <T>(value: T) => value,
   getChannelAgentToolMeta: () => undefined,
 }));
@@ -251,21 +234,17 @@ it("restricts node-originated runs to the node-safe tool subset", () => {
 
 describe("agent ring-zero tool context", () => {
   it("isolates concurrent async runs and clears the scope after settlement", async () => {
-    const firstTool = tool(async () => emptyResult(), "first");
-    const secondTool = tool(async () => emptyResult(), "second");
     const firstReady = deferred();
     const secondReady = deferred();
     const release = deferred();
-    const first = runWithAgentRingZeroTools([firstTool], async () => {
-      firstReady.resolve();
-      await release.promise;
-      return getActiveAgentRingZeroTools();
-    });
-    const second = runWithAgentRingZeroTools([secondTool], async () => {
-      secondReady.resolve();
-      await release.promise;
-      return getActiveAgentRingZeroTools();
-    });
+    const run = (name: string, ready: ReturnType<typeof deferred<void>>) =>
+      runWithAgentRingZeroTools([tool(async () => emptyResult(), name)], async () => {
+        ready.resolve();
+        await release.promise;
+        return getActiveAgentRingZeroTools();
+      });
+    const first = run("first", firstReady);
+    const second = run("second", secondReady);
     await Promise.all([firstReady.promise, secondReady.promise]);
     expect(getActiveAgentRingZeroTools()).toEqual([]);
     release.resolve();

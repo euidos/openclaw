@@ -42,6 +42,7 @@ import { runWithAgentRingZeroTools } from "./agent-tools.ring-zero-context.js";
 import type { AnyAgentTool } from "./agent-tools.types.js";
 import { createOpenClawTools } from "./openclaw-tools.js";
 import { resolveOpenClawPluginToolInputs } from "./openclaw-tools.plugin-context.js";
+import { stubTool } from "./test-helpers/fast-tool-stubs.js";
 
 const MEMORY_PATH = "memory/2026-08-22.md";
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
@@ -49,10 +50,8 @@ const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 // Concrete plugin metadata lets the production projection distinguish equal tool names.
 function persistenceTool(pluginId: string, name = "save_memory"): AnyAgentTool {
   const tool: AnyAgentTool = {
-    name,
+    ...stubTool(name),
     label: name,
-    description: "Persist a memory",
-    parameters: { type: "object", properties: {} },
     execute: vi.fn<AnyAgentTool["execute"]>(async () => ({
       content: [{ type: "text", text: "saved" }],
       details: {},
@@ -62,25 +61,42 @@ function persistenceTool(pluginId: string, name = "save_memory"): AnyAgentTool {
   return tool;
 }
 
+function flushContext(
+  overrides: Partial<NonNullable<OpenClawCodingToolsOptions["memoryFlushTools"]>> = {},
+) {
+  return {
+    flushId: "same-compaction-cycle",
+    ownerPluginId: "memory-provider",
+    persistenceToolNames: ["save_memory"],
+    lookupToolNames: [],
+    recordPersistenceToolSuccess: vi.fn(),
+    ...overrides,
+  };
+}
+
 // Exercise the full assembly and policy boundary with a lightweight plugin tool factory.
 function assembleProviderFlush(tools: AnyAgentTool[], options: OpenClawCodingToolsOptions = {}) {
   vi.mocked(createOpenClawTools).mockReturnValueOnce(tools);
-  const recordPersistenceToolSuccess = vi.fn();
+  const memoryFlushTools = flushContext();
   const assembled = createOpenClawCodingTools({
     workspaceDir: tempDirs.make("openclaw-provider-flush-"),
     trigger: "memory",
     senderIsOwner: false,
     wrapBeforeToolCallHook: false,
-    memoryFlushTools: {
-      flushId: "same-compaction-cycle",
-      ownerPluginId: "memory-provider",
-      persistenceToolNames: ["save_memory"],
-      lookupToolNames: [],
-      recordPersistenceToolSuccess,
-    },
+    memoryFlushTools,
     ...options,
   });
-  return { assembled, recordPersistenceToolSuccess };
+  return { assembled, recordPersistenceToolSuccess: memoryFlushTools.recordPersistenceToolSuccess };
+}
+
+function assembleFileFlush(options: OpenClawCodingToolsOptions = {}) {
+  return createOpenClawCodingTools({
+    workspaceDir: tempDirs.make("openclaw-file-flush-"),
+    trigger: "memory",
+    memoryFlushWritePath: MEMORY_PATH,
+    senderIsOwner: true,
+    ...options,
+  });
 }
 
 describe("memory flush writer availability", () => {
@@ -111,13 +127,9 @@ describe("memory flush writer availability", () => {
       ],
       {
         config: { tools: { deny: ["get_memory"] } },
-        memoryFlushTools: {
-          flushId: "same-compaction-cycle",
-          ownerPluginId: "memory-provider",
-          persistenceToolNames: ["save_memory"],
+        memoryFlushTools: flushContext({
           lookupToolNames: ["find_memory", "get_memory"],
-          recordPersistenceToolSuccess: vi.fn(),
-        },
+        }),
       },
     );
 
@@ -142,13 +154,7 @@ describe("memory flush writer availability", () => {
           if (arm === "provider") {
             return assembleProviderFlush([persistenceTool("memory-provider")]).assembled;
           }
-          return createOpenClawCodingTools({
-            workspaceDir: tempDirs.make("openclaw-file-flush-"),
-            trigger: "memory",
-            memoryFlushWritePath: MEMORY_PATH,
-            senderIsOwner: true,
-            includeToolSearchControls: true,
-          });
+          return assembleFileFlush({ includeToolSearchControls: true });
         },
       );
       expect(tools.map((tool) => tool.name).toSorted()).toEqual([
@@ -205,12 +211,7 @@ describe("memory flush writer availability", () => {
   it("rejects an empty declaration without an owned writer", () => {
     expect(() =>
       assembleProviderFlush([], {
-        memoryFlushTools: {
-          flushId: "same-compaction-cycle",
-          ownerPluginId: "memory-provider",
-          persistenceToolNames: [],
-          recordPersistenceToolSuccess: vi.fn(),
-        },
+        memoryFlushTools: flushContext({ persistenceToolNames: [] }),
       }),
     ).toThrow(MemoryFlushToolsUnavailableError);
   });
@@ -252,28 +253,13 @@ describe("memory flush writer availability", () => {
   it.each([
     {
       name: "denied by policy",
-      config: { tools: { deny: ["write"] } },
-      messageProvider: undefined,
-      writable: false,
+      options: { config: { tools: { deny: ["write"] } } },
       warning: true,
     },
-    {
-      name: "excluded by transport",
-      config: undefined,
-      messageProvider: "node",
-      writable: false,
-      warning: false,
-    },
-  ])("reports a writer $name", ({ config, messageProvider, writable, warning }) => {
-    const tools = createOpenClawCodingTools({
-      workspaceDir: tempDirs.make("openclaw-flush-writer-"),
-      config,
-      messageProvider,
-      trigger: "memory",
-      memoryFlushWritePath: MEMORY_PATH,
-      senderIsOwner: true,
-    });
-    expect(tools.some((tool) => tool.name === "write")).toBe(writable);
+    { name: "excluded by transport", options: { messageProvider: "node" }, warning: false },
+  ])("reports a writer $name", ({ options, warning }) => {
+    const tools = assembleFileFlush(options);
+    expect(tools.some((tool) => tool.name === "write")).toBe(false);
     const flushWarnings = warnings.filter((line) => line.includes("memory flush cannot persist"));
     expect(flushWarnings).toEqual(warning ? [expect.stringContaining(MEMORY_PATH)] : []);
   });
