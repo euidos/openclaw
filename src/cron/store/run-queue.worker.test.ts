@@ -1,6 +1,5 @@
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { loseFirstCronMutationReply } from "../../../test/helpers/cron/runtime-mutation.js";
-import { executeExistingOpenClawStateRead } from "../../state/openclaw-state-db-readonly.js";
 import { captureOpenClawStateWorkerContext } from "../../state/openclaw-state-worker-context.js";
 import type { OpenClawStateWorkerContext } from "../../state/openclaw-state-worker-context.types.js";
 import { executeOpenClawStateWorker } from "../../state/openclaw-state-worker-store.js";
@@ -9,41 +8,27 @@ import {
   type OpenClawTestState,
 } from "../../test-utils/openclaw-test-state.js";
 import { resolveCronJobConfigRevision } from "../config-revision.js";
-import { projectCronRunHistoryPage } from "../run-history.js";
-import { saveCronStore } from "../store.js";
-import type { CronJob, CronJobPatch } from "../types.js";
-import { readCronRunHistoryCandidates, readCronRunHistoryRecords } from "./read-only.js";
-import type {
-  CronQueuedRun,
-  CronRunQueueOperations,
-  CronRunRequestContext,
-} from "./run-queue.types.js";
+import type { CronJob } from "../types.js";
+import { readCronRunHistoryCandidates } from "./read-only.js";
+import {
+  queueJob,
+  queueStore,
+  requestFor,
+  scheduled as scheduledAt,
+  type QueueRequest,
+} from "./run-queue.test-support.js";
+import type { CronQueuedRun } from "./run-queue.types.js";
 import type { CronRunReceiptHandle } from "./run-receipt.types.js";
-import { createCronScheduledRunId } from "./run-request-id.js";
 
 const now = 1_800_000_000_000;
 let fixture: OpenClawTestState;
 let context: OpenClawStateWorkerContext;
-type Request = CronRunQueueOperations["cron.requestRuns"]["input"]["requests"][number];
-
-function requestFor(current: CronJob, input: Omit<Request, "jobId" | "configRevision">): Request {
-  return { jobId: current.id, configRevision: resolveCronJobConfigRevision(current), ...input };
-}
-
 const jobIds = (runs: CronQueuedRun[]) => runs.map(({ job: entry }) => entry.id);
 const runIds = (runs: { runReceipt: CronRunReceiptHandle }[]) =>
   runs.map(({ runReceipt }) => runReceipt.receiptId);
-const rejected = (request: Request, reason = "already-requested") => [
+const rejected = (request: QueueRequest, reason = "already-requested") => [
   { jobId: request.jobId, receiptId: request.receiptId, reason },
 ];
-
-async function readHistoryRecords(storeKey: string) {
-  const { records } = await readCronRunHistoryCandidates(storeKey);
-  return readCronRunHistoryRecords(
-    storeKey,
-    records.map((record) => record.id),
-  );
-}
 
 beforeAll(async () => {
   fixture = await createOpenClawTestState({ label: "cron-worker-queue" });
@@ -55,110 +40,10 @@ afterAll(async () => {
   await fixture?.cleanup();
 });
 
-function job(id: string, overrides: Partial<CronJob> = {}): CronJob {
-  return {
-    id,
-    name: id,
-    agentId: "main",
-    enabled: true,
-    createdAtMs: now - 1000,
-    updatedAtMs: now - 1000,
-    schedule: { kind: "every", everyMs: 60_000 },
-    sessionTarget: "isolated",
-    wakeMode: "next-heartbeat",
-    payload: { kind: "command", argv: ["echo", id] },
-    delivery: { mode: "none" },
-    state: { nextRunAtMs: now },
-    ...overrides,
-  };
-}
-
-async function store(label: string, jobs: CronJob[]) {
-  const storeKey = fixture.statePath("cron", `${label}.json`);
-  await saveCronStore(storeKey, { version: 1, jobs });
-  const read = async () => {
-    const result = await executeOpenClawStateWorker(context, {
-      type: "cron.loadMutable",
-      input: { storeKey },
-    });
-    if (!result.ok) {
-      throw new Error(result.error.message);
-    }
-    return result.loaded.store;
-  };
-  return {
-    storeKey,
-    read,
-    history: async (runId?: string) =>
-      projectCronRunHistoryPage(await readHistoryRecords(storeKey), { storeKey, runId }),
-    recover: () =>
-      executeOpenClawStateWorker(context, {
-        type: "cron.recoverRuns",
-        input: { storeKey, nowMs: now + 2 },
-      }),
-    readReceipt: async (handle: CronRunReceiptHandle) => {
-      const result = await executeExistingOpenClawStateRead(
-        { path: context.admission.databasePath, env: context.environment },
-        {
-          type: "cron.currentReceipt",
-          handle,
-          includeJob: false,
-          includeAvailability: false,
-        },
-        { context },
-      );
-      if (!result?.ok || result.type !== "cron.currentReceipt") {
-        throw new Error("Cron receipt read failed");
-      }
-      return result.facts.receipt;
-    },
-    request: (requests: CronRunQueueOperations["cron.requestRuns"]["input"]["requests"]) =>
-      executeOpenClawStateWorker(context, {
-        type: "cron.requestRuns",
-        input: { storeKey, nowMs: now, requests },
-      }),
-    drain: (
-      requests: CronRunRequestContext[] = [],
-      maxConcurrentRuns = 1,
-      schedulingPaused = false,
-    ) =>
-      executeOpenClawStateWorker(context, {
-        type: "cron.drainQueue",
-        input: { storeKey, nowMs: now + 1, requests, maxConcurrentRuns, schedulingPaused },
-      }),
-    cancel: (receiptIds: string[], status?: "skipped" | "superseded") =>
-      executeOpenClawStateWorker(context, {
-        type: "cron.cancelRequests",
-        input: { storeKey, receiptIds, nowMs: now + 2, reason: "synthetic cancellation", status },
-      }),
-    update: (id: string, patch: CronJobPatch) =>
-      executeOpenClawStateWorker(context, {
-        type: "cron.mutateJobs",
-        input: {
-          storeKey,
-          jobMutation: { kind: "update", id, patch, options: { captured: false } },
-          snapshot: { nowMs: now + 1 },
-        },
-      }),
-    remove: (id: string) =>
-      executeOpenClawStateWorker(context, {
-        type: "cron.mutateJobs",
-        input: {
-          storeKey,
-          jobMutation: { kind: "remove", ids: [id] },
-          snapshot: { nowMs: now + 1 },
-        },
-      }),
-  };
-}
-
-function scheduled(storeKey: string, current: CronJob) {
-  return requestFor(current, {
-    receiptId: createCronScheduledRunId(storeKey, current.id, now),
-    scheduledSlotMs: now,
-    mode: "scheduled" as const,
-  });
-}
+const job = (id: string, overrides?: Partial<CronJob>) => queueJob(id, now, overrides);
+const store = (label: string, jobs: CronJob[]) =>
+  queueStore(fixture.statePath("cron", `${label}.json`), jobs, now, () => context);
+const scheduled = (storeKey: string, current: CronJob) => scheduledAt(storeKey, current, now);
 
 it("keeps the first execution link across binding retries without changing the run claim", async () => {
   const current = job("execution-link");

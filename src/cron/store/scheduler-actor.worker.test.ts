@@ -16,6 +16,7 @@ import { projectCronRunHistoryPage } from "../run-history.js";
 import type { CronJob } from "../types.js";
 import { loadCronStoreFromDatabase } from "./load.kernel.js";
 import { readCronRunRecordsInDatabase } from "./run-history.kernel.js";
+import { queueJob } from "./run-queue.test-support.js";
 import { cancelCronRequestsInWorker } from "./run-queue.worker.js";
 import { ensureCronRunReceiptSchema } from "./run-receipt-store.js";
 import { saveCronStoreInDatabase } from "./save.kernel.js";
@@ -30,6 +31,11 @@ const snapshot: CronSchedulerSnapshot = {
 let fixture: OpenClawTestState;
 let database: ReturnType<typeof openOpenClawStateDatabase>;
 const active = new Map<string, string>();
+type StartOptions = Partial<CronSchedulerOperations["cron.schedulerStart"]["input"]>;
+type TickInput = Omit<
+  CronSchedulerOperations["cron.schedulerTick"]["input"],
+  "storeKey" | "nowMs" | "monotonicMs"
+>;
 const cronSchedule = { kind: "cron", expr: "* * * * *", tz: "UTC", staggerMs: 0 } as const;
 const jobIds = (runs: { job: CronJob }[]) => runs.map(({ job: entry }) => entry.id);
 const immediate = (count: number) => ({
@@ -62,21 +68,13 @@ afterAll(async () => {
 });
 
 function job(id: string, dueAtMs: number, overrides: Partial<CronJob> = {}): CronJob {
-  return {
-    id,
-    name: id,
-    agentId: "main",
-    enabled: true,
+  return queueJob(id, now, {
     createdAtMs: now - 24 * 60 * minute,
     updatedAtMs: now - 24 * 60 * minute,
     schedule: { kind: "every", everyMs: minute, anchorMs: dueAtMs },
-    sessionTarget: "isolated",
-    wakeMode: "next-heartbeat",
-    payload: { kind: "command", argv: ["echo", id] },
-    delivery: { mode: "none" },
     state: { nextRunAtMs: dueAtMs },
     ...overrides,
-  };
+  });
 }
 
 function withinWorker<T>(run: () => T): T {
@@ -99,17 +97,14 @@ function storedScheduler(label: string, jobs: CronJob[]) {
   const storeKey = fixture.statePath("cron", `${label}.json`);
   const channelName = `cron-scheduler-test:${storeKey}`;
   save(storeKey, jobs);
-  const start = (
-    atMs = now,
-    options: Partial<CronSchedulerOperations["cron.schedulerStart"]["input"]> = {},
-  ) => {
+  const run = (command: Parameters<typeof runCronSchedulerInWorker>[1]) =>
+    withinWorker(() => runCronSchedulerInWorker(database, command));
+  const start = (atMs = now, options: StartOptions = {}) => {
     active.set(options.channelName ?? channelName, storeKey);
-    return withinWorker(() =>
-      runCronSchedulerInWorker(database, {
-        type: "cron.schedulerStart",
-        input: { storeKey, channelName, snapshot, nowMs: atMs, monotonicMs: 0, ...options },
-      }),
-    );
+    return run({
+      type: "cron.schedulerStart",
+      input: { storeKey, channelName, snapshot, nowMs: atMs, monotonicMs: 0, ...options },
+    });
   };
   const read = () => loadCronStoreFromDatabase(database.db, storeKey).store.jobs;
   return {
@@ -117,6 +112,7 @@ function storedScheduler(label: string, jobs: CronJob[]) {
     channelName,
     start,
     read,
+    job: (id: string) => read().find((entry) => entry.id === id)!,
     save: (entries: CronJob[]) => save(storeKey, entries),
     cancel: (receiptIds: string[], nowMs: number, reason: string) =>
       withinWorker(() =>
@@ -125,36 +121,22 @@ function storedScheduler(label: string, jobs: CronJob[]) {
     refresh: (
       input: Omit<CronSchedulerOperations["cron.schedulerRefresh"]["input"], "storeKey"> = {},
     ) =>
-      withinWorker(() =>
-        runCronSchedulerInWorker(database, {
-          type: "cron.schedulerRefresh",
-          input: { storeKey, channelName, nowMs: now, monotonicMs: 0, ...input },
-        }),
-      ),
-    tick: (
-      atMs: number,
-      monotonicMs: number,
-      input: Omit<
-        CronSchedulerOperations["cron.schedulerTick"]["input"],
-        "storeKey" | "nowMs" | "monotonicMs"
-      > = {},
-    ) =>
-      withinWorker(() =>
-        runCronSchedulerInWorker(database, {
-          type: "cron.schedulerTick",
-          input: { storeKey, nowMs: atMs, monotonicMs, ...input },
-        }),
-      ),
+      run({
+        type: "cron.schedulerRefresh",
+        input: { storeKey, channelName, nowMs: now, monotonicMs: 0, ...input },
+      }),
+    tick: (atMs: number, monotonicMs: number, input: TickInput = {}) =>
+      run({
+        type: "cron.schedulerTick",
+        input: { storeKey, nowMs: atMs, monotonicMs, ...input },
+      }),
     receipts: () =>
       database.db
         .prepare(
           "SELECT job_id, receipt_id FROM cron_run_receipts WHERE store_key = ? ORDER BY job_id",
         )
         .all(storeKey),
-    restart: async (
-      atMs: number,
-      options: Partial<CronSchedulerOperations["cron.schedulerStart"]["input"]> = {},
-    ) => {
+    restart: async (atMs: number, options: StartOptions = {}) => {
       stopCronSchedulerInWorker({ storeKey, channelName });
       active.delete(channelName);
       await closeOpenClawStateDatabaseAsync();
@@ -164,27 +146,31 @@ function storedScheduler(label: string, jobs: CronJob[]) {
   };
 }
 
-it("requests one overdue occurrence per job in oldest-first order", () => {
-  const scheduler = storedScheduler("oldest-first", [
-    job("newest", now - minute),
-    job("oldest", now - 24 * 60 * minute),
-    job("middle", now - 10 * minute),
-  ]);
-  const started = scheduler.start();
-  expect(jobIds(started.accepted)).toEqual(["oldest", "middle", "newest"]);
-  expect(scheduler.receipts()).toHaveLength(3);
-  expect(scheduler.tick(now + 1, 1).accepted).toEqual([]);
-  expect(scheduler.receipts()).toHaveLength(3);
-});
+function observeWakes(channelName: string) {
+  const receiver = new BroadcastChannel(channelName);
+  const posted = vi.spyOn(BroadcastChannel.prototype, "postMessage");
+  return {
+    posted,
+    next: async (delay: number) => {
+      const notification = once(receiver, "message");
+      await vi.advanceTimersByTimeAsync(delay);
+      await notification;
+    },
+    [Symbol.dispose]: () => {
+      posted.mockRestore();
+      receiver.close();
+    },
+  };
+}
 
 it("activates scheduled requests in FIFO capacity order and observes a queued edit on the next tick", () => {
   const count = DEFAULT_CRON_MAX_CONCURRENT_RUNS + 2;
   const scheduler = storedScheduler(
     "scheduled-activation",
-    jobSeries("job", count, (index) => now - (count - index) * minute),
+    jobSeries("job", count, (index) => now - (count - index) * minute).toReversed(),
   );
   const started = scheduler.start(now, immediate(count));
-  expect(started.accepted).toHaveLength(count);
+  expect(jobIds(started.accepted)).toEqual(Array.from({ length: count }, (_, i) => `job-${i}`));
   expect(jobIds(started.launches)).toEqual(
     Array.from({ length: DEFAULT_CRON_MAX_CONCURRENT_RUNS }, (_, index) => `job-${index}`),
   );
@@ -198,7 +184,8 @@ it("activates scheduled requests in FIFO capacity order and observes a queued ed
   queued.payload = { kind: "command", argv: ["echo", "edited while queued"] };
   queued.state.lastError = "preserve earlier failure";
   scheduler.save(persisted);
-  expect(scheduler.tick(now + 1, 1).launches).toEqual([]);
+  expect(scheduler.tick(now + 1, 1)).toMatchObject({ accepted: [], launches: [] });
+  expect(scheduler.receipts()).toHaveLength(count);
   scheduler.cancel([started.launches[0]!.runReceipt.receiptId], now + 2, "test releases one slot");
   const resumed = scheduler.tick(now + 3, 3);
   expect(resumed.accepted).toEqual([]);
@@ -211,9 +198,7 @@ it("activates scheduled requests in FIFO capacity order and observes a queued ed
     runningAtMs: now + 3,
     lastError: "preserve earlier failure",
   });
-  expect(scheduler.read().find((entry) => entry.id === queuedId)?.state).toEqual(
-    resumed.launches[0]?.job.state,
-  );
+  expect(scheduler.job(queuedId)?.state).toEqual(resumed.launches[0]?.job.state);
 });
 
 it.each(["every", "cron"] as const)(
@@ -235,13 +220,13 @@ it.each(["every", "cron"] as const)(
     const started = scheduler.start(now, options);
     const receipt = started.accepted.find(({ job: entry }) => entry.id === target.id)!.runReceipt;
     expect(started.launches.some(({ job: entry }) => entry.id === target.id)).toBe(false);
-    expect(scheduler.read().find(({ id }) => id === target.id)?.state.queuedAtMs).toBe(now);
+    expect(scheduler.job(target.id)?.state.queuedAtMs).toBe(now);
     scheduler.cancel(
       started.accepted.map(({ runReceipt }) => runReceipt.receiptId),
       now + 1,
       "cron service stopped",
     );
-    const cancelled = scheduler.read().find(({ id }) => id === target.id)!;
+    const cancelled = scheduler.job(target.id)!;
     expect(cancelled.state.nextRunAtMs).toBe(now);
     expect(cancelled.state.queuedAtMs).toBeUndefined();
     const restarted = await scheduler.restart(now + 2, options);
@@ -249,9 +234,7 @@ it.each(["every", "cron"] as const)(
       "already-requested",
     );
     scheduler.tick(now + 3, 1);
-    expect(scheduler.read().find(({ id }) => id === target.id)?.state.nextRunAtMs).toBe(
-      now + minute,
-    );
+    expect(scheduler.job(target.id)?.state.nextRunAtMs).toBe(now + minute);
     const resumed = scheduler.tick(now + minute, minute - 2);
     const launch = resumed.launches.find(({ job: entry }) => entry.id === target.id);
     expect(launch?.job.state.runningAtMs).toBe(now + minute);
@@ -475,75 +458,51 @@ it("keeps scheduling for an active subscriber and resumes after every subscriber
 });
 it("parks empty and disabled actors until an explicit row/config refresh", async () => {
   const scheduler = storedScheduler("idle-parked", []);
-  const receiver = new BroadcastChannel(scheduler.channelName);
-  const posted = vi.spyOn(BroadcastChannel.prototype, "postMessage");
-  try {
-    expect(scheduler.start().nextWakeAtMs).toBeUndefined();
-    await vi.advanceTimersByTimeAsync(2 * minute);
-    expect(posted).not.toHaveBeenCalled();
-    scheduler.save([job("added", now + 3 * minute)]);
-    const disabled = { config: { ...snapshot.config, cronEnabled: false } };
-    expect(
-      scheduler.refresh({ snapshot: disabled, nowMs: now + 2 * minute }).nextWakeAtMs,
-    ).toBeUndefined();
-    await vi.advanceTimersByTimeAsync(minute);
-    expect(posted).not.toHaveBeenCalled();
-    scheduler.refresh({
-      nowMs: now + 3 * minute,
-      snapshot: { config: snapshot.config },
-    });
-    const notification = once(receiver, "message");
-    await vi.advanceTimersByTimeAsync(2_000);
-    await notification;
-    expect(jobIds(scheduler.tick(now + 3 * minute + 2_000, 3 * minute + 2_000).accepted)).toEqual([
-      "added",
-    ]);
-  } finally {
-    posted.mockRestore();
-    receiver.close();
-  }
+  using wakes = observeWakes(scheduler.channelName);
+  const { posted } = wakes;
+  expect(scheduler.start().nextWakeAtMs).toBeUndefined();
+  await vi.advanceTimersByTimeAsync(2 * minute);
+  expect(posted).not.toHaveBeenCalled();
+  scheduler.save([job("added", now + 3 * minute)]);
+  const disabled = { config: { ...snapshot.config, cronEnabled: false } };
+  expect(
+    scheduler.refresh({ snapshot: disabled, nowMs: now + 2 * minute }).nextWakeAtMs,
+  ).toBeUndefined();
+  await vi.advanceTimersByTimeAsync(minute);
+  expect(posted).not.toHaveBeenCalled();
+  scheduler.refresh({
+    nowMs: now + 3 * minute,
+    snapshot: { config: snapshot.config },
+  });
+  await wakes.next(2_000);
+  expect(jobIds(scheduler.tick(now + 3 * minute + 2_000, 3 * minute + 2_000).accepted)).toEqual([
+    "added",
+  ]);
 });
 
 it("observes future deadlines without SQL wakes and retries an unacknowledged due wake", async () => {
   const deadline = now + 10 * minute;
   const scheduler = storedScheduler("future-deadline", [job("future", deadline)]);
-  const receiver = new BroadcastChannel(scheduler.channelName);
-  const posted = vi.spyOn(BroadcastChannel.prototype, "postMessage");
-  try {
-    expect(scheduler.start().nextWakeAtMs).toBe(deadline);
-    await vi.advanceTimersByTimeAsync(9 * minute);
-    expect(posted).not.toHaveBeenCalled();
-    const notification = once(receiver, "message");
-    await vi.advanceTimersByTimeAsync(minute);
-    await notification;
-    expect(posted).toHaveBeenCalledTimes(1);
-    const retry = once(receiver, "message");
-    await vi.advanceTimersByTimeAsync(minute);
-    await retry;
-    expect(posted).toHaveBeenCalledTimes(2);
-    expect(jobIds(scheduler.tick(deadline + minute, 11 * minute).accepted)).toEqual(["future"]);
-  } finally {
-    posted.mockRestore();
-    receiver.close();
-  }
+  using wakes = observeWakes(scheduler.channelName);
+  const { posted } = wakes;
+  expect(scheduler.start().nextWakeAtMs).toBe(deadline);
+  await vi.advanceTimersByTimeAsync(9 * minute);
+  expect(posted).not.toHaveBeenCalled();
+  await wakes.next(minute);
+  expect(posted).toHaveBeenCalledTimes(1);
+  await wakes.next(minute);
+  expect(posted).toHaveBeenCalledTimes(2);
+  expect(jobIds(scheduler.tick(deadline + minute, 11 * minute).accepted)).toEqual(["future"]);
 });
 
-it("does not mistake a normal long deadline for a clock jump", () => {
-  const deadline = now + 10 * minute;
+it.each([
+  { name: "on-time long deadline", due: 10, elapsed: 10, accepted: 7 },
+  { name: "missed work after sleep", due: 1, elapsed: 60, accepted: 5 },
+])("bounds catch-up only for $name", ({ name, due, elapsed, accepted }) => {
   const scheduler = storedScheduler(
-    "long-deadline",
-    jobSeries("job", 7, () => deadline),
+    name,
+    jobSeries("job", 7, () => now + due * minute),
   );
   scheduler.start();
-  // A real catch-up is bounded to five; an on-time wake admits all seven.
-  expect(scheduler.tick(deadline, 10 * minute).accepted).toHaveLength(7);
-});
-
-it("bounds missed due work after sleep when both clocks advance together", () => {
-  const scheduler = storedScheduler(
-    "sleep",
-    jobSeries("sleep", 7, () => now + minute),
-  );
-  scheduler.start();
-  expect(scheduler.tick(now + 60 * minute, 60 * minute).accepted).toHaveLength(5);
+  expect(scheduler.tick(now + elapsed * minute, elapsed * minute).accepted).toHaveLength(accepted);
 });

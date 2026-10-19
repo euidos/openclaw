@@ -7,56 +7,16 @@ import {
 import { captureOpenClawStateWorkerContext } from "../../state/openclaw-state-worker-context.js";
 import { executeOpenClawStateWorker } from "../../state/openclaw-state-worker-store.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
-import { resolveCronJobConfigRevision } from "../config-revision.js";
-import { saveCronStore } from "../store.js";
-import type { CronJob } from "../types.js";
 import { loadCronStoreFromDatabase } from "./load.kernel.js";
-import type { CronRunQueueOperations } from "./run-queue.types.js";
+import { queueJob, queueStore, requestForJob } from "./run-queue.test-support.js";
 import { drainCronQueueInWorker } from "./run-queue.worker.js";
-import { createCronScheduledRunId } from "./run-request-id.js";
 
 const now = 1_800_000_000_000;
-function makeJob(id: string, onExit = false): CronJob {
-  return {
-    id,
-    name: id,
-    agentId: "main",
-    enabled: true,
-    createdAtMs: now - 1000,
-    updatedAtMs: now - 1000,
-    schedule: onExit
-      ? { kind: "on-exit", command: "synthetic-watch" }
-      : { kind: "every", everyMs: 60_000 },
+const makeJob = (id: string, onExit = false) =>
+  queueJob(id, now, {
     payload: { kind: "command", argv: ["echo", "synthetic"] },
-    sessionTarget: "isolated",
-    wakeMode: "next-heartbeat",
-    delivery: { mode: "none" },
-    state: { nextRunAtMs: now },
-  };
-}
-
-function requestFor(storeKey: string, job: CronJob) {
-  const onExit = job.schedule.kind === "on-exit";
-  return {
-    jobId: job.id,
-    receiptId: onExit ? "cron:request:exit" : createCronScheduledRunId(storeKey, job.id, now),
-    configRevision: resolveCronJobConfigRevision(job),
-    mode: onExit ? ("on-exit" as const) : ("scheduled" as const),
-    onExitSchedule: job.schedule.kind === "on-exit" ? job.schedule : undefined,
-    scheduledSlotMs: onExit ? undefined : now,
-  };
-}
-
-async function requestRuns(
-  storeKey: string,
-  requests: CronRunQueueOperations["cron.requestRuns"]["input"]["requests"],
-  nowMs = now,
-) {
-  return executeOpenClawStateWorker(captureOpenClawStateWorkerContext(), {
-    type: "cron.requestRuns",
-    input: { storeKey, nowMs, requests },
+    ...(onExit ? { schedule: { kind: "on-exit", command: "synthetic-watch" } as const } : {}),
   });
-}
 
 it.each([false, true])(
   "keeps authored job bytes and row ownership when requesting an exit event: %s",
@@ -64,7 +24,7 @@ it.each([false, true])(
     await withOpenClawTestState({ label: "cron-queue-authored-data" }, async (fixture) => {
       const storeKey = fixture.statePath("cron", "jobs.json");
       const job = makeJob("authored", onExit);
-      await saveCronStore(storeKey, { version: 1, jobs: [job] });
+      const queue = await queueStore(storeKey, [job], now);
       await closeOpenClawStateDatabaseAsync();
       let db = openOpenClawStateDatabase().db;
       db.prepare(
@@ -80,15 +40,8 @@ it.each([false, true])(
       await closeOpenClawStateDatabaseAsync();
       const context = captureOpenClawStateWorkerContext();
       await executeOpenClawStateWorker(context, { type: "cron.initializeRunReceipts", input: {} });
-      const loaded = await executeOpenClawStateWorker(context, {
-        type: "cron.loadMutable",
-        input: { storeKey },
-      });
-      if (!loaded.ok) {
-        throw new Error(loaded.error.message);
-      }
-      const current = loaded.loaded.store.jobs[0]!;
-      const result = await requestRuns(storeKey, [requestFor(storeKey, current)]);
+      const current = (await queue.read()).jobs[0]!;
+      const result = await queue.request([requestForJob(storeKey, current, now)]);
       expect(result.rejected).toEqual([]);
       expect(result.accepted).toHaveLength(1);
       await closeOpenClawStateDatabaseAsync();
@@ -107,9 +60,9 @@ it("preserves a durable claim when its runtime queue marker is absent", async ()
   await withOpenClawTestState({ label: "cron-queue-claim-conflict" }, async (fixture) => {
     const storeKey = fixture.statePath("cron", "jobs.json");
     const job = makeJob("claimed");
-    await saveCronStore(storeKey, { version: 1, jobs: [job] });
-    const request = requestFor(storeKey, job);
-    const first = await requestRuns(storeKey, [request]);
+    const queue = await queueStore(storeKey, [job], now);
+    const request = requestForJob(storeKey, job, now);
+    const first = await queue.request([request]);
     expect(first.accepted).toHaveLength(1);
     await closeOpenClawStateDatabaseAsync();
     const db = openOpenClawStateDatabase().db;
@@ -124,7 +77,7 @@ it("preserves a durable claim when its runtime queue marker is absent", async ()
       .get(request.receiptId);
     await closeOpenClawStateDatabaseAsync();
     const competing = { ...request, mode: "force" as const, receiptId: "cron:request:competing" };
-    const retry = await requestRuns(storeKey, [request, competing], now + 1);
+    const retry = await queue.request([request, competing], now + 1);
     expect(retry.accepted).toEqual([]);
     expect(retry.rejected).toEqual([
       { jobId: job.id, receiptId: request.receiptId, reason: "already-requested" },
@@ -143,11 +96,11 @@ it("keeps requested occurrences and siblings intact when activation rolls back",
   await withOpenClawTestState({ label: "cron-queue-activation-rollback" }, async (fixture) => {
     const storeKey = fixture.statePath("cron", "jobs.json");
     const jobs = ["failing", "sibling"].map((id) => makeJob(id));
-    await saveCronStore(storeKey, { version: 1, jobs });
+    const queue = await queueStore(storeKey, jobs, now);
     const context = captureOpenClawStateWorkerContext();
     await executeOpenClawStateWorker(context, { type: "cron.initializeRunReceipts", input: {} });
-    const requests = jobs.map((job) => requestFor(storeKey, job));
-    expect((await requestRuns(storeKey, requests)).accepted).toHaveLength(2);
+    const requests = jobs.map((job) => requestForJob(storeKey, job, now));
+    expect((await queue.request(requests)).accepted).toHaveLength(2);
     await closeOpenClawStateDatabaseAsync();
     const database = openOpenClawStateDatabase();
     // Install the fault after admission on the connection this storage operation owns.
