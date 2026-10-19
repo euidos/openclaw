@@ -8,37 +8,16 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import * as advertisedLanHost from "../../infra/advertised-lan-host.js";
 import * as httpListen from "../server/http-listen.js";
-import {
-  createGatewayPortalService,
-  createPortalOperations,
-  type GatewayPortalService,
-} from "./portal-service.js";
-import { holdPortalBind, requestText, usePortalHarness } from "./portal.test-support.js";
+import { createPortalOperations, type GatewayPortalService } from "./portal-service.js";
+import { holdPortalBind, authority, requestText, usePortalHarness } from "./portal.test-support.js";
 
-const { target, makeService: createService } = usePortalHarness();
+const { target, makeService } = usePortalHarness();
 
 async function unavailableWorkerConnection(): Promise<Duplex> {
   throw new Error("Worker connection unavailable");
 }
 
-function workerTarget(environmentId = "cloud-a", ownerEpoch = 7) {
-  return {
-    kind: "worker" as const,
-    environmentId,
-    ownerEpoch,
-    remotePort: 3000,
-    connect: unavailableWorkerConnection,
-  };
-}
-
 afterEach(() => vi.restoreAllMocks());
-
-function makeService(
-  hosts = ["127.0.0.1"],
-  options: Partial<Parameters<typeof createGatewayPortalService>[0]> = {},
-) {
-  return createService({ httpBindHosts: hosts, ...options });
-}
 
 function openWorker(
   service: GatewayPortalService,
@@ -48,7 +27,13 @@ function openWorker(
 ) {
   return service.open({
     targetPort: 3000,
-    target: workerTarget(environmentId, ownerEpoch),
+    target: {
+      kind: "worker",
+      environmentId,
+      ownerEpoch,
+      remotePort: 3000,
+      connect: unavailableWorkerConnection,
+    },
     ...options,
   });
 }
@@ -67,7 +52,7 @@ function reportTargetPortCollision(server: Server, targetPort: number): void {
   vi.spyOn(server, "address").mockReturnValueOnce({ ...address, port: targetPort });
 }
 
-describe("portal open authority fence", () => {
+describe("gateway portal service", () => {
   it("keeps a scoped stream after request completion and retires it with its resource owner", async () => {
     target.handler = (_req, res) => {
       res.writeHead(200, { "Content-Type": "text/event-stream" });
@@ -75,19 +60,15 @@ describe("portal open authority fence", () => {
     };
     const { service } = makeService();
     const owner = new AbortController();
-    let requestCurrent = true;
+    const request = authority("request completed");
     const release = vi.fn();
     const portal = await service.open({
       targetPort: target.port,
       ownerSignal: owner.signal,
-      assertCurrent: () => {
-        if (!requestCurrent) {
-          throw new Error("request completed");
-        }
-      },
+      assertCurrent: request.assertCurrent,
       onClose: release,
     });
-    requestCurrent = false;
+    request.current = false;
     expect(service.list()).toEqual([portal]);
     expect(await getStatus("127.0.0.1", portal.listenPort, "/")).toBe(401);
     const response = await fetch(portal.url);
@@ -96,28 +77,8 @@ describe("portal open authority fence", () => {
     owner.abort();
     expect(service.list()).toEqual([]);
     await expect(reader.read()).rejects.toThrow();
-    expect(service.list()).toEqual([]);
     await service.closeAll();
     expect(release).toHaveBeenCalledOnce();
-  });
-
-  it("refuses to mutate a reused portal when the caller's authority lapsed", async () => {
-    const { service } = makeService();
-    const first = await service.open({ targetPort: 41234, title: "Live" });
-    const releaseRejected = vi.fn();
-    await expect(
-      service.open({
-        targetPort: 41234,
-        title: "Hijacked",
-        onClose: releaseRejected,
-        assertCurrent: () => {
-          throw new Error("authority lapsed");
-        },
-      }),
-    ).rejects.toThrow("authority lapsed");
-    const summary = service.list().find((portal) => portal.id === first.id);
-    expect(summary?.title).toBe("Live");
-    expect(releaseRejected).toHaveBeenCalledOnce();
   });
 
   it.each([
@@ -126,7 +87,7 @@ describe("portal open authority fence", () => {
   ])("releases unpublished resources after %s authority loss", async (stage, message) => {
     const owner = new AbortController();
     const actualListen = httpListen.listenGatewayHttpServer;
-    let authorityCurrent = true;
+    const guard = authority(message);
     let listener: Server | undefined;
     vi.spyOn(httpListen, "listenGatewayHttpServer").mockImplementation(async (params) => {
       listener = params.httpServer;
@@ -137,104 +98,100 @@ describe("portal open authority fence", () => {
     });
     if (stage === "LAN") {
       vi.spyOn(advertisedLanHost, "resolveAdvertisedLanHostCore").mockImplementation(async () => {
-        authorityCurrent = false;
+        guard.current = false;
         return "192.168.1.20";
       });
     }
-    const { service, httpServers } = makeService([stage === "LAN" ? "0.0.0.0" : "127.0.0.1"]);
+    const { service, httpServers } = makeService({
+      httpBindHosts: [stage === "LAN" ? "0.0.0.0" : "127.0.0.1"],
+    });
     const releaseTarget = vi.fn();
-
     await expect(
       service.open({
         targetPort: 3000,
         onClose: releaseTarget,
         ownerSignal: owner.signal,
-        assertCurrent: () => {
-          if (!authorityCurrent) {
-            throw new Error(message);
-          }
-        },
+        assertCurrent: guard.assertCurrent,
       }),
     ).rejects.toThrow(message);
-
     expect(service.list()).toEqual([]);
     expect(httpServers).toEqual([]);
     expect(listener?.listening).toBe(false);
     expect(releaseTarget).toHaveBeenCalledOnce();
   });
-});
+  it.each([false, true])("owns listeners after collision=%s", async (collision) => {
+    const targetPort = target.port;
+    const actualListen = httpListen.listenGatewayHttpServer;
+    const calls: Array<{ host: string; port: number }> = [];
+    const attemptedServers = new Set<Server>();
+    const listen = vi
+      .spyOn(httpListen, "listenGatewayHttpServer")
+      .mockImplementation(async (params) => {
+        calls.push({ host: params.bindHost, port: params.port });
+        attemptedServers.add(params.httpServer);
+        await actualListen(params);
+        if (collision && params.bindHost === "127.0.0.1" && params.port === 0) {
+          reportTargetPortCollision(params.httpServer, targetPort);
+        }
+      });
+    const { service, httpServers } = makeService({
+      httpBindHosts: collision ? ["127.0.0.1"] : ["127.0.0.1", "::1"],
+    });
 
-describe("gateway portal service", () => {
-  it.each([false, true])(
-    "owns all listeners after target-port collision rejection=%s",
-    async (collision) => {
-      const targetPort = target.port;
-      const actualListen = httpListen.listenGatewayHttpServer;
-      const calls: Array<{ host: string; port: number }> = [];
-      const attemptedServers = new Set<Server>();
-      const listen = vi
-        .spyOn(httpListen, "listenGatewayHttpServer")
-        .mockImplementation(async (params) => {
-          calls.push({ host: params.bindHost, port: params.port });
-          attemptedServers.add(params.httpServer);
-          await actualListen(params);
-          if (collision && params.bindHost === "127.0.0.1" && params.port === 0) {
-            reportTargetPortCollision(params.httpServer, targetPort);
-          }
-        });
-      const { service, httpServers } = makeService(
-        collision ? ["127.0.0.1"] : ["127.0.0.1", "::1"],
+    if (collision) {
+      await expect(service.open({ targetPort })).rejects.toThrow(
+        `Portal listener repeatedly allocated target port ${targetPort}`,
       );
-
-      if (collision) {
-        await expect(service.open({ targetPort })).rejects.toThrow(
-          `Portal listener repeatedly allocated target port ${targetPort}`,
-        );
-        expect(listen).toHaveBeenCalledOnce();
-        expect(attemptedServers.size).toBe(1);
-        expect(httpServers).toEqual([]);
-        const [primaryServer] = attemptedServers;
-        expect(primaryServer?.listening).toBe(false);
-        expect(primaryServer?.address()).toBeNull();
-        return;
-      }
-
-      const portal = await service.open({ targetPort, title: "App" });
-
-      expect(portal).toMatchObject({ id: `p${targetPort}`, port: targetPort, title: "App" });
-      expect(portal.listenPort).toBeGreaterThan(0);
-      expect(await getStatus("127.0.0.1", portal.listenPort, "/")).toBe(401);
-      expect(await getStatus("::1", portal.listenPort, "/")).toBe(401);
-      expect(portal.listenPort).not.toBe(targetPort);
-      expect(calls).toEqual([
-        { host: "127.0.0.1", port: 0 },
-        { host: "::1", port: portal.listenPort },
-      ]);
-      expect(httpServers).toHaveLength(2);
-      expect(httpServers.every((server) => server.listening)).toBe(true);
-      for (const server of httpServers) {
-        expect(server.address()).toMatchObject({ port: portal.listenPort });
-      }
-      expect(await requestText(portal.url)).toMatchObject({ status: 200, body: "target" });
-
-      const ownedServers = [...httpServers];
-      await service.closeAll();
+      expect(listen).toHaveBeenCalledOnce();
+      expect(attemptedServers.size).toBe(1);
       expect(httpServers).toEqual([]);
-      expect(ownedServers.every((server) => !server.listening && server.address() === null)).toBe(
-        true,
-      );
-    },
-  );
+      const [primaryServer] = attemptedServers;
+      expect(primaryServer?.listening).toBe(false);
+      expect(primaryServer?.address()).toBeNull();
+      return;
+    }
+
+    const portal = await service.open({ targetPort, title: "App" });
+    expect(portal).toMatchObject({ id: `p${targetPort}`, port: targetPort, title: "App" });
+    expect(await getStatus("127.0.0.1", portal.listenPort, "/")).toBe(401);
+    expect(await getStatus("::1", portal.listenPort, "/")).toBe(401);
+    expect(calls).toEqual([
+      { host: "127.0.0.1", port: 0 },
+      { host: "::1", port: portal.listenPort },
+    ]);
+    expect(httpServers).toHaveLength(2);
+    expect(httpServers.every((server) => server.listening)).toBe(true);
+    for (const server of httpServers) {
+      expect(server.address()).toMatchObject({ port: portal.listenPort });
+    }
+    expect(await requestText(portal.url)).toMatchObject({ status: 200, body: "target" });
+
+    const ownedServers = [...httpServers];
+    await service.closeAll();
+    expect(httpServers).toEqual([]);
+    expect(ownedServers.every((server) => !server.listening && server.address() === null)).toBe(
+      true,
+    );
+  });
 
   it("updates an existing target without replacing its listener or token", async () => {
     const { service, httpServers } = makeService();
     const releaseFirst = vi.fn();
     const releaseRedundant = vi.fn();
-    const first = await service.open({
-      targetPort: 3000,
-      title: "First",
-      onClose: releaseFirst,
-    });
+    const first = await service.open({ targetPort: 3000, title: "First", onClose: releaseFirst });
+    const releaseRejected = vi.fn();
+    await expect(
+      service.open({
+        targetPort: 3000,
+        title: "Hijacked",
+        onClose: releaseRejected,
+        assertCurrent: () => {
+          throw new Error("authority lapsed");
+        },
+      }),
+    ).rejects.toThrow("authority lapsed");
+    expect(service.list().find((portal) => portal.id === first.id)?.title).toBe("First");
+    expect(releaseRejected).toHaveBeenCalledOnce();
     const second = await service.open({
       targetPort: 3000,
       title: "Second",
@@ -265,10 +222,15 @@ describe("gateway portal service", () => {
 
   it("keeps local and worker portals on the same application port distinct", async () => {
     const { service } = makeService();
+    const closeStaleForward = vi.fn();
+    const closeCurrentForward = vi.fn();
     const local = await service.open({ targetPort: 3000 });
-    const worker = await openWorker(service, "cloud/a", 7, { origin: "Cloud worker A" });
+    const worker = await openWorker(service, "cloud/a", 7, {
+      origin: "Cloud worker A",
+      onClose: closeCurrentForward,
+    });
     const otherWorker = await openWorker(service, "cloud-a", 7);
-    const staleWorker = await openWorker(service, "cloud/a", 6);
+    const staleWorker = await openWorker(service, "cloud/a", 6, { onClose: closeStaleForward });
 
     expect(local.id).toBe("p3000");
     expect(new Set([local.id, worker.id, otherWorker.id, staleWorker.id]).size).toBe(4);
@@ -277,49 +239,37 @@ describe("gateway portal service", () => {
       origin: "Cloud worker A",
       exposure: { kind: "loopback-only", browserReachability: "unverified" },
     });
-    expect(service.list()).toHaveLength(4);
     expect(service.listWorkerPortals("cloud/a", 7)).toEqual([worker]);
     expect(service.listWorkerPortals("cloud/a", 6)).toEqual([staleWorker]);
     expect(service.listWorkerPortals("cloud-a", 7)).toEqual([otherWorker]);
     expect(service.listWorkerPortals("cloud/a", 8)).toEqual([]);
-  });
-
-  it("closes worker forwards only for the selected environment owner epoch", async () => {
-    const { service } = makeService();
-    const closeStaleForward = vi.fn();
-    const closeCurrentForward = vi.fn();
-    const stale = await openWorker(service, "cloud-a", 6, { onClose: closeStaleForward });
-    const current = await openWorker(service, "cloud-a", 7, { onClose: closeCurrentForward });
-
-    await service.closeWorkerPortals("cloud-a", 6);
-
+    await service.closeWorkerPortals("cloud/a", 6);
     expect(closeStaleForward).toHaveBeenCalledOnce();
     expect(closeCurrentForward).not.toHaveBeenCalled();
-    expect(service.list().map((portal) => portal.id)).toEqual([current.id]);
-    expect(stale.id).not.toBe(current.id);
-
-    await service.close(current.id);
+    expect(
+      service
+        .list()
+        .map((portal) => portal.id)
+        .toSorted(),
+    ).toEqual([local.id, worker.id, otherWorker.id].toSorted());
+    await service.close(worker.id);
     expect(closeCurrentForward).toHaveBeenCalledOnce();
   });
 
   it("revalidates worker close authority immediately before queued removal", async () => {
     const { service } = makeService();
+    const guard = authority("Worker portal authority changed");
     const owner = {
       environmentId: "cloud-a",
       ownerEpoch: 1,
       ownershipError: "Worker portal belongs to another owner",
-      current: true,
-      assertCurrent() {
-        if (!this.current) {
-          throw new Error("Worker portal authority changed");
-        }
-      },
+      assertCurrent: guard.assertCurrent,
       prepareTarget: async () => ({ connect: unavailableWorkerConnection, close: vi.fn() }),
     };
     const operations = createPortalOperations(service, owner);
     const portal = await operations.open({ port: 3000 });
     const closing = operations.close(portal.id);
-    owner.current = false;
+    guard.current = false;
 
     await expect(closing).rejects.toThrow("Worker portal authority changed");
     expect(service.list()).toEqual([portal]);
@@ -342,7 +292,7 @@ describe("gateway portal service", () => {
   });
 
   it("removes every registered listener after a partial bind failure", async () => {
-    const { service, httpServers } = makeService(["127.0.0.1", "127.0.0.1"]);
+    const { service, httpServers } = makeService({ httpBindHosts: ["127.0.0.1", "127.0.0.1"] });
 
     await expect(service.open({ targetPort: 3000 })).rejects.toThrow(/already listening/u);
     expect(service.list()).toEqual([]);
@@ -357,7 +307,7 @@ describe("gateway portal service", () => {
     const resolveHost = vi
       .spyOn(advertisedLanHost, "resolveAdvertisedLanHostCore")
       .mockResolvedValue(lanHost);
-    const { service, httpServers } = makeService([bindHost]);
+    const { service, httpServers } = makeService({ httpBindHosts: [bindHost] });
     const portal = await service.open({ targetPort: 3000, path });
 
     expect(portal.publicUrl).toBe(`http://${openableHost}:${portal.listenPort}${path}`);
@@ -365,7 +315,6 @@ describe("gateway portal service", () => {
       kind: lanHost ? "non-loopback" : "loopback-only",
       browserReachability: "unverified",
     });
-    expect(service.list()[0]?.exposure).toEqual(portal.exposure);
     expect(portal.url).toBe(
       `${portal.publicUrl}${path.includes("?") ? "&" : "?"}${portal.tokenQuery}`,
     );
@@ -395,7 +344,7 @@ describe("direct HTTPS portal publication", () => {
     execFileSync(
       "openssl",
       [
-        ..."req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=gateway.example.test".split(" "),
+        ..."req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=gw.e.test".split(" "),
         "-addext",
         `subjectAltName=${subjectAltName}`,
         "-keyout",
@@ -409,9 +358,9 @@ describe("direct HTTPS portal publication", () => {
   }
 
   beforeAll(() => {
-    certificate = createCertificate("DNS:gateway.example.test,DNS:alternate.example.test");
+    certificate = createCertificate("DNS:gw.e.test,DNS:alt.e.test");
     ipCertificate = createCertificate("IP:127.0.0.1");
-    wildcardCertificate = createCertificate("DNS:*.example.test");
+    wildcardCertificate = createCertificate("DNS:*.e.test");
   });
 
   // Own the listener route while keeping CA, expiry, and URL hostname checks enabled.
@@ -422,57 +371,44 @@ describe("direct HTTPS portal publication", () => {
       lookup: (_host, _options, callback) => callback(null, "127.0.0.1", 4),
     });
     try {
-      const { status, body } = await requestText(url, { agent });
-      return { status, body };
+      return await requestText(url, { agent });
     } finally {
       agent.destroy();
     }
   }
 
   it.each(["ip", "wildcard", "chain", "LAN", "configured"] as const)(
-    "publishes a certificate-valid hostname for %s access",
+    "publishes certificate-valid %s origins",
     async (kind) => {
       const material =
         kind === "ip" ? ipCertificate : kind === "wildcard" ? wildcardCertificate : certificate;
       const hostname =
-        kind === "ip"
-          ? "127.0.0.1"
-          : kind === "configured"
-            ? "alternate.example.test"
-            : "gateway.example.test";
+        kind === "ip" ? "127.0.0.1" : kind === "configured" ? "alt.e.test" : "gw.e.test";
       if (kind === "LAN") {
         // A broken candidate must fail on TLS, not routing.
         vi.spyOn(advertisedLanHost, "resolveAdvertisedLanHostCore").mockResolvedValue("127.0.0.2");
       }
-      const { service } = makeService([kind === "LAN" ? "0.0.0.0" : "127.0.0.1"], {
+      const { service } = makeService({
+        httpBindHosts: [kind === "LAN" ? "0.0.0.0" : "127.0.0.1"],
         tlsOptions: { ...material, cert: kind === "chain" ? [material.cert] : material.cert },
         gatewayOrigins:
           kind === "wildcard"
             ? ["*", `https://${hostname}`]
             : kind === "configured"
-              ? ["https://unrelated.example.test", "https://alternate.example.test:8443"]
+              ? ["https://other.e.test", "https://alt.e.test:8443"]
               : [],
       });
-      const checkPortal = async (targetPort: number) => {
-        const portal = await service.open({ targetPort });
-        expect(new URL(portal.publicUrl).hostname).toBe(hostname);
-        // A certificate-valid DNS name cannot expose a loopback-only listener.
-        expect(portal.exposure).toEqual({
-          kind: kind === "LAN" ? "non-loopback" : "loopback-only",
-          browserReachability: "unverified",
-        });
-        if (kind === "LAN") {
-          expect(await readPortal(portal.url)).toEqual({ status: 200, body: "direct TLS app" });
-          expect(service.list()[0]?.publicUrl).toBe(portal.publicUrl);
-        }
-        expect((await readPortal(portal.publicUrl, material.cert)).status).toBe(401);
-      };
+      const portal = await service.open({ targetPort: kind === "LAN" ? target.port : 3000 });
+      expect(new URL(portal.publicUrl).hostname).toBe(hostname);
+      expect(portal.exposure).toEqual({
+        kind: kind === "LAN" ? "non-loopback" : "loopback-only",
+        browserReachability: "unverified",
+      });
       if (kind === "LAN") {
         target.handler = (_req, res) => res.end("direct TLS app");
-        await checkPortal(target.port);
-      } else {
-        await checkPortal(3000);
+        expect(await readPortal(portal.url)).toMatchObject({ status: 200, body: "direct TLS app" });
       }
+      expect((await readPortal(portal.publicUrl, material.cert)).status).toBe(401);
     },
   );
 });

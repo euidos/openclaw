@@ -112,3 +112,15 @@ export function holdPortalBind() {
   });
   return { started: started.promise, release: released.resolve };
 }
+
+export function authority(message: string) {
+  const state = {
+    current: true,
+    assertCurrent() {
+      if (!state.current) {
+        throw new Error(message);
+      }
+    },
+  };
+  return state;
+}
