@@ -149,6 +149,9 @@ export function createChatViewFrame(
   const displayedPendingInputs = pendingInputs
     ? [...pendingInputs.page.items.filter((input) => !input.queued), ...pendingInputs.queuedInputs]
     : undefined;
+  const resolveCommentSource = (selection: ChatSelectionSource) =>
+    resolveChatCommentAnchor(props.transcript.messageElements?.elements.values() ?? [], selection)
+      ?.range;
   const openSelectionComment = (
     selection: ChatSelectionSource,
     anchorRect: DOMRect,
@@ -159,9 +162,7 @@ export function createChatViewFrame(
     showChatAnnotationEditor({
       paneId: props.paneId,
       anchorRect,
-      sourceRange: props.transcript.scrollElement
-        ? resolveChatCommentAnchor(props.transcript.scrollElement, selection)?.range
-        : undefined,
+      sourceRange: resolveCommentSource(selection),
       comment: "",
       readSignal: props.readSignal,
       onCancel,
@@ -335,6 +336,7 @@ export function createChatViewFrame(
     asyncQuestions,
     openImmediateImage,
     attachmentDropHandlers,
+    resolveCommentSource,
     threadProps,
     displayQueue,
     historyLoadState,

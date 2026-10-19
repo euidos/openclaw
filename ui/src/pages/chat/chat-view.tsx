@@ -432,6 +432,7 @@ function ChatContent(input: { props: ChatProps }) {
           paneId={input.props.paneId}
           onFocusComposer={frame().threadProps.onFocusComposer}
           visiblePin={(id) => getTranscriptState(input.props.paneId).commentPins?.visiblePin(id)}
+          resolveSourceRange={frame().resolveCommentSource}
           props={input.props}
           disabled={!input.props.canSend}
           sessionKey={input.props.sessionKey}

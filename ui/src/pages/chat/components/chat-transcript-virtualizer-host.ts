@@ -109,6 +109,9 @@ export class ChatSessionVirtualizerHost implements ChatTranscriptSession {
     const parent = this.threadInnerElement?.parentElement;
     return this.connected && parent instanceof HTMLDivElement && parent.isConnected ? parent : null;
   }
+  get contentElement(): HTMLDivElement | null {
+    return this.threadInnerElement;
+  }
   // Keep one ref per root and row so redraws do not repeat attachment work.
   readonly scrollElementRef = (element?: Element) => {
     this.threadInnerElement = element instanceof HTMLDivElement ? element : null;
