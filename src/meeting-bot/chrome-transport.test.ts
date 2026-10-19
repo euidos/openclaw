@@ -152,7 +152,9 @@ function mockTransport(options: Partial<Omit<TransportOptions, "runtime">> = {},
     stop: vi.fn(async () => {}),
     writeOutput: vi.fn(async () => {}),
   };
-  const createNodeAudioTransport = node ? vi.fn(() => nodeAudioTransport) : vi.fn();
+  const createNodeAudioTransport = node
+    ? vi.fn<typeof createNodeMeetingRealtimeAudioTransport>(() => nodeAudioTransport)
+    : vi.fn<typeof createNodeMeetingRealtimeAudioTransport>();
   const transport = createTransport({
     ...transportOptions,
     ...options,
@@ -251,7 +253,7 @@ describe("meeting Chrome transport", () => {
     expect(recovered.audioBridge?.providerId).toBe("openai");
   });
 
-  it.each(["rollback", "owned-constructor", "owned-dispose"] as const)(
+  it.each(["rollback", "owned-constructor", "owned-dispose", "owned-node-stop"] as const)(
     "reports failed node cleanup without replacing the startup error (%s)",
     async (scenario) => {
       const { transport, createBindings, createNodeAudioTransport, nodeAudioTransport } =
@@ -266,11 +268,15 @@ describe("meeting Chrome transport", () => {
         createNodeAudioTransport.mockImplementationOnce(() => {
           throw startupFailure;
         });
-      } else if (scenario === "owned-dispose") {
+      } else if (scenario === "owned-dispose" || scenario === "owned-node-stop") {
         createBindings.mockImplementationOnce(() => {
           throw startupFailure;
         });
-        nodeAudioTransport.dispose.mockRejectedValueOnce(cleanupFailure);
+        if (scenario === "owned-node-stop") {
+          createNodeAudioTransport.mockImplementationOnce(createNodeMeetingRealtimeAudioTransport);
+        } else {
+          nodeAudioTransport.dispose.mockRejectedValueOnce(cleanupFailure);
+        }
       }
       browserMocks.open.mockResolvedValue({
         launched: true,
@@ -304,11 +310,15 @@ describe("meeting Chrome transport", () => {
             ? "node bridge"
             : "node audio transport";
       expect(logger.warn).toHaveBeenCalledExactlyOnceWith(
-        expect.stringContaining(`${phase} cleanup after realtime startup failure`),
+        expect.stringContaining(
+          scenario === "owned-node-stop"
+            ? "node audio bridge stop did not complete"
+            : `${phase} cleanup after realtime startup failure`,
+        ),
       );
       expect(vi.mocked(logger.warn).mock.calls[0]?.[0]).not.toContain(cleanupToken);
       expect(browserMocks.leave).toHaveBeenCalledOnce();
-      if (scenario === "owned-constructor") {
+      if (scenario === "owned-constructor" || scenario === "owned-node-stop") {
         expect(invoke).toHaveBeenCalledWith(
           expect.objectContaining({ params: { action: "stop", bridgeId: "bridge-1" } }),
         );
