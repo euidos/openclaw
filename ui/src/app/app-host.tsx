@@ -129,7 +129,10 @@ export class ShellOwner
     Partial<
       Pick<
         AppSidebarElement,
-        "navigationVisible" | "updateComplete" | "findSidebarHovercardRowByKey"
+        | "navigationVisible"
+        | "updateComplete"
+        | "findSidebarHovercardRowByKey"
+        | "dismissTransientMenus"
       >
     > = document.createElement(APP_SIDEBAR_ELEMENT.tagName);
   // Where "Back to app" / Escape leaves the settings takeover; falls back to

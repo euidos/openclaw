@@ -16,23 +16,24 @@ export type ShellNavigationElements = {
   toastElement?: HTMLElement;
 };
 
-type AppSidebarElement = HTMLElement & { dismissTransientMenus(): boolean };
+type AppSidebarElement = HTMLElement & { dismissTransientMenus?(): boolean };
 type SidebarAttentionElement = HTMLElement & { dismissPanel(): boolean };
 
 export function navDrawerFocusableElements(drawer: HTMLElement): HTMLElement[] {
   return [...tabbableElements(drawer.children)];
 }
 
-export function dismissNavigationTransientSurfaces(host: HTMLElement): boolean {
+export function dismissNavigationTransientSurfaces(
+  host: HTMLElement,
+  sidebar: AppSidebarElement,
+): boolean {
   // Sidebar-owned menu/panel markup stays foreign; unupgraded elements own no transient UI.
   const dismissedPanel = [
     ...host.querySelectorAll<SidebarAttentionElement>("openclaw-sidebar-attention:defined"),
   ]
     .map((attention) => attention.dismissPanel())
     .some((dismissed) => dismissed);
-  const dismissedMenu = host
-    .querySelector<AppSidebarElement>("openclaw-app-sidebar:defined")
-    ?.dismissTransientMenus();
+  const dismissedMenu = host.contains(sidebar) && sidebar.dismissTransientMenus?.();
   return dismissedMenu === true || dismissedPanel;
 }
 

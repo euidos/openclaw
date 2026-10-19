@@ -133,6 +133,7 @@ type ShellChromeEventState = {
 };
 
 type ShellNavDrawerCloseState = { element: HTMLElement } & ShellChromeEventState & {
+    navigationSidebar: ShellOwner["navigationSidebar"];
     desktopNavigationExpanded: boolean;
     navDrawerTrigger: HTMLElement | null;
     closeNavDrawer: (options?: { restoreFocus?: boolean }) => void;
@@ -796,9 +797,7 @@ describe("OpenClaw shell keyboard shortcuts", () => {
         },
       } as unknown as ApplicationContext,
     };
-    const sidebar = document.createElement("openclaw-app-sidebar") as HTMLElement & {
-      dismissTransientMenus: () => boolean;
-    };
+    const sidebar = shell.navigationSidebar;
     const dismissTransientMenus = vi.spyOn(sidebar, "dismissTransientMenus").mockReturnValue(true);
     shell.element.append(sidebar);
     const trigger = document.body.appendChild(document.createElement("button"));
@@ -820,6 +819,13 @@ describe("OpenClaw shell keyboard shortcuts", () => {
     shell.toggleNavigationSurface();
     expect(updateNavigation).toHaveBeenCalledExactlyOnceWith({ navCollapsed: true });
     expect(shell.desktopNavigationExpanded).toBe(false);
+    const otherShell = document.createElement("div");
+    otherShell.append(sidebar);
+    dismissTransientMenus.mockClear();
+    shell.navDrawerOpen = true;
+    shell.closeNavDrawer();
+    expect(dismissTransientMenus).not.toHaveBeenCalled();
+    expect(shell.navDrawerOpen).toBe(false);
     trigger.remove();
   });
 

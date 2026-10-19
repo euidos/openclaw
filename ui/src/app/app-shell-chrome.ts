@@ -91,7 +91,7 @@ export interface ShellChromeHost
   readonly commandPaletteElement: OptionalCustomElement;
   readonly execApprovalElement: OptionalCustomElement;
   readonly queryRenderedElement: (tagName: string) => Element | null;
-  readonly navigationSidebar: HTMLElement;
+  readonly navigationSidebar: HTMLElement & { dismissTransientMenus?(): boolean };
   navDrawerOpen: boolean;
   desktopNavigationExpanded: boolean;
   navDrawerTrigger: HTMLElement | null;
@@ -369,7 +369,7 @@ export class ShellChromeOwner {
   };
 
   dismissSidebarTransientMenus = (): boolean =>
-    dismissNavigationTransientSurfaces(this.host.element);
+    dismissNavigationTransientSurfaces(this.host.element, this.host.navigationSidebar);
 
   private readonly handleDocumentKeydownBubble = (event: KeyboardEvent): void => {
     const host = this.host;
