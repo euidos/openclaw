@@ -22,6 +22,14 @@ const cfg: OpenClawConfig = { channels: { discord: { token: "Bot test-token" } }
 const opts = { cfg, webhookId: "123", webhookToken: "abc" };
 let fetchMock: MockInstance<typeof fetch>;
 
+async function expectDeadline() {
+  const rejection = expect(sendWebhookMessageDiscord("hello", opts)).rejects.toMatchObject({
+    name: "TimeoutError",
+    message: "request timed out",
+  });
+  await Promise.all([vi.advanceTimersByTimeAsync(DISCORD_REST_TIMEOUT_MS), rejection]);
+}
+
 describe("Discord webhook transport", () => {
   beforeEach(() => {
     makeProxyFetchMock.mockReset();
@@ -37,20 +45,18 @@ describe("Discord webhook transport", () => {
     vi.useRealTimers();
   });
 
-  it.each([
-    {
-      name: "account opt-out",
-      config: { suppressEmbeds: true, accounts: { runtime: { suppressEmbeds: false } } },
-      flags: undefined,
-    },
-  ])("applies $name link-preview suppression", async ({ config, flags }) => {
+  it("applies account opt-out of link-preview suppression", async () => {
     await sendWebhookMessageDiscord("https://example.com", {
       ...opts,
-      cfg: { channels: { discord: config } },
+      cfg: {
+        channels: {
+          discord: { suppressEmbeds: true, accounts: { runtime: { suppressEmbeds: false } } },
+        },
+      },
       accountId: "runtime",
     });
     expect(fetchMock.mock.calls[0]?.[1]?.body).toBe(
-      JSON.stringify({ content: "https://example.com", flags }),
+      JSON.stringify({ content: "https://example.com" }),
     );
   });
 
@@ -157,11 +163,7 @@ describe("Discord webhook transport", () => {
         }
       });
     });
-    const rejection = expect(sendWebhookMessageDiscord("hello", opts)).rejects.toMatchObject({
-      name: "TimeoutError",
-      message: "request timed out",
-    });
-    await Promise.all([vi.advanceTimersByTimeAsync(DISCORD_REST_TIMEOUT_MS), rejection]);
+    await expectDeadline();
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
@@ -180,22 +182,14 @@ describe("Discord webhook transport", () => {
         { status },
       );
     });
-    const rejection = expect(sendWebhookMessageDiscord("hello", opts)).rejects.toMatchObject({
-      name: "TimeoutError",
-      message: "request timed out",
-    });
-    await Promise.all([vi.advanceTimersByTimeAsync(DISCORD_REST_TIMEOUT_MS), rejection]);
+    await expectDeadline();
   });
 
   it("aborts rate-limit backoff at the deadline without leaving a retry timer", async () => {
     fetchMock.mockImplementation(async () =>
       Response.json({ message: "Slow down", retry_after: 60 }, { status: 429 }),
     );
-    const rejection = expect(sendWebhookMessageDiscord("hello", opts)).rejects.toMatchObject({
-      name: "TimeoutError",
-      message: "request timed out",
-    });
-    await Promise.all([vi.advanceTimersByTimeAsync(DISCORD_REST_TIMEOUT_MS), rejection]);
+    await expectDeadline();
     expect(fetchMock).toHaveBeenCalledOnce();
     expect(vi.getTimerCount()).toBe(0);
   });

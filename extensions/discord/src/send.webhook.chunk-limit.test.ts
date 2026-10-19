@@ -1,3 +1,4 @@
+import { json } from "node:stream/consumers";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { withServer } from "openclaw/plugin-sdk/test-env";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -24,23 +25,16 @@ async function withWebhookServer(
   const contents: string[] = [];
   const references: Array<string | undefined> = [];
   await withServer(
-    (request, response) => {
-      let body = "";
-      request.setEncoding("utf8");
-      request.on("data", (part: string) => {
-        body += part;
-      });
-      request.on("end", () => {
-        const { content, message_reference } = JSON.parse(body) as {
-          content: string;
-          message_reference?: { message_id: string };
-        };
-        references.push(message_reference?.message_id);
-        contents.push(content);
-        const next = reply(content, contents.length);
-        response.writeHead(next.status ?? 200, { "content-type": "application/json" });
-        response.end(JSON.stringify(next.body));
-      });
+    async (request, response) => {
+      const { content, message_reference } = (await json(request)) as {
+        content: string;
+        message_reference?: { message_id: string };
+      };
+      references.push(message_reference?.message_id);
+      contents.push(content);
+      const next = reply(content, contents.length);
+      response.writeHead(next.status ?? 200, { "content-type": "application/json" });
+      response.end(JSON.stringify(next.body));
     },
     async (baseUrl) => {
       const realFetch = globalThis.fetch.bind(globalThis);

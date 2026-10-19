@@ -5,6 +5,7 @@ import { EMPTY_DISCORD_TEST_OPTS as opts } from "./test-support/config.js";
 
 const mockRest = vi.hoisted(() => ({ get: vi.fn() }));
 vi.mock("./client.js", () => ({ resolveDiscordRest: () => mockRest }));
+const subject = ["guild-1", "user-1"] as const;
 type Role = [id: string, permissions: bigint, position?: number];
 type Fixture = {
   owner?: string;
@@ -91,9 +92,7 @@ describe("discord guild permission authorization", () => {
 
   it("rejects managing a role above the sender", async () => {
     mockGuild({ roles: roleHierarchy(5, 10), memberRoles: ["role-mod"] });
-    expect(await api.canManageGuildRoleDiscord("guild-1", "user-1", "role-target", opts)).toBe(
-      false,
-    );
+    expect(await api.canManageGuildRoleDiscord(...subject, "role-target", opts)).toBe(false);
   });
 
   it.each<[string, Fixture, string, boolean, boolean]>([
@@ -136,8 +135,7 @@ describe("discord guild permission authorization", () => {
     mockGuild({ memberRoles: ["role-mod"], target, ...fixture });
     expect(
       await api.canManageGuildMemberRoleDiscord(
-        "guild-1",
-        "user-1",
+        ...subject,
         target,
         role,
         opts,
@@ -148,7 +146,7 @@ describe("discord guild permission authorization", () => {
 
   it("returns null when the guild member lookup fails", async () => {
     mockRest.get.mockRejectedValueOnce(new Error("404 Member not found"));
-    expect(await api.fetchMemberGuildPermissionsDiscord("guild-1", "user-1", opts)).toBeNull();
+    expect(await api.fetchMemberGuildPermissionsDiscord(...subject, opts)).toBeNull();
   });
 
   it.each<[string, Fixture, bigint[], boolean]>([
@@ -163,23 +161,14 @@ describe("discord guild permission authorization", () => {
     ],
   ])("hasAnyGuildPermissionDiscord %s", async (_name, fixture, required, allowed) => {
     mockGuild(fixture);
-    expect(await api.hasAnyGuildPermissionDiscord("guild-1", "user-1", required, opts)).toBe(
-      allowed,
-    );
+    expect(await api.hasAnyGuildPermissionDiscord(...subject, required, opts)).toBe(allowed);
   });
 
-  it.each<[string, bigint, boolean]>([
-    ["rejects a member with only one required permission", P.KickMembers, false],
-  ])("hasAllGuildPermissionsDiscord %s", async (_name, bits, allowed) => {
-    mockGuild({ member: bits });
+  it("hasAllGuildPermissionsDiscord rejects a member with only one required permission", async () => {
+    mockGuild({ member: P.KickMembers });
     expect(
-      await api.hasAllGuildPermissionsDiscord(
-        "guild-1",
-        "user-1",
-        [P.KickMembers, P.BanMembers],
-        opts,
-      ),
-    ).toBe(allowed);
+      await api.hasAllGuildPermissionsDiscord(...subject, [P.KickMembers, P.BanMembers], opts),
+    ).toBe(false);
   });
 
   it.each<[string, Fixture, bigint, boolean]>([
