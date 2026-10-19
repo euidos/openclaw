@@ -3,7 +3,6 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { makeTempWorkspace } from "../test-helpers/workspace.js";
-import { captureEnv, setTestEnvValue } from "../test-utils/env.js";
 import { nodeFilePath } from "../test-utils/node-file-path.js";
 import { publishBootstrapFile } from "./workspace-bootstrap-publish.js";
 import * as workspace from "./workspace.js";
@@ -47,25 +46,23 @@ async function injectPartialPublicationFailure(dir: string, fileName: string) {
 }
 
 async function listTempSiblings(dir: string): Promise<string[]> {
-  const names = await fs.readdir(dir);
-  return names.filter((name) => name.startsWith(".fs-safe-")).toSorted();
+  return (await fs.readdir(dir)).filter((name) => name.startsWith(".fs-safe-")).toSorted();
 }
 
 describe("bootstrap publication atomicity", () => {
-  let nativeModeEnv: ReturnType<typeof captureEnv>;
+  const readOnly = process.platform !== "win32" && process.getuid?.() !== 0;
   let tempDir: string;
   let agentsPath: string;
   const ensure = () => ensureAgentWorkspace({ dir: tempDir, ensureBootstrapFiles: true });
   beforeEach(async () => {
-    nativeModeEnv = captureEnv(["FS_SAFE_NATIVE_MODE"]);
     // Inject actual write/publication failures through the supported JavaScript backend.
-    setTestEnvValue("FS_SAFE_NATIVE_MODE", "off");
+    vi.stubEnv("FS_SAFE_NATIVE_MODE", "off");
     tempDir = await makeTempWorkspace("openclaw-workspace-");
     agentsPath = path.join(tempDir, DEFAULT_AGENTS_FILENAME);
   });
   afterEach(async () => {
     vi.restoreAllMocks();
-    nativeModeEnv.restore();
+    vi.unstubAllEnvs();
     await fs.chmod(tempDir, 0o700);
     await fs.rm(tempDir, { recursive: true, force: true });
   });
@@ -82,40 +79,34 @@ describe("bootstrap publication atomicity", () => {
     expect(content.trim().length).toBeGreaterThan(0);
   });
 
-  it.runIf(process.platform !== "win32" && process.getuid?.() !== 0)(
-    "reuses an established read-only workspace without creating bootstrap files",
-    async () => {
-      const files = ["AGENTS.md", "SOUL.md", "IDENTITY.md", "USER.md"];
-      for (const name of files) {
-        await fs.writeFile(path.join(tempDir, name), `Authored ${name}\n`);
-      }
-      await ensure();
-      await fs.chmod(tempDir, 0o555);
-      await ensure();
-      for (const name of files) {
-        expect(await fs.readFile(path.join(tempDir, name), "utf8")).toBe(`Authored ${name}\n`);
-      }
-      expect((await fs.readdir(tempDir)).toSorted()).toEqual(files.toSorted());
-    },
-  );
+  it.runIf(readOnly)("reuses read-only workspaces", async () => {
+    const files = ["AGENTS.md", "SOUL.md", "IDENTITY.md", "USER.md"];
+    for (const name of files) {
+      await fs.writeFile(path.join(tempDir, name), `Authored ${name}\n`);
+    }
+    await ensure();
+    await fs.chmod(tempDir, 0o555);
+    await ensure();
+    for (const name of files) {
+      expect(await fs.readFile(path.join(tempDir, name), "utf8")).toBe(`Authored ${name}\n`);
+    }
+    expect((await fs.readdir(tempDir)).toSorted()).toEqual(files.toSorted());
+  });
 
-  it.runIf(process.platform !== "win32" && process.getuid?.() !== 0)(
-    "preserves an existing dangling bootstrap symlink in a read-only workspace",
-    async () => {
-      await fs.symlink("missing.md", agentsPath);
-      await fs.chmod(tempDir, 0o555);
+  it.runIf(readOnly)("preserves read-only dangling symlinks", async () => {
+    await fs.symlink("missing.md", agentsPath);
+    await fs.chmod(tempDir, 0o555);
 
-      await expect(publishBootstrapFile(agentsPath, "replacement\n")).resolves.toBe(false);
-      expect(await fs.readlink(agentsPath)).toBe("missing.md");
-      expect(await fs.readdir(tempDir)).toEqual([DEFAULT_AGENTS_FILENAME]);
-    },
-  );
+    await expect(publishBootstrapFile(agentsPath, "replacement\n")).resolves.toBe(false);
+    expect(await fs.readlink(agentsPath)).toBe("missing.md");
+    expect(await fs.readdir(tempDir)).toEqual([DEFAULT_AGENTS_FILENAME]);
+  });
 
   it("publishes one complete winner", async () => {
     const contents = ["FIRST-COMPLETE\n", "SECOND-COMPLETE\n"];
 
     const created = await Promise.all(
-      contents.map(async (content) => await publishBootstrapFile(agentsPath, content)),
+      contents.map((content) => publishBootstrapFile(agentsPath, content)),
     );
 
     expect(created.filter(Boolean)).toHaveLength(1);
@@ -155,8 +146,7 @@ describe("bootstrap publication atomicity", () => {
 
   it("preserves the raw bootstrap bytes including a UTF-8 BOM", async () => {
     // TextDecoder strips the BOM, but approval and existing-winner checks require raw bytes.
-    const bom = Buffer.from([0xef, 0xbb, 0xbf]);
-    const content = Buffer.concat([bom, Buffer.from("# BOOTSTRAP\n")]);
+    const content = Buffer.from("\ufeff# BOOTSTRAP\n", "utf8");
 
     await expect(seedWorkspaceBootstrap({ dir: tempDir, content })).resolves.toBe("seeded");
     await expect(seedWorkspaceBootstrap({ dir: tempDir, content })).resolves.toBe("already-seeded");
@@ -164,10 +154,10 @@ describe("bootstrap publication atomicity", () => {
       seedWorkspaceBootstrap({ dir: tempDir, content: Buffer.from("# Different bootstrap\n") }),
     ).rejects.toThrow("differs from the consented Claw bootstrap");
 
-    const written = await fs.readFile(path.join(tempDir, DEFAULT_BOOTSTRAP_FILENAME));
-    expect(written.equals(content)).toBe(true);
+    const bootstrapPath = path.join(tempDir, DEFAULT_BOOTSTRAP_FILENAME);
+    expect((await fs.readFile(bootstrapPath)).equals(content)).toBe(true);
     if (process.platform !== "win32") {
-      const stat = await fs.stat(path.join(tempDir, DEFAULT_BOOTSTRAP_FILENAME));
+      const stat = await fs.stat(bootstrapPath);
       expect(stat.mode & 0o777).toBe(0o600);
     }
   });

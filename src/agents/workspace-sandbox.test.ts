@@ -12,6 +12,12 @@ import { createSandboxTestContext } from "./sandbox/test-fixtures.js";
 import { resolveAttemptWorkspaceSandbox, resolveHarnessWorkspace } from "./workspace-sandbox.js";
 
 const sandboxConfig = (sandbox: AgentSandboxConfig) => ({ agents: { defaults: { sandbox } } });
+const runParams = (workspaceDir: string, sessionId = "execution") => ({
+  workspaceDir,
+  sessionId,
+  sessionKey: "agent:main:" + sessionId,
+  agentId: "main",
+});
 
 it("keeps cwd authority with the selected local or remote workspace owner", () => {
   const sandbox = createSandboxTestContext({
@@ -47,10 +53,7 @@ it("refuses a retired admitted run before creating or preparing its workspace", 
   try {
     await expect(
       resolveAttemptWorkspaceSandbox({
-        workspaceDir,
-        sessionId: "retired",
-        sessionKey: "agent:main:retired",
-        agentId: "main",
+        ...runParams(workspaceDir, "retired"),
         config: { agents: { entries: { main: { workspace: workspaceDir } } } },
         admittedRunContext: { operationalRunInstance: { runId: "retired", instanceId: "retired" } },
       }),
@@ -65,10 +68,7 @@ it("keeps writable placement policy without preparing its paths locally", async 
   await withOpenClawTestState({ label: "placement-workspace-policy" }, async (state) => {
     const remoteWorkspace = state.path("remote-execution-only");
     const preparation = resolveAttemptWorkspaceSandbox({
-      workspaceDir: state.workspaceDir,
-      sessionId: "remote-policy",
-      sessionKey: "agent:main:remote-policy",
-      agentId: "main",
+      ...runParams(state.workspaceDir, "remote-policy"),
       requireWorkspaceOnly: true,
       config: sandboxConfig({ mode: "all", backend: "unavailable-fixture" }),
       placementSandbox: createSandboxTestContext({
@@ -119,10 +119,7 @@ it.each(["realpath", "mkdir"] as const)(
         await expect(
           resolveAttemptWorkspaceSandbox({
             config,
-            agentId: "main",
-            sessionId: "workspace-preparation",
-            sessionKey: "agent:main:workspace-preparation",
-            workspaceDir: state.workspaceDir,
+            ...runParams(state.workspaceDir, "workspace-preparation"),
             placementSandbox: createSandboxTestContext(),
             admittedRunContext,
           }),
@@ -138,27 +135,55 @@ it.each(["realpath", "mkdir"] as const)(
   },
 );
 
-it("reports the selected sandbox policy without duplicate workspace creation", async () => {
+it.each([false, true])("uses independent policy session (required=%s)", async (required) => {
   await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
     await captureRuntimeConfigAsyncReader()();
-    const sessionKey = "agent:main:optional";
+    const sessionId = required ? "required" : "optional";
+    const sessionKey = "agent:main:" + sessionId;
     await upsertSessionEntryCore(
       { agentId: "main", sessionKey },
-      { sessionId: "optional", updatedAt: 1, sandboxMode: "off" },
+      {
+        sessionId,
+        updatedAt: 1,
+        sandboxMode: "off",
+        ...(required ? { sandbox: "required" as const } : {}),
+      },
     );
+    const prepare = () =>
+      resolveAttemptWorkspaceSandbox({
+        ...runParams(state.workspaceDir),
+        sandboxSessionKey: sessionKey,
+        config: sandboxConfig(
+          required
+            ? {
+                mode: "off",
+                backend: "ssh",
+                ssh: {
+                  target: "sandbox@example.invalid",
+                  identityData: {
+                    source: "env",
+                    provider: "default",
+                    id: "UNMATERIALIZED_SANDBOX_IDENTITY",
+                  },
+                },
+              }
+            : { mode: "all" },
+        ),
+      });
+    if (required) {
+      await expect(prepare()).rejects.toMatchObject({
+        code: "sandbox_provisioning",
+        cause: { code: "SECRET_SURFACE_UNAVAILABLE", ownerId: "agent-sandbox:main" },
+      });
+      return;
+    }
     const mkdir = vi.spyOn(fs, "mkdir");
     const sql = observeHostDataSql();
     try {
-      const prepared = await resolveAttemptWorkspaceSandbox({
-        agentId: "main",
-        sessionKey: "agent:main:execution",
-        sandboxSessionKey: sessionKey,
-        sessionId: "execution",
-        workspaceDir: state.workspaceDir,
-        config: sandboxConfig({ mode: "all" }),
+      expect(await prepare()).toMatchObject({
+        sandbox: null,
+        sandboxReport: { mode: "all", sandboxed: false },
       });
-      expect(prepared.sandbox).toBeNull();
-      expect(prepared.sandboxReport).toEqual({ mode: "all", sandboxed: false });
       expect(mkdir.mock.calls.filter(([dir]) => dir === state.workspaceDir)).toHaveLength(1);
       expect(
         sql.queries.filter((query) => /\bsession_(?:nodes|windows|participants)\b/.test(query)),
@@ -167,40 +192,5 @@ it("reports the selected sandbox policy without duplicate workspace creation", a
       sql.restore();
       mkdir.mockRestore();
     }
-  });
-});
-
-it("enforces required sandboxing for an independent policy session even when mode is off", async () => {
-  await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
-    await captureRuntimeConfigAsyncReader()();
-    const sessionKey = "agent:main:required";
-    await upsertSessionEntryCore(
-      { agentId: "main", sessionKey },
-      { sessionId: "required", updatedAt: 1, sandbox: "required", sandboxMode: "off" },
-    );
-    await expect(
-      resolveAttemptWorkspaceSandbox({
-        agentId: "main",
-        sessionKey: "agent:main:execution",
-        sandboxSessionKey: sessionKey,
-        sessionId: "execution",
-        workspaceDir: state.workspaceDir,
-        config: sandboxConfig({
-          mode: "off",
-          backend: "ssh",
-          ssh: {
-            target: "sandbox@example.invalid",
-            identityData: {
-              source: "env",
-              provider: "default",
-              id: "UNMATERIALIZED_SANDBOX_IDENTITY",
-            },
-          },
-        }),
-      }),
-    ).rejects.toMatchObject({
-      code: "sandbox_provisioning",
-      cause: { code: "SECRET_SURFACE_UNAVAILABLE", ownerId: "agent-sandbox:main" },
-    });
   });
 });

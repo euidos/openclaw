@@ -30,6 +30,7 @@ const dirs = useAutoCleanupTempDirTracker(afterEach);
 const digest = (value: Buffer | string) => createHash("sha256").update(value).digest("hex");
 let root: string;
 let f: Awaited<ReturnType<typeof fixture>>;
+let release: () => void;
 
 beforeEach(async () => {
   root = await fs.realpath(dirs.make("openclaw-workspace-inputs-"));
@@ -37,8 +38,15 @@ beforeEach(async () => {
   await fs.mkdir(path.join(getMediaDir(), "inbound"), { recursive: true });
   await fs.mkdir(path.join(getMediaDir(), "remote-cache"));
   f = await fixture();
+  release = registerAgentWorkspaceAccess(f.gateway, {
+    bridge: f.bridge,
+    prepareTurnAttachments: f.prepare,
+  });
 });
-afterEach(() => vi.unstubAllEnvs());
+afterEach(() => {
+  release();
+  vi.unstubAllEnvs();
+});
 
 function createBridge(
   gateway: string,
@@ -96,17 +104,6 @@ const loadImages = (params: Partial<Parameters<typeof detectAndLoadPromptImages>
     sandbox: { root: f.harness, bridge: f.bridge },
     ...params,
   });
-async function withAccess(run: () => Promise<void>) {
-  const release = registerAgentWorkspaceAccess(f.gateway, {
-    bridge: f.bridge,
-    prepareTurnAttachments: f.prepare,
-  });
-  try {
-    await run();
-  } finally {
-    release();
-  }
-}
 async function writeMedia(name = "inbound/report.txt", data: string | Buffer = "input") {
   const source = path.join(getMediaDir(), name);
   await fs.writeFile(source, data);
@@ -123,29 +120,27 @@ describeLinux("workspace attachment adapter with the real remote-shell bridge", 
     const source = await writeMedia("inbound/input.png", bytes);
     const media = [{ path: source, contentType: "image/png" }];
     const ctx = { media };
-    await withAccess(async () => {
-      await stageSandboxMedia({
-        ctx,
-        sessionCtx: ctx,
-        cfg: {},
-        sessionKey: "agent:main:test",
-        workspaceDir: f.gateway,
-      });
-      expect(ctx.media).toBe(media);
-      expect(await fs.readdir(f.gateway)).toEqual([]);
-      await prepareMedia(media);
-      expect(await fs.readFile(f.destination(source))).toEqual(bytes);
-      const result = await loadImages({ media, workspaceOnly: true });
-      expect(result.failedMediaCount).toBe(0);
-      expect(result.images).toHaveLength(1);
-      const promptOnly = await loadImages({ prompt: `Inspect ${source}` });
-      expect(promptOnly.images).toHaveLength(0);
-      const outside = path.join(f.gateway, "private.png");
-      await fs.writeFile(outside, bytes);
-      const rejected = await loadImages({ media: [{ path: outside, contentType: "image/png" }] });
-      expect(rejected.images).toHaveLength(0);
-      expect(rejected.failedMediaCount).toBe(1);
+    await stageSandboxMedia({
+      ctx,
+      sessionCtx: ctx,
+      cfg: {},
+      sessionKey: "agent:main:test",
+      workspaceDir: f.gateway,
     });
+    expect(ctx.media).toBe(media);
+    expect(await fs.readdir(f.gateway)).toEqual([]);
+    await prepareMedia(media);
+    expect(await fs.readFile(f.destination(source))).toEqual(bytes);
+    const result = await loadImages({ media, workspaceOnly: true });
+    expect(result.failedMediaCount).toBe(0);
+    expect(result.images).toHaveLength(1);
+    const promptOnly = await loadImages({ prompt: `Inspect ${source}` });
+    expect(promptOnly.images).toHaveLength(0);
+    const outside = path.join(f.gateway, "private.png");
+    await fs.writeFile(outside, bytes);
+    const rejected = await loadImages({ media: [{ path: outside, contentType: "image/png" }] });
+    expect(rejected.images).toHaveLength(0);
+    expect(rejected.failedMediaCount).toBe(1);
   });
 
   it("transfers 50 MiB without a Gateway workspace copy and preserves subsequent Harness edits", async () => {
@@ -183,20 +178,18 @@ describeLinux("workspace attachment adapter with the real remote-shell bridge", 
       media: [{ kind: "video", contentType: "video/mp4", url: "media://inbound/input.mp4" }],
     });
     const original = JSON.stringify(message);
-    await withAccess(async () => {
-      const provider = await materializeProviderContext({
-        context: { systemPrompt: "system", messages: convertToLlm([message]), tools: [] },
-        workspaceDir: f.gateway,
-        sandbox: { root: f.harness, bridge: f.bridge },
-        workspaceOnly: true,
-      });
-      expect(provider.messages[0]?.content).toContainEqual({
-        type: "video",
-        data: bytes.toString("base64"),
-        mimeType: "video/mp4",
-      });
-      expect(JSON.stringify(message)).toBe(original);
+    const provider = await materializeProviderContext({
+      context: { systemPrompt: "system", messages: convertToLlm([message]), tools: [] },
+      workspaceDir: f.gateway,
+      sandbox: { root: f.harness, bridge: f.bridge },
+      workspaceOnly: true,
     });
+    expect(provider.messages[0]?.content).toContainEqual({
+      type: "video",
+      data: bytes.toString("base64"),
+      mimeType: "video/mp4",
+    });
+    expect(JSON.stringify(message)).toBe(original);
   });
 
   it("uses canonical originals, deduplicates aliases, and separates sources with the same basename", async () => {
@@ -265,31 +258,6 @@ describeLinux("workspace attachment adapter with the real remote-shell bridge", 
     },
   );
 
-  it("stops between preparation and mutation when the source authority closes", async () => {
-    const source = await writeMedia();
-    let active = true;
-    const prepare = createWorkspaceAttachmentPreparer({
-      remoteRoot: f.harness,
-      createBridge: () => ({
-        readFile: f.bridge.readFile.bind(f.bridge),
-        createFileExclusive: f.create,
-        stat: async (params) => {
-          const stat = await f.bridge.stat(params);
-          active = false;
-          return stat;
-        },
-      }),
-    });
-    await expect(
-      prepare(turn([{ path: source }]), () => {
-        if (!active) {
-          throw new Error("source closed");
-        }
-      }),
-    ).rejects.toThrow("source closed");
-    expect(f.create).not.toHaveBeenCalled();
-  });
-
   it("does not fetch HTTP references or invent source files for inline images", async () => {
     await expect(
       prepareMedia([{ url: "https://example.test/input" }, { kind: "image" }]),
@@ -297,60 +265,70 @@ describeLinux("workspace attachment adapter with the real remote-shell bridge", 
     expect(f.create).not.toHaveBeenCalled();
   });
 
-  it("checks message authority at command admission after in-flight path validation", async () => {
-    const source = await writeMedia();
-    let active = true;
-    let creating = false;
-    let validationCompleted = false;
-    const admitted = vi.fn();
-    const prepare = createWorkspaceAttachmentPreparer({
-      remoteRoot: f.harness,
-      createBridge: (assertCurrent) => {
-        const session = createRemoteShellSandboxSession({
-          buildCommand: ({ remoteCommand }) => ({
-            argv: ["/bin/sh", "-c", remoteCommand],
-            env: { ...process.env },
-          }),
-          assertCurrent() {
-            assertCurrent();
-            admitted();
-          },
-        });
-        const bridge = createBridge(
-          f.gateway,
-          f.harness,
-          async ({ script, args = [], ...options }) => {
-            const result = await session.runCommand({
-              remoteCommand: buildRemoteCommand(["/bin/sh", "-c", script, "fixture", ...args]),
-              ...options,
-            });
-            if (creating) {
-              validationCompleted = true;
-              active = false;
-              admitted.mockClear();
-            }
-            return result;
-          },
-        );
-        return {
-          readFile: bridge.readFile.bind(bridge),
-          stat: bridge.stat.bind(bridge),
-          createFileExclusive(params) {
-            creating = true;
-            return bridge.createFileExclusive!(params);
-          },
-        };
-      },
-    });
-    await expect(
-      prepare(turn([{ path: source }]), () => {
-        if (!active) {
-          throw new Error("source closed");
-        }
-      }),
-    ).rejects.toThrow("source closed");
-    expect(validationCompleted).toBe(true);
-    expect(admitted).not.toHaveBeenCalled();
-    expect(await fs.readdir(f.harness)).toEqual([]);
-  });
+  it.each(["preparation", "command admission"])(
+    "checks source authority after %s",
+    async (stage) => {
+      const source = await writeMedia();
+      const preparing = stage === "preparation";
+      let active = true;
+      let creating = false;
+      let validationCompleted = false;
+      const admitted = vi.fn();
+      const prepare = createWorkspaceAttachmentPreparer({
+        remoteRoot: f.harness,
+        createBridge: (assertCurrent) => {
+          const session = createRemoteShellSandboxSession({
+            buildCommand: ({ remoteCommand }) => ({
+              argv: ["/bin/sh", "-c", remoteCommand],
+              env: { ...process.env },
+            }),
+            assertCurrent() {
+              assertCurrent();
+              admitted();
+            },
+          });
+          const bridge = preparing
+            ? f.bridge
+            : createBridge(f.gateway, f.harness, async ({ script, args = [], ...options }) => {
+                const command = ["/bin/sh", "-c", script, "fixture", ...args];
+                const result = await session.runCommand({
+                  remoteCommand: buildRemoteCommand(command),
+                  ...options,
+                });
+                if (creating) {
+                  validationCompleted = true;
+                  active = false;
+                  admitted.mockClear();
+                }
+                return result;
+              });
+          return {
+            readFile: bridge.readFile.bind(bridge),
+            async stat(params) {
+              const stat = await bridge.stat(params);
+              if (preparing) {
+                active = false;
+              }
+              return stat;
+            },
+            createFileExclusive(params) {
+              creating = true;
+              return preparing ? f.create(params) : bridge.createFileExclusive!(params);
+            },
+          };
+        },
+      });
+      await expect(
+        prepare(turn([{ path: source }]), () => {
+          if (!active) {
+            throw new Error("source closed");
+          }
+        }),
+      ).rejects.toThrow("source closed");
+      expect(validationCompleted).toBe(stage === "command admission");
+      expect(f.create).not.toHaveBeenCalled();
+      expect(admitted).not.toHaveBeenCalled();
+      expect(await fs.readdir(f.harness)).toEqual([]);
+    },
+  );
 });

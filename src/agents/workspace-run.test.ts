@@ -27,22 +27,25 @@ describe("rooted runtime workspace selection", () => {
   const config: OpenClawConfig = {
     agents: { entries: { main: { workspace: canonical } } },
   };
+  const rooted = (params: Partial<Parameters<typeof resolveRootedRunRuntimeWorkspace>[0]>) =>
+    resolveRootedRunRuntimeWorkspace({
+      config,
+      agentId: "main",
+      workspaceDir: executionRoot,
+      bootstrapWorkspaceDir: canonical,
+      ...params,
+    });
+  const canonicalRun = (workspaceDir: string) =>
+    resolveCanonicalRunRuntimeWorkspace({ config, agentId: "main", workspaceDir });
 
   it.each([
     { bootstrapWorkspaceDir: canonical, expected: canonical },
     { bootstrapWorkspaceDir: executionRoot, expected: undefined },
     { bootstrapWorkspaceDir: undefined, expected: undefined },
   ])(
-    "only borrows explicit canonical bootstrap $bootstrapWorkspaceDir",
+    "only borrows canonical bootstrap $bootstrapWorkspaceDir",
     ({ bootstrapWorkspaceDir, expected }) => {
-      expect(
-        resolveRootedRunRuntimeWorkspace({
-          config,
-          agentId: "main",
-          workspaceDir: executionRoot,
-          bootstrapWorkspaceDir,
-        })?.workspaceDir,
-      ).toBe(expected);
+      expect(rooted({ bootstrapWorkspaceDir })?.workspaceDir).toBe(expected);
     },
   );
 
@@ -50,11 +53,8 @@ describe("rooted runtime workspace selection", () => {
     "keeps same-workspace reload binding unless execution is confined (%s)",
     (confined) => {
       expect(
-        resolveRootedRunRuntimeWorkspace({
-          config,
-          agentId: "main",
+        rooted({
           workspaceDir: canonical,
-          bootstrapWorkspaceDir: canonical,
           ...(confined ? { requireWorkspaceOnly: true, sessionRoot: canonical } : {}),
         })?.workspaceDir,
       ).toBe(confined ? canonical : undefined);
@@ -64,13 +64,7 @@ describe("rooted runtime workspace selection", () => {
   it.each([undefined, {}])(
     "does not invent canonical ownership without a roster (%j)",
     (missingConfig) => {
-      expect(
-        resolveRootedRunRuntimeWorkspace({
-          config: missingConfig,
-          workspaceDir: executionRoot,
-          bootstrapWorkspaceDir: canonical,
-        }),
-      ).toBeUndefined();
+      expect(rooted({ config: missingConfig })).toBeUndefined();
       expect(
         resolveCanonicalRunRuntimeWorkspace({ config: missingConfig, workspaceDir: executionRoot }),
       ).toBeUndefined();
@@ -78,159 +72,128 @@ describe("rooted runtime workspace selection", () => {
   );
 
   it("selects the agent's canonical workspace only for runs that execute elsewhere", () => {
-    expect(
-      resolveCanonicalRunRuntimeWorkspace({ config, agentId: "main", workspaceDir: executionRoot }),
-    ).toMatchObject({ workspaceDir: canonical, isCanonicalWorkspace: true, usedFallback: false });
-    expect(
-      resolveCanonicalRunRuntimeWorkspace({ config, agentId: "main", workspaceDir: canonical }),
-    ).toBeUndefined();
+    expect(canonicalRun(executionRoot)).toMatchObject({
+      workspaceDir: canonical,
+      isCanonicalWorkspace: true,
+      usedFallback: false,
+    });
+    expect(canonicalRun(canonical)).toBeUndefined();
   });
 });
 
 describe("resolveRunWorkspaceDir", () => {
-  it("resolves explicit workspace values without fallback", () => {
-    const explicit = workspace("run-explicit");
-    expect(
-      resolve({
+  const explicit = workspace("run-explicit");
+  const ops = workspace("ops");
+  it.each([
+    {
+      name: "explicit workspace",
+      input: { workspaceDir: explicit, sessionKey: "agent:main:subagent:test" },
+      expected: {
+        usedFallback: false,
+        isCanonicalWorkspace: false,
+        agentId: "main",
         workspaceDir: explicit,
-        sessionKey: "agent:main:subagent:test",
-      }),
-    ).toMatchObject({
-      usedFallback: false,
-      isCanonicalWorkspace: false,
-      agentId: "main",
-      workspaceDir: path.resolve(explicit),
-    });
+      },
+    },
+    {
+      name: "missing per-agent workspace",
+      input: { sessionKey: "agent:research:subagent:test" },
+      expected: {
+        usedFallback: true,
+        isCanonicalWorkspace: true,
+        fallbackReason: "missing",
+        agentId: "research",
+        workspaceDir: researchWorkspace,
+      },
+    },
+    {
+      name: "blank default workspace",
+      input: { workspaceDir: "   ", sessionKey: "agent:main:subagent:test" },
+      expected: {
+        usedFallback: true,
+        fallbackReason: "blank",
+        agentId: "main",
+        workspaceDir: defaultWorkspace,
+      },
+    },
+    {
+      name: "normalized explicit owner",
+      input: {
+        agentId: " OPS ",
+        sessionKey: "agent:ops:main",
+        config: { agents: { entries: { ops: { workspace: ops } } } },
+      },
+      expected: { agentId: "ops", agentIdSource: "explicit", workspaceDir: ops },
+    },
+    {
+      name: "legacy non-agent key",
+      input: { sessionKey: "custom-main-key" },
+      expected: { agentId: "main", agentIdSource: "default", workspaceDir: defaultWorkspace },
+    },
+  ])("resolves $name", ({ input, expected }) => {
+    expect(resolve(input)).toMatchObject(expected);
   });
 
-  it("falls back to configured per-agent workspace when input is missing", () => {
-    expect(
-      resolve({
-        sessionKey: "agent:research:subagent:test",
-      }),
-    ).toMatchObject({
-      usedFallback: true,
-      isCanonicalWorkspace: true,
-      fallbackReason: "missing",
-      agentId: "research",
-      workspaceDir: path.resolve(researchWorkspace),
-    });
+  const rosterRequired = expect.objectContaining({ code: "RUN_WORKSPACE_ROSTER_REQUIRED" });
+  const notConfigured = expect.objectContaining({ code: "RUN_WORKSPACE_AGENT_NOT_CONFIGURED" });
+  const invalidOwner = (agentId: string) => ({
+    workspaceDir: workspace("main"),
+    agentId,
+    sessionKey: "agent:main:main",
   });
-
-  it("falls back to default workspace for blank strings", () => {
-    expect(
-      resolve({
-        workspaceDir: "   ",
-        sessionKey: "agent:main:subagent:test",
-      }),
-    ).toMatchObject({
-      usedFallback: true,
-      fallbackReason: "blank",
-      agentId: "main",
-      workspaceDir: path.resolve(defaultWorkspace),
-    });
-  });
-
-  it("refuses to invent an agent when config is unavailable", () => {
-    const workspaceDir = path.join(path.sep, "srv", "openclaw-workspace");
-    expect(() =>
-      resolve({
+  const opsOnly = { agents: { entries: { ops: {} } } };
+  it.each([
+    {
+      name: "missing config despite environment workspace",
+      input: {
         workspaceDir: null,
         sessionKey: "custom-main-key",
         config: undefined,
-        env: { ...process.env, OPENCLAW_WORKSPACE_DIR: workspaceDir },
-      }),
-    ).toThrow(expect.objectContaining({ code: "RUN_WORKSPACE_ROSTER_REQUIRED" }));
+        env: {
+          ...process.env,
+          OPENCLAW_WORKSPACE_DIR: path.join(path.sep, "srv", "openclaw-workspace"),
+        },
+      },
+      error: rosterRequired,
+    },
+    {
+      name: "explicit owner without roster",
+      input: { agentId: "research", config: {} },
+      error: rosterRequired,
+    },
+    { name: "empty owner", input: invalidOwner(""), error: "Invalid explicit agent id" },
+    { name: "invalid owner", input: invalidOwner("!!!"), error: "Invalid explicit agent id" },
+    {
+      name: "unconfigured owner",
+      input: { agentId: "research", config: opsOnly },
+      error: notConfigured,
+    },
+    {
+      name: "unconfigured session owner",
+      input: { sessionKey: "agent:research:subagent:test", config: opsOnly },
+      error: notConfigured,
+    },
+    {
+      name: "malformed agent key despite explicit owner",
+      input: { sessionKey: "agent::broken", agentId: "research" },
+      error: "Malformed agent session key",
+    },
+  ])("rejects $name", ({ input, error }) => {
+    expect(() => resolve(input)).toThrow(error);
   });
 
-  it("rejects an explicit agent when the supplied config has no roster", () => {
-    expect(() =>
-      resolve({
-        agentId: "research",
-        config: {},
-      }),
-    ).toThrow(expect.objectContaining({ code: "RUN_WORKSPACE_ROSTER_REQUIRED" }));
-  });
-
-  it.each(["", "!!!"])("rejects invalid explicit agent id %j", (agentId) => {
-    expect(() =>
-      resolve({
-        workspaceDir: workspace("main"),
-        agentId,
-        sessionKey: "agent:main:main",
-      }),
-    ).toThrow("Invalid explicit agent id");
-  });
-
-  it("normalizes a valid explicit agent at the selection boundary", () => {
-    const workspaceDir = workspace("ops");
-    expect(
-      resolve({
-        agentId: " OPS ",
-        sessionKey: "agent:ops:main",
-        config: { agents: { entries: { ops: { workspace: workspaceDir } } } },
-      }),
-    ).toMatchObject({
-      agentId: "ops",
-      agentIdSource: "explicit",
-      workspaceDir: path.resolve(workspaceDir),
-    });
-  });
-
-  it.each([
-    { agentId: "research", sessionKey: undefined },
-    { agentId: undefined, sessionKey: "agent:research:subagent:test" },
-  ])("rejects an unconfigured workspace owner for $sessionKey", ({ agentId, sessionKey }) => {
-    expect(() =>
-      resolve({
-        agentId,
-        sessionKey,
-        config: { agents: { entries: { ops: {} } } },
-      }),
-    ).toThrow(expect.objectContaining({ code: "RUN_WORKSPACE_AGENT_NOT_CONFIGURED" }));
-  });
-
-  it("throws for malformed agent session keys even with an explicit agent owner", () => {
-    // Explicit ownership must not mask malformed keys as legacy main-session keys.
-    expect(() =>
-      resolve({
-        sessionKey: "agent::broken",
-        agentId: "research",
-      }),
-    ).toThrow("Malformed agent session key");
-  });
-
-  it("treats non-agent legacy keys as default, not malformed", () => {
-    expect(
-      resolve({
-        sessionKey: "custom-main-key",
-      }),
-    ).toMatchObject({
-      agentId: "main",
-      agentIdSource: "default",
-      workspaceDir: path.resolve(defaultWorkspace),
-    });
-  });
-
-  it("uses the persisted fixed-store owner for a bare global workspace", () => {
-    const opsWorkspace = workspace("ops-global");
-    const cfg = {
+  it("uses persisted fixed-store ownership for a bare global workspace", () => {
+    const config: OpenClawConfig = {
       agents: {
         ownership: "explicit",
         defaults: { sessionStore: { agentId: "ops" } },
-        entries: {
-          ops: { workspace: opsWorkspace },
-          research: { workspace: workspace("research-global") },
-        },
+        entries: { ops: { workspace: ops }, research: { workspace: researchWorkspace } },
       },
       session: { scope: "global", store: "/tmp/openclaw-shared-sessions.sqlite" },
-    } satisfies OpenClawConfig;
-
-    expect(
-      resolve({
-        sessionKey: "global",
-        config: cfg,
-      }),
-    ).toMatchObject({ agentId: "ops", workspaceDir: path.resolve(opsWorkspace) });
+    };
+    expect(resolve({ sessionKey: "global", config })).toMatchObject({
+      agentId: "ops",
+      workspaceDir: ops,
+    });
   });
 });
