@@ -99,6 +99,7 @@ export function buildSideRunAttemptParams(
     authProfileStore: params.preparedRuntimeAuth.authProfileStore,
     modelRegistry: params.preparedRuntimeAuth.modelRegistry,
     preparedModelRuntime: params.preparedModelRuntime,
+    preparedWebSearchPolicy: params.preparedWebSearchPolicy,
     ...(params.preparedRuntimeAuth.resolvedApiKey
       ? { resolvedApiKey: params.preparedRuntimeAuth.resolvedApiKey }
       : {}),

@@ -21,6 +21,7 @@ import {
 import { resolveAgentWorkspaceDir } from "./agent-scope.js";
 import {
   prepareBtwRuntimeAuth,
+  prepareBtwHarnessToolPolicies,
   resolveBtwPreparedRuntimeAuth,
   resolveRuntimeModel,
   runCliBtwSideQuestion,
@@ -32,7 +33,6 @@ import { runLightweightBtwStream } from "./btw-stream.js";
 import { readBtwTranscriptMessages, resolveBtwSessionTranscriptPath } from "./btw-transcript.js";
 import { getActiveEmbeddedRunSnapshot } from "./embedded-agent-runner/runs.js";
 import { runEmbeddedSessionFork } from "./embedded-agent-runner/session-fork.js";
-import { preparePluginHarnessPolicyToolsAllow } from "./harness/execution-environment.js";
 import { createAgentHarnessHostCapabilities } from "./harness/host-capability.js";
 import { resolveAgentHarnessOwnerPluginId } from "./harness/registry.js";
 import { ensureSelectedAgentHarnessPlugin } from "./harness/runtime-plugin.js";
@@ -249,26 +249,6 @@ export async function runBtwSideQuestion(
       runtime: Awaited<ReturnType<typeof resolveRuntimeModel>>,
       routeFinalized = false,
     ): Promise<BtwHarnessSideQuestionDispatch> => {
-      const toolsAllow = await preparePluginHarnessPolicyToolsAllow({
-        config: params.cfg,
-        sessionId,
-        sessionKey: params.sessionKey,
-        sandboxSessionKey: params.sandboxSessionKey,
-        agentId: sessionAgentId,
-        provider: runtime.model.provider,
-        modelId: runtime.model.id,
-        messageProvider: params.messageProvider,
-        messageChannel: params.messageChannel,
-        spawnedBy: params.spawnedBy,
-        groupId: params.groupId,
-        groupChannel: params.groupChannel,
-        groupSpace: params.groupSpace,
-        agentAccountId: params.agentAccountId,
-        senderId: params.senderId,
-        senderName: params.senderName,
-        senderUsername: params.senderUsername,
-        senderE164: params.senderE164,
-      });
       const authPreparation =
         selectedHarness.id === harness.id
           ? undefined
@@ -386,6 +366,13 @@ export async function runBtwSideQuestion(
         },
       };
       void sandboxLifetime;
+      const { toolsAllow, webSearchPolicy } = await prepareBtwHarnessToolPolicies({
+        ...params,
+        agentId: sessionAgentId,
+        sessionId,
+        runtimeModel,
+        sandbox,
+      });
       const preparedRunAdmission = prepareSystemAgentRunAdmission(
         params.cfg,
         sideRunId,
@@ -424,6 +411,7 @@ export async function runBtwSideQuestion(
           model: runtimeModel.id,
           runtimeModel,
           preparedModelRuntime,
+          preparedWebSearchPolicy: webSearchPolicy,
           preparedRuntimeAuth: {
             plan: runtimeAuthPlan,
             authProfileStore: scopeAuthProfileStoreToPreparedPlan(

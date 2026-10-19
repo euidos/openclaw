@@ -59,15 +59,22 @@ it.each([
   "late-requester-id-created",
   "late-requester-id-removed",
   "late-requester-id-reassigned",
+  "btw-unchanged",
+  "btw-requester-revoked",
+  "btw-requester-reassigned",
+  "model-less",
 ] as const)(
-  "binds prepared hosted search to current native authority for %s",
-  async (transition) => {
+  "binds prepared hosted search to current native authority for transition %s",
+  async (scenario) => {
+    const sideQuestion = scenario.startsWith("btw-");
+    const modelLess = scenario === "model-less";
+    const transition = scenario.replace(/^btw-/, "");
     const params = fixture.createParams(
       path.join(fixture.tempDir, "session.jsonl"),
       fixture.tempDir,
       {
-        sessionKey: `agent:main:dashboard:native-search-${transition}`,
-        sessionId: `native-search-${transition}`,
+        sessionKey: `agent:main:dashboard:native-search-${scenario}`,
+        sessionId: `native-search-${scenario}`,
         provider: "openai",
         prompt: "Synthetic native search policy proof.",
       },
@@ -133,6 +140,17 @@ it.each([
       } satisfies Parameters<typeof fixture.writeCodexAppServerBinding>[1];
       await fixture.writeNativeCatalogFixture(binding.rolloutPath, binding.threadId, []);
       await fixture.writeCodexAppServerBinding(params.sessionFile, binding);
+      if (sideQuestion) {
+        await fixture.testCodexAppServerBindingStore.mutate(
+          {
+            kind: "session",
+            agentId: "main",
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+          },
+          { kind: "set", binding },
+        );
+      }
       let preparationReply = false;
       let mutation: Promise<void> | undefined;
       // oxlint-disable-next-line typescript/unbound-method -- Calls preserve the intercepted Worker receiver.
@@ -170,10 +188,14 @@ it.each([
       });
       let prepared: typeof params;
       const prepare = () =>
-        preparePluginHarnessParams(params, harness, false, () => {}, false, {
-          provider: "openai",
-          model: "search-allowed",
-        });
+        preparePluginHarnessParams(
+          params,
+          harness,
+          false,
+          () => {},
+          false,
+          modelLess ? null : { provider: "openai", model: "search-allowed" },
+        );
       try {
         if (transition === "changed") {
           const readProjection = createSessionRowCapabilityReader({
@@ -204,10 +226,16 @@ it.each([
       if (transition === "changed") {
         expect(preparationReply).toBe(true);
       }
-      expect(prepared.preparedWebSearchPolicy).toMatchObject({
-        allowed: true,
-        persistentAllowed: true,
-      });
+      if (!modelLess) {
+        expect(prepared.preparedWebSearchPolicy).toMatchObject({
+          allowed: true,
+          persistentAllowed: true,
+        });
+      }
+      if (sideQuestion && transition !== "unchanged") {
+        // Change the requester after core preparation, before native source capture.
+        await revokeRequester();
+      }
       expect(prepared.pluginHarnessToolPolicyRestricted).toBe(false);
       if (transition === "early-requester-revoked") {
         await revokeRequester();
@@ -274,7 +302,31 @@ it.each([
               modelProvider: "openai",
             };
           }
+          if (method === "thread/fork") {
+            const response = {
+              ...fixture.threadStartResult("side-thread", { cwd: fixture.tempDir }),
+              model: "search-allowed",
+              modelProvider: "openai",
+            };
+            wire.seed(response, { loaded: true, subscribed: true });
+            return response;
+          }
           if (method === "turn/start") {
+            if (sideQuestion) {
+              queueMicrotask(() => {
+                wire.notify({
+                  method: "turn/completed",
+                  params: {
+                    threadId: "side-thread",
+                    turn: {
+                      id: "turn-1",
+                      status: "completed",
+                      items: [{ id: "answer", type: "agentMessage", text: "Synthetic answer." }],
+                    },
+                  },
+                });
+              });
+            }
             return fixture.turnStartResult();
           }
           if (method === "modelProvider/capabilities/read") {
@@ -303,10 +355,11 @@ it.each([
       );
       let requesterChanged = false;
       if (
-        transition === "requester-revoked" ||
-        transition === "requester-reassigned" ||
-        transition === "missing-requester-id-created" ||
-        lateIdChange
+        !sideQuestion &&
+        (transition === "requester-revoked" ||
+          transition === "requester-reassigned" ||
+          transition === "missing-requester-id-created" ||
+          lateIdChange)
       ) {
         const dispatch = fixture.CodexAppServerClient.prototype.request.bind(wire.client);
         wire.request.mockImplementation((method, body, options) =>
@@ -367,18 +420,56 @@ it.each([
               }),
         );
       }
-      const run = fixture.runCodexAppServerAttempt(prepared, { pluginConfig });
-      const complete = run.waitForTurnAccepted().then(
-        () =>
-          wire.notify({
-            method: "turn/completed",
-            params: {
-              threadId: binding.threadId,
-              turn: { id: "turn-1", status: "completed", items: [] },
-            },
-          }),
-        () => {},
-      );
+      const sideParams = {
+        cfg: params.config,
+        agentDir: params.agentDir!,
+        agentId: "main",
+        provider: "openai",
+        model: "search-allowed",
+        runtimeModel: params.model,
+        question: "Synthetic side question.",
+        sessionEntry: { sessionId: params.sessionId, updatedAt: 1 },
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        sessionFile: params.sessionFile,
+        storePath: scope.storePath,
+        workspaceDir: fixture.tempDir,
+        isNewSession: false,
+        resolvedReasoningLevel: "off" as const,
+        hostCapabilities: params.hostCapabilities,
+        preparedWebSearchPolicy: prepared.preparedWebSearchPolicy,
+        preparedRuntimeAuth: {
+          plan: {
+            providerForAuth: "openai",
+            authProfileProviderForAuth: "openai",
+            selectedAuthMode: "api-key" as const,
+          },
+          authStorage: params.authStorage,
+          authProfileStore: params.authProfileStore,
+          modelRegistry: params.modelRegistry,
+        },
+      };
+      const run = sideQuestion
+        ? fixture.runCodexAppServerSideQuestion(sideParams, {
+            pluginConfig,
+            bindingStore: fixture.testCodexAppServerBindingStore,
+            nativeHookRelay: { enabled: false },
+          })
+        : fixture.runCodexAppServerAttempt(prepared, { pluginConfig });
+      const complete =
+        "waitForTurnAccepted" in run
+          ? run.waitForTurnAccepted().then(
+              () =>
+                wire.notify({
+                  method: "turn/completed",
+                  params: {
+                    threadId: binding.threadId,
+                    turn: { id: "turn-1", status: "completed", items: [] },
+                  },
+                }),
+              () => {},
+            )
+          : Promise.resolve();
       const outcome = await run.then(
         (value) => ({ value }),
         (error: unknown) => ({ error }),
@@ -389,7 +480,10 @@ it.each([
       );
       const nativeWrites = requests.filter(
         ({ method }) =>
-          method === "thread/resume" || method === "thread/start" || method === "turn/start",
+          method === "thread/resume" ||
+          method === "thread/start" ||
+          method === "thread/fork" ||
+          method === "turn/start",
       );
       const nativeSearch = nativeWrites
         .filter(({ method }) => method !== "turn/start")
@@ -399,9 +493,21 @@ it.each([
             : undefined,
         );
       console.log(
-        `[native-search] transition=${transition} thread-or-turn-writes=${nativeWrites.length} thread-search=${JSON.stringify(nativeSearch)} outcome=${"error" in outcome ? "rejected" : "completed"}`,
+        `[native-search] transition=${scenario} thread-or-turn-writes=${nativeWrites.length} thread-search=${JSON.stringify(nativeSearch)} outcome=${"error" in outcome ? "rejected" : "completed"}`,
       );
-      if (transition !== "unchanged") {
+      if (modelLess) {
+        // A supervised cached-search thread may refuse a disabled policy replacement.
+        expect(nativeSearch.every((mode) => mode === "disabled")).toBe(true);
+        if ("error" in outcome) {
+          expect(outcome.error).toMatchObject({
+            message: expect.stringMatching(/web.search configuration|prepared.*policy/),
+          });
+          expect(nativeWrites).toEqual([]);
+        } else {
+          expect(nativeSearch.length).toBeGreaterThan(0);
+          expect(nativeWrites.filter(({ method }) => method === "turn/start")).toHaveLength(1);
+        }
+      } else if (transition !== "unchanged") {
         expect(outcome).toHaveProperty("error");
         expect("error" in outcome && outcome.error).toMatchObject({
           message: expect.stringMatching(
@@ -412,20 +518,25 @@ it.each([
         });
         expect(nativeWrites).toEqual([]);
         if (
-          transition === "requester-revoked" ||
-          transition === "requester-reassigned" ||
-          transition === "missing-requester-id-created" ||
-          lateIdChange
+          !sideQuestion &&
+          (transition === "requester-revoked" ||
+            transition === "requester-reassigned" ||
+            transition === "missing-requester-id-created" ||
+            lateIdChange)
         ) {
           expect(requesterChanged).toBe(true);
         }
       } else {
         expect(outcome).not.toHaveProperty("error");
-        expect(nativeWrites.find(({ method }) => method === "thread/resume")?.params).toMatchObject(
-          { config: { web_search: "cached" } },
-        );
+        expect(
+          nativeWrites.find(
+            ({ method }) => method === (sideQuestion ? "thread/fork" : "thread/resume"),
+          )?.params,
+        ).toMatchObject({ config: { web_search: "cached" } });
         expect(nativeWrites.filter(({ method }) => method === "turn/start")).toHaveLength(1);
-        expect(resolvePolicy).not.toHaveBeenCalled();
+        if (!sideQuestion && !modelLess) {
+          expect(resolvePolicy).not.toHaveBeenCalled();
+        }
       }
     } finally {
       close();

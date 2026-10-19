@@ -23,6 +23,11 @@ import { executePreparedCliRun } from "./cli-runner/execute.runtime.js";
 import { prepareCliRunContext } from "./cli-runner/prepare.runtime.js";
 import type { BlockReplyChunking } from "./embedded-agent-block-chunker.js";
 import { resolveModelAsync } from "./embedded-agent-runner/model.js";
+import {
+  preparePluginHarnessToolPolicies,
+  resolvePluginHarnessPolicyToolsAllow,
+} from "./harness/execution-environment.js";
+import { readSessionRuntimeOwnershipAsync } from "./harness/session-runtime-ownership.js";
 import type { AgentHarness } from "./harness/types.js";
 import type { ImageSanitizationLimits } from "./image-sanitization.js";
 import {
@@ -42,6 +47,7 @@ import {
   resolvePreparedRuntimeModelAuth,
 } from "./runtime-plan/resolve-auth.js";
 import type { AgentRuntimeAuthPlan } from "./runtime-plan/types.js";
+import type { SandboxContext } from "./sandbox/types.js";
 import { resolveAgentTimeoutMs } from "./timeout.js";
 import { sanitizeImageBlocks } from "./tool-images.js";
 import { normalizeUsage, type NormalizedUsage } from "./usage.js";
@@ -440,6 +446,33 @@ export type RunBtwSideQuestionParams = {
   /** Internal execution identity; never reuse a parent/correlation run id. */
   authorityRunId?: string;
 };
+
+export async function prepareBtwHarnessToolPolicies(
+  params: RunBtwSideQuestionParams & {
+    sessionId: string;
+    runtimeModel: Model;
+    sandbox: SandboxContext | null;
+  },
+) {
+  const nativeOwnership = await readSessionRuntimeOwnershipAsync({ ...params, config: params.cfg });
+  const policies = await preparePluginHarnessToolPolicies(
+    {
+      ...params,
+      config: params.cfg,
+      provider: params.runtimeModel.provider,
+      modelId: params.runtimeModel.id,
+    },
+    undefined,
+    undefined,
+    nativeOwnership
+      ? (nativeOwnership.modelRef ?? null)
+      : { provider: params.runtimeModel.provider, model: params.runtimeModel.id },
+  );
+  return {
+    toolsAllow: resolvePluginHarnessPolicyToolsAllow(policies),
+    webSearchPolicy: policies.webSearchPolicy,
+  };
+}
 
 export async function runCliBtwSideQuestion(params: {
   cfg: OpenClawConfig;

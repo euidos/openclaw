@@ -69,6 +69,10 @@ reassigning the requester before native thread or turn dispatch rejects the
 operation before that request reaches Codex. This also applies to `/btw`. Hosted
 search runs inside Codex; OpenClaw validates admission of the search-enabled
 native turn, rather than receiving a separate callback for each hosted search.
+Pending native supervision without a selected model has no hosted search tool.
+Retry after the native session selects a model to prepare its search policy.
+Missing prepared policy also disables hosted search; Codex does not resolve it
+later while building native tools.
 
 `sessions_yield`, `sessions_spawn`, and message-tool-only source replies stay
 direct because they are turn-control or delegation contracts. Guidance uses
