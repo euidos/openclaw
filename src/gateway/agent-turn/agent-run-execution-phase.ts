@@ -165,6 +165,7 @@ async function executeAgentRun(
     };
     const assertDispatchCurrent = () => {
       params.assertContextCurrent?.();
+      params.executionSource?.();
       prepared.operatorAuthority?.assertCurrent();
       prepared.userTurn.assertRequesterCurrent?.();
       abortController.signal.throwIfAborted();
@@ -454,6 +455,7 @@ async function executeAgentRun(
               },
               cronCreatorAuthority: prepared.cronCreatorAuthority,
               ingressOpts: {
+                assertSourceCurrent: params.executionSource,
                 skillLibraryAuthoring,
                 message,
                 images: params.images,

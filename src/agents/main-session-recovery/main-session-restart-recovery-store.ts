@@ -113,6 +113,7 @@ export async function recoverStore(params: {
   for (const { sessionKey, entry: loadedEntry } of entries) {
     let entry = loadedEntry;
     let completionSource: SessionSourceAssertion | undefined;
+    let executionSource: SessionSourceAssertion | undefined;
     let releaseCompletionSource: (() => void) | undefined;
     const isRecoveryCandidate =
       !loadedEntry.mainRestartRecovery?.tombstone &&
@@ -502,6 +503,7 @@ export async function recoverStore(params: {
           },
         });
         completionSource = recovered?.source;
+        executionSource = recovered?.source;
         releaseCompletionSource = recovered?.release;
       }
       if (
@@ -611,6 +613,7 @@ export async function recoverStore(params: {
         entry,
         observation: recoveryView.observation,
         completionSource,
+        executionSource,
         releaseCompletionSource: releaseDispatchedCompletionSource,
         recoveryAttempt: recoveryView.nextAttempt,
         controllerInput: params.controllerInput,

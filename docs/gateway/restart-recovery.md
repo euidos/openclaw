@@ -134,9 +134,11 @@ reruns the sender task or restores old approvals.
 If an accepted peer input was already consumed by a turn when the Gateway died,
 main-session recovery uses its saved delivery source to resume that turn. It checks
 the original endpoints and current communication permissions again, including
-after another forced restart. The input remains consumed and is not submitted as
-a new message. A queued session event joins this recovery through normal session
-admission instead of treating the missing live sender as an ended session.
+after another forced restart. Recovered execution retains these checks for tool
+effects, so revoking communication permission stops further effects. The input
+remains consumed and is not submitted as a new message. A queued session event
+joins this recovery through normal session admission instead of treating the
+missing live sender as an ended session.
 
 When an update replaces the bundled Control UI, an open tab reloads after the
 Gateway reports the new build. Automatic recovery for that reported build and
