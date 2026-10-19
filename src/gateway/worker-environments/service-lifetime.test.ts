@@ -715,43 +715,74 @@ describe("worker environment service", () => {
     }
   });
 
-  it("retains a bootstrap lease when scheduler shutdown precedes service teardown", async () => {
-    const environmentId = "worker-scheduler-bootstrap";
-    const initial = await support.seedBootstrapping(environmentId);
-    const entered = createDeferred();
-    const finishProducer = createDeferred();
-    let signal: AbortSignal | undefined;
-    support.testState.bootstrapWorker = vi.fn(async (input) => {
-      signal = input.signal;
-      entered.resolve();
-      await finishProducer.promise;
-      input.signal.throwIfAborted();
-      return support.BOOTSTRAP_RECEIPT;
-    });
-    const destroy = vi.fn(async () => {});
-    const scheduler = createTestGatewayScheduler();
-    const workerService = support.createService(support.createProvider({ destroy }), { scheduler });
-    const reconciliation = workerService.reconcileEnvironment(environmentId).catch(() => undefined);
-    try {
-      await entered.promise;
-      scheduler.beginClose();
-      expect(signal?.aborted).toBe(true);
-      finishProducer.resolve();
-      await reconciliation;
-      expect(destroy).not.toHaveBeenCalled();
-      expect(support.testState.store.get(environmentId)).toMatchObject({
-        state: initial.state,
-        leaseId: initial.leaseId,
-        ownerEpoch: initial.ownerEpoch,
-        destroyRequestedAtMs: null,
-        lastError: initial.lastError,
-      });
-    } finally {
-      finishProducer.resolve();
-      await reconciliation;
-      await workerService.stop();
-    }
-  });
+  it.each(["ssh", "node"] as const)(
+    "retains a %s bootstrap lease when scheduler shutdown precedes service teardown",
+    async (transport) => {
+      const environmentId = "worker-scheduler-bootstrap";
+      const initial = await (transport === "ssh"
+        ? support.seedBootstrapping(environmentId)
+        : (async () => {
+            await support.testState.store.createIntent({
+              environmentId,
+              providerId: "fake",
+              profileId: "development",
+              profileSnapshot: { settings: { region: "test" } },
+              provisionOperationId: `provision:${environmentId}`,
+            });
+            return support.testState.store.transition({
+              environmentId,
+              from: "requested",
+              to: "provisioning",
+            });
+          })());
+      const entered = createDeferred();
+      const finishProducer = createDeferred();
+      let activeSignal: AbortSignal | undefined;
+      const install = async (workSignal?: AbortSignal) => {
+        activeSignal = workSignal;
+        entered.resolve();
+        await finishProducer.promise;
+        workSignal?.throwIfAborted();
+        return support.BOOTSTRAP_RECEIPT;
+      };
+      support.testState.bootstrapWorker = vi.fn(({ signal }) => install(signal));
+      const destroy = vi.fn(async () => {});
+      const scheduler = createTestGatewayScheduler();
+      const workerService = support.createService(
+        support.createProvider({
+          provision: async () => ({
+            leaseId: "lease:provisioning",
+            node: { deviceId: "node:provisioning" },
+          }),
+          destroy,
+        }),
+        { scheduler, ensureNodeWorkerBundle: ({ signal }) => install(signal) },
+      );
+      const reconciliation = workerService
+        .reconcileEnvironment(environmentId)
+        .catch(() => undefined);
+      try {
+        await entered.promise;
+        scheduler.beginClose();
+        expect(activeSignal?.aborted).toBe(true);
+        finishProducer.resolve();
+        await reconciliation;
+        expect(destroy).not.toHaveBeenCalled();
+        expect(support.testState.store.get(environmentId)).toMatchObject({
+          state: initial.state,
+          leaseId: initial.leaseId,
+          ownerEpoch: initial.ownerEpoch,
+          provisionOperationId: initial.provisionOperationId,
+          destroyRequestedAtMs: null,
+          lastError: initial.lastError,
+        });
+      } finally {
+        finishProducer.resolve();
+        await reconciliation;
+        await workerService.stop();
+      }
+    },
+  );
 
   it.each([
     "provision",

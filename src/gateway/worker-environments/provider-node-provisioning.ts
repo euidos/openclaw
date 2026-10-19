@@ -40,6 +40,7 @@ type WorkerNodeProvisioningOptions = Pick<
   | "saveError"
 > &
   Pick<ReturnType<typeof createWorkerProviderOwnerLifecycle>, "failBootstrap"> & {
+    ownerSignal: AbortSignal;
     commitReady: WorkerCredentialBroker["commitReady"];
   };
 
@@ -357,8 +358,9 @@ export function createWorkerNodeProvisioning(options: WorkerNodeProvisioningOpti
       }
     } catch (error) {
       await cancellation?.settleStopIntent();
-      if (options.isStopping()) {
-        workSignal.throwIfAborted();
+      if (options.ownerSignal.aborted) {
+        // Owner shutdown leaves this allocation for restart recovery.
+        throw error;
       }
       return await options.failBootstrap(record, lease.leaseId, provider, error, nodePatch);
     }
