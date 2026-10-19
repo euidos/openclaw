@@ -204,9 +204,13 @@ import fs from "node:fs";
 import { createRequire, isBuiltin, registerHooks } from "node:module";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-const [entry, observer, rootDir, mode, outcome, sealed] = process.argv.slice(1);
+const [entry, observer, rootDir, mode, outcome, sealed, bundledNativeAsset] = process.argv.slice(1);
+const sealedImports = new Set([
+  pathToFileURL(entry).href,
+  ...(bundledNativeAsset ? [bundledNativeAsset, pathToFileURL(bundledNativeAsset).href] : []),
+]);
 if (sealed) registerHooks({ resolve(specifier, context, next) {
-  if (!isBuiltin(specifier) && specifier !== pathToFileURL(entry).href)
+  if (!isBuiltin(specifier) && !sealedImports.has(specifier))
     throw new Error("sealed dependency escaped: " + specifier);
   return next(specifier, context);
 }});
@@ -235,7 +239,8 @@ if (outcome === "missing") {
   assert.equal(fs.readFileSync(path.join(rootDir, "proof.txt"), "utf8"), "native proof");
   assert.equal(fs.readFileSync(path.join(rootDir, "created.txt"), "utf8"), "create proof");
 }
-const loaded = Object.keys(createRequire(import.meta.url).cache).filter((file) => file.endsWith("fs-safe-native.node"));
+const loaded = Object.keys(createRequire(import.meta.url).cache).filter((file) =>
+  file.endsWith("fs-safe-native.node") || file === bundledNativeAsset);
 assert.equal(loaded.length, outcome === "native" ? 1 : 0);
 if (loaded.length) assert(loaded[0].startsWith(path.dirname(rootDir) + path.sep));
 `;
@@ -1045,6 +1050,15 @@ console.log("relocated session card renders with bundled fonts");
           worker ? "output/worker/worker.mjs" : "output/plugin-sdk/memory-core-host-engine-fs.js",
         );
         const observer = worker ? entry : path.join(relocatedRoot, "output/observer.js");
+        const bundledNativeAsset =
+          worker && process.platform === "darwin"
+            ? path.join(
+                path.dirname(entry),
+                WORKER_BUNDLE_DARWIN_NATIVE_ARTIFACTS[
+                  process.arch === "arm64" ? "darwin-arm64" : "darwin-x64"
+                ],
+              )
+            : "";
         const probe = async (
           name: string,
           mode: string,
@@ -1067,6 +1081,7 @@ console.log("relocated session card renders with bundled fonts");
                   mode,
                   outcome,
                   worker ? "sealed" : "",
+                  bundledNativeAsset,
                 ],
                 {
                   cwd: relocatedRoot,
@@ -1101,10 +1116,13 @@ console.log("relocated session card renders with bundled fonts");
           }
         };
         if (worker) {
+          // Darwin workers require their bundled addon; other hosts retain the fallback.
+          const mode = bundledNativeAsset ? "require" : "off";
+          const outcome = bundledNativeAsset ? "native" : "fallback";
           await join([
-            probe("default", "off", "fallback"),
+            probe("default", mode, outcome),
             ...["FS_SAFE_NATIVE_MODE", "OPENCLAW_FS_SAFE_NATIVE_MODE"].map((key) =>
-              probe(key, "off", "fallback", { [key]: "require" }),
+              probe(key, mode, outcome, { [key]: "require" }),
             ),
           ]);
         } else {
