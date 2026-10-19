@@ -32,6 +32,7 @@ import { wizardHandlers } from "./wizard.js";
 vi.mock("../../agents/embedded-agent.js", () => ({ runEmbeddedAgent: vi.fn() }));
 
 afterEach(() => vi.restoreAllMocks());
+const device = { deviceId: "wizard-device", role: "operator" };
 
 it.each([
   { revoked: false, progress: false },
@@ -51,7 +52,7 @@ it.each([
       let probe: Awaited<ReturnType<typeof runSetupInferenceTurn>> | undefined;
       const run = vi.spyOn(embeddedAgent, "runEmbeddedAgent").mockImplementation(async () => {
         if (revoked) {
-          invalidateGatewayDeviceRevocation(context, "wizard-device", "operator");
+          invalidateGatewayDeviceRevocation(context, device.deviceId, device.role);
         }
         const scope = expectDefined(getPluginRuntimeGatewayRequestScope(), "probe scope");
         const captured = expectDefined(
@@ -106,7 +107,7 @@ it.each([
       ) {
         const authority = captureGatewayDeviceRevocation(
           context,
-          { deviceId: "wizard-device", role: "operator" },
+          device,
           () => true,
           connection.signal,
         );
@@ -193,24 +194,16 @@ it.each(["admission", "publication"])(
         createSession,
       };
       const closed = new Error(`Connection closed before ${phase}`);
-      if (phase === "admission") {
-        connection.abort(closed);
-        try {
-          await expect(startWizardLogin(params)).rejects.toThrow(closed.message);
-        } finally {
-          for (const session of context.wizardSessions.values()) {
-            session.cancel();
-            await whenAdmittedWizardSessionSettled(session);
-          }
-        }
-        expect(createSession).not.toHaveBeenCalled();
-      } else {
-        const session = expectDefined(
-          await createAdmittedWizardSession(createSession),
-          "admitted login session",
-        );
-        try {
-          connection.abort(closed);
+      const session =
+        phase === "publication"
+          ? expectDefined(
+              await createAdmittedWizardSession(createSession),
+              "admitted login session",
+            )
+          : undefined;
+      connection.abort(closed);
+      try {
+        if (session) {
           await publishWizardLoginSession({ ...params, session });
           expect(session.signal.aborted).toBe(true);
           expect(respond).toHaveBeenCalledWith(
@@ -220,9 +213,14 @@ it.each(["admission", "publication"])(
               message: "Login is no longer available on this connection.",
             }),
           );
-        } finally {
-          session.cancel();
-          await whenAdmittedWizardSessionSettled(session);
+        } else {
+          await expect(startWizardLogin(params)).rejects.toThrow(closed.message);
+          expect(createSession).not.toHaveBeenCalled();
+        }
+      } finally {
+        for (const active of session ? [session] : context.wizardSessions.values()) {
+          active.cancel();
+          await whenAdmittedWizardSessionSettled(active);
         }
       }
       expect(context.wizardSessions.size).toBe(0);

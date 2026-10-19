@@ -27,6 +27,8 @@ let config: OpenClawConfig;
 let searchStatus: WebSearchStatusResult;
 const source = { title: "A source", url: "https://example.com/source" };
 const citation = { url: source.url, title: "Source" };
+const sourceResult = { results: [{ ...source, description: "A snippet" }] };
+const answer = { content: "A grounded answer", citations: [citation] };
 const prepared = () => ({ status: searchStatus, config, agentDir: "/synthetic/agent" });
 function request(
   method: "webSearch.status" | "webSearch.test",
@@ -40,27 +42,24 @@ function request(
     respond: vi.fn(),
   } as unknown as GatewayRequestHandlerOptions;
 }
-async function invoke(options: GatewayRequestHandlerOptions) {
+async function invoke(options: GatewayRequestHandlerOptions, expected?: unknown[]) {
   await webSearchHandlers[options.req.method]!(options);
-  return vi.mocked(options.respond);
-}
-async function expectResult(options: GatewayRequestHandlerOptions, result: unknown) {
-  const respond = await invoke(options);
-  expect(respond).toHaveBeenCalledWith(true, result, undefined);
+  const respond = vi.mocked(options.respond);
+  if (expected) {
+    expect(respond).toHaveBeenCalledWith(...expected);
+  }
   return respond;
 }
+const expectResult = (options: GatewayRequestHandlerOptions, result: unknown) =>
+  invoke(options, [true, result, undefined]);
 const probe = (params: Record<string, unknown> = {}) =>
   request("webSearch.test", { query: "query", ...params });
 const expectProbe = (result: Record<string, unknown>, params: Record<string, unknown> = {}) =>
   expectResult(probe(params), expect.objectContaining(result));
-async function expectFailure(
+const expectFailure = (
   options: GatewayRequestHandlerOptions,
   code: "INVALID_REQUEST" | "UNAVAILABLE",
-) {
-  const respond = await invoke(options);
-  expect(respond).toHaveBeenCalledWith(false, undefined, expect.objectContaining({ code }));
-  return respond;
-}
+) => invoke(options, [false, undefined, expect.objectContaining({ code })]);
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.profile.mockReturnValue(undefined);
@@ -75,12 +74,7 @@ beforeEach(() => {
     route: { kind: "managed", provider: "example", label: "Example Search", testable: true },
   };
   mocks.prepare.mockImplementation(async () => prepared());
-  mocks.search.mockResolvedValue({
-    provider: "example",
-    result: {
-      results: [{ ...source, description: "A snippet" }],
-    },
-  });
+  mocks.search.mockResolvedValue({ provider: "example", result: sourceResult });
 });
 
 it("returns settings and rejects incomplete or unknown request fields", async () => {
@@ -98,27 +92,25 @@ it.each([
   {
     kind: "sources",
     query: " source query ",
-    result: { results: [{ ...source, description: "A snippet" }] },
+    result: sourceResult,
     expected: { results: [{ ...source, snippet: "A snippet" }] },
   },
   {
     kind: "answer",
     query: "query",
-    result: { content: "A grounded answer", citations: [citation, "javascript:alert(1)"] },
-    expected: { content: "A grounded answer", citations: [citation] },
+    result: { ...answer, citations: [citation, "javascript:alert(1)"] },
+    expected: answer,
   },
 ])("normalizes $kind with cache bypass", async ({ query, result, expected }) => {
   mocks.search.mockResolvedValue({ provider: "example", result });
-  await expectProbe(
-    {
-      provider: "example",
-      status: "ok",
-      latencyMs: expect.any(Number),
-      cached: false,
-      ...expected,
-    },
-    { query },
-  );
+  const resultShape = {
+    provider: "example",
+    status: "ok",
+    latencyMs: expect.any(Number),
+    cached: false,
+    ...expected,
+  };
+  await expectProbe(resultShape, { query });
   expect(mocks.search).toHaveBeenCalledWith(
     expect.objectContaining({
       providerId: "example",
