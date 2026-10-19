@@ -65,6 +65,31 @@ describe("SQLite reclamation admission races", () => {
     closeOpenClawAgentDatabasesForTest();
   });
 
+  const scope = (sessionKey: string) => ({ sessionKey, storePath });
+  const transcript = (sessionKey: string, sessionId: string) => ({
+    ...scope(sessionKey),
+    sessionId,
+  });
+  async function seed(sessionKey: string, sessionId: string, updatedAt: number, content?: string) {
+    await replaceSessionEntry(scope(sessionKey), { sessionId, updatedAt });
+    if (content !== undefined) {
+      await replaceTranscriptEvents(transcript(sessionKey, sessionId), [
+        { type: "session", id: sessionId, content },
+      ]);
+    }
+  }
+  function remove(
+    sessionKey: string,
+    options: Partial<Parameters<typeof deleteSessionEntryLifecycle>[0]> = {},
+  ) {
+    return deleteSessionEntryLifecycle({
+      archiveTranscript: false,
+      storePath,
+      target: { canonicalKey: sessionKey, storeKeys: [sessionKey] },
+      ...options,
+    });
+  }
+
   it.runIf(process.platform !== "win32")(
     "keeps worker reclamation on the opened database after an alias retarget",
     async () => {
@@ -89,13 +114,9 @@ describe("SQLite reclamation admission races", () => {
         fs.symlinkSync(replacementPath, alias);
       };
 
-      await expect(
-        deleteSessionEntryLifecycle({
-          archiveTranscript: false,
-          storePath: alias,
-          target: { canonicalKey: sessionKey, storeKeys: [sessionKey] },
-        }),
-      ).resolves.toMatchObject({ deleted: true });
+      await expect(remove(sessionKey, { storePath: alias })).resolves.toMatchObject({
+        deleted: true,
+      });
       expect(loadSessionEntry({ sessionKey, storePath: originalPath })).toBeUndefined();
       expect(loadSessionEntry({ sessionKey, storePath: replacementPath })).toMatchObject({
         sessionId,
@@ -107,17 +128,8 @@ describe("SQLite reclamation admission races", () => {
     const sessionKey = "agent:main:revoked-deletion";
     const sessionId = "revoked-deletion-current";
     const historicalSessionId = "revoked-deletion-history";
-    await replaceSessionEntry(
-      { sessionKey, storePath },
-      { sessionId: historicalSessionId, updatedAt: 1 },
-    );
-    await replaceTranscriptEvents({ sessionKey, sessionId: historicalSessionId, storePath }, [
-      { type: "session", id: historicalSessionId, content: "retained history" },
-    ]);
-    await replaceSessionEntry({ sessionKey, storePath }, { sessionId, updatedAt: 2 });
-    await replaceTranscriptEvents({ sessionKey, sessionId, storePath }, [
-      { type: "session", id: sessionId, content: "retained current transcript" },
-    ]);
+    await seed(sessionKey, historicalSessionId, 1, "retained history");
+    await seed(sessionKey, sessionId, 2, "retained current transcript");
     let authorized = true;
     archiveMaterializationHook.beforeReclaim = async () => {
       await Promise.resolve();
@@ -125,24 +137,21 @@ describe("SQLite reclamation admission races", () => {
     };
 
     await expect(
-      deleteSessionEntryLifecycle({
-        archiveTranscript: false,
+      remove(sessionKey, {
         deleteTranscriptWithoutArchive: true,
         commitGuard: () => {
           if (!authorized) {
             throw new Error("caller authority closed");
           }
         },
-        storePath,
-        target: { canonicalKey: sessionKey, storeKeys: [sessionKey] },
       }),
     ).rejects.toThrow("caller authority closed");
-    expect(loadSessionEntry({ sessionKey, storePath })).toMatchObject({ sessionId });
-    await expect(loadTranscriptEvents({ sessionKey, sessionId, storePath })).resolves.toEqual([
+    expect(loadSessionEntry(scope(sessionKey))).toMatchObject({ sessionId });
+    await expect(loadTranscriptEvents(transcript(sessionKey, sessionId))).resolves.toEqual([
       expect.objectContaining({ id: sessionId, content: "retained current transcript" }),
     ]);
     await expect(
-      loadTranscriptEvents({ sessionKey, sessionId: historicalSessionId, storePath }),
+      loadTranscriptEvents(transcript(sessionKey, historicalSessionId)),
     ).resolves.toEqual([
       expect.objectContaining({ id: historicalSessionId, content: "retained history" }),
     ]);
@@ -152,22 +161,8 @@ describe("SQLite reclamation admission races", () => {
     const sessionKey = "agent:main:historical-admission-race";
     const historicalSessionId = "historical-admission-previous";
     const currentSessionId = "historical-admission-current";
-    const historicalEvent = {
-      type: "session" as const,
-      id: historicalSessionId,
-      content: "historical admission transcript",
-    };
-    await replaceSessionEntry(
-      { sessionKey, storePath },
-      { sessionId: historicalSessionId, updatedAt: 1 },
-    );
-    await replaceTranscriptEvents({ sessionKey, sessionId: historicalSessionId, storePath }, [
-      historicalEvent,
-    ]);
-    await replaceSessionEntry(
-      { sessionKey, storePath },
-      { sessionId: currentSessionId, updatedAt: 2 },
-    );
+    await seed(sessionKey, historicalSessionId, 1, "historical admission transcript");
+    await seed(sessionKey, currentSessionId, 2);
 
     const materializationStarted = createDeferred();
     const materializationGate = createDeferred();
@@ -176,18 +171,10 @@ describe("SQLite reclamation admission races", () => {
       await materializationGate.promise;
     };
 
-    const deletion = deleteSessionEntryLifecycle({
-      archiveTranscript: true,
-      storePath,
-      target: { canonicalKey: sessionKey, storeKeys: [sessionKey] },
-    });
+    const deletion = remove(sessionKey, { archiveTranscript: true });
     await materializationStarted.promise;
     const assertHistoricalGenerationExists = async () => {
-      const events = await loadTranscriptEvents({
-        sessionKey,
-        sessionId: historicalSessionId,
-        storePath,
-      });
+      const events = await loadTranscriptEvents(transcript(sessionKey, historicalSessionId));
       if (events.length === 0) {
         throw new Error("historical generation no longer exists");
       }
@@ -217,7 +204,7 @@ describe("SQLite reclamation admission races", () => {
     await expect(deletion).resolves.toMatchObject({ deleted: true });
     await expect(admissionOutcome).resolves.toBe("historical generation no longer exists");
     await expect(
-      loadTranscriptEvents({ sessionKey, sessionId: historicalSessionId, storePath }),
+      loadTranscriptEvents(transcript(sessionKey, historicalSessionId)),
     ).resolves.toEqual([]);
   });
 });

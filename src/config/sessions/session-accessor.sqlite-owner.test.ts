@@ -20,107 +20,114 @@ import {
 } from "./session-accessor.js";
 import { retainPreparedSessionEntryPredicate } from "./session-accessor.sqlite-entry-cache-publication-state.js";
 import { assignSessionOwnerInWorker } from "./session-metadata-write.async.js";
+import type { SessionEntry } from "./types.js";
 
 afterEach(() => {
   closeOpenClawAgentDatabasesForTest();
 });
 
+async function withOwnerSession(
+  sessionId: string,
+  overrides: Partial<SessionEntry>,
+  run: (
+    scope: { agentId: string; env: NodeJS.ProcessEnv; sessionKey: string },
+    entry: SessionEntry,
+  ) => Promise<void>,
+) {
+  await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+    setRuntimeConfigSnapshot({});
+    const scope = { agentId: "main", env: state.env, sessionKey: `agent:main:${sessionId}` };
+    const entry: SessionEntry = {
+      sessionId,
+      updatedAt: 1,
+      createdActor: { type: "human", source: "profile", id: "profile-creator" },
+      ...overrides,
+    };
+    await upsertSessionEntryCore(scope, entry);
+    await run(scope, entry);
+  });
+}
+
+function ownerAssignment(id = "profile-assigner") {
+  return {
+    actor: { type: "agent" as const, id: "research" },
+    assignedBy: { type: "human" as const, id },
+    assignedAt: 1234,
+  };
+}
+function ownerParams({ actor: owner, ...assignment }: ReturnType<typeof ownerAssignment>) {
+  return { owner, ...assignment };
+}
+
 describe("SQLite session owner assignment", () => {
   it("guards incognito owner assignments without querying session rows", async () => {
-    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
-      setRuntimeConfigSnapshot({});
-      const scope = {
-        agentId: "main",
-        env: state.env,
-        sessionKey: "agent:main:dashboard:incognito-owner",
-      };
-      const entry = {
+    await withOwnerSession(
+      "dashboard:incognito-owner",
+      {
         sessionId: "incognito-owner",
-        updatedAt: 1,
         lifecycleRevision: "original-generation",
-        incognito: true as const,
-        createdActor: { type: "human" as const, source: "profile" as const, id: "creator" },
-      };
-      await upsertSessionEntryCore(scope, entry);
-      const sql = observeHostDataSql();
-      const assignment = {
-        actor: { type: "agent" as const, id: "research" },
-        assignedBy: { type: "human" as const, id: "creator" },
-        assignedAt: 1234,
-      };
-      const params = {
-        owner: assignment.actor,
-        assignedBy: assignment.assignedBy,
-        assignedAt: assignment.assignedAt,
-        expectedSessionId: entry.sessionId,
-        expectedEntry: entry,
-      };
-      try {
-        await expect(assignSessionOwnerInWorker(scope, params)).resolves.toEqual(assignment);
-        await expect(
-          assignSessionOwnerInWorker(scope, { ...params, expectedSessionId: "replaced-session" }),
-        ).rejects.toThrow("session changed before collaboration mutation");
-        expect(sql.queries).toEqual([]);
-      } finally {
-        sql.restore();
-      }
-      expect(loadSessionEntry(scope)?.owner).toEqual(assignment);
-    });
+        incognito: true,
+        createdActor: { type: "human", source: "profile", id: "creator" },
+      },
+      async (scope, entry) => {
+        const sql = observeHostDataSql();
+        const assignment = ownerAssignment("creator");
+        const params = {
+          ...ownerParams(assignment),
+          expectedSessionId: entry.sessionId,
+          expectedEntry: entry,
+        };
+        try {
+          await expect(assignSessionOwnerInWorker(scope, params)).resolves.toEqual(assignment);
+          await expect(
+            assignSessionOwnerInWorker(scope, { ...params, expectedSessionId: "replaced-session" }),
+          ).rejects.toThrow("session changed before collaboration mutation");
+          expect(sql.queries).toEqual([]);
+        } finally {
+          sql.restore();
+        }
+        expect(loadSessionEntry(scope)?.owner).toEqual(assignment);
+      },
+    );
   });
 
   it("refuses stale session identity and lifecycle before assigning an owner", async () => {
-    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
-      setRuntimeConfigSnapshot({});
-      const scope = {
-        agentId: "main",
-        env: state.env,
-        sessionKey: "agent:main:guarded-owner",
-      };
-      await upsertSessionEntryCore(scope, {
+    await withOwnerSession(
+      "guarded-owner",
+      {
         sessionId: "session-original",
-        updatedAt: 1,
         lifecycleRevision: "original-generation",
-        createdActor: { type: "human", source: "profile", id: "profile-creator" },
-      });
-      const expectedEntry = loadSessionEntry(scope)!;
-      const assignment = {
-        owner: { type: "agent" as const, id: "research" },
-        assignedBy: { type: "human" as const, id: "profile-assigner" },
-      };
-      expect(() =>
-        assignSessionOwner(scope, { ...assignment, expectedSessionId: "session-replaced" }),
-      ).toThrow("session changed before owner assignment");
-      expect(loadSessionEntry(scope)?.owner).toBeUndefined();
+      },
+      async (scope) => {
+        const expectedEntry = loadSessionEntry(scope)!;
+        const assignment = {
+          owner: { type: "agent" as const, id: "research" },
+          assignedBy: { type: "human" as const, id: "profile-assigner" },
+        };
+        expect(() =>
+          assignSessionOwner(scope, { ...assignment, expectedSessionId: "session-replaced" }),
+        ).toThrow("session changed before owner assignment");
+        expect(loadSessionEntry(scope)?.owner).toBeUndefined();
 
-      await upsertSessionEntryCore(scope, {
-        ...expectedEntry,
-        lifecycleRevision: "replacement-generation",
-      });
-      expect(() =>
-        assignSessionOwner(scope, {
-          ...assignment,
-          expectedSessionId: expectedEntry.sessionId,
-          expectedEntry,
-        }),
-      ).toThrow("session ownership changed before owner assignment");
-      expect(loadSessionEntry(scope)?.owner).toBeUndefined();
-    });
+        await upsertSessionEntryCore(scope, {
+          ...expectedEntry,
+          lifecycleRevision: "replacement-generation",
+        });
+        expect(() =>
+          assignSessionOwner(scope, {
+            ...assignment,
+            expectedSessionId: expectedEntry.sessionId,
+            expectedEntry,
+          }),
+        ).toThrow("session ownership changed before owner assignment");
+        expect(loadSessionEntry(scope)?.owner).toBeUndefined();
+      },
+    );
   });
 
   it("lazily adds bare columns and preserves the assignment across reopen", async () => {
-    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
-      setRuntimeConfigSnapshot({});
-      const scope = {
-        agentId: "main",
-        env: state.env,
-        sessionKey: "agent:main:owned-session",
-      };
-      await upsertSessionEntryCore(scope, {
-        sessionId: "session-owned",
-        updatedAt: 1,
-        createdActor: { type: "human", source: "profile", id: "profile-creator" },
-      });
-      const initial = openOpenClawAgentDatabase({ agentId: "main", env: state.env });
+    await withOwnerSession("owned-session", { sessionId: "session-owned" }, async (scope) => {
+      const initial = openOpenClawAgentDatabase(scope);
       for (const { columnName, tableName } of FIRST_USE_ADDITIVE_AGENT_COLUMN_DEFINITIONS) {
         initial.db.exec(`ALTER TABLE ${tableName} DROP COLUMN ${columnName};`);
       }
@@ -133,28 +140,21 @@ describe("SQLite session owner assignment", () => {
       expect(loadSessionEntry(scope)?.owner).toBeUndefined();
 
       expect(() =>
-        runOpenClawAgentWriteTransaction(
-          () => {
-            expect(
-              assignSessionOwner(scope, {
-                owner: { type: "agent", id: "rolled-back-owner" },
-                assignedBy: { type: "human", id: "profile-assigner" },
-                assignedAt: 1233,
-              }),
-            ).not.toBeNull();
-            throw new Error("roll back owner schema");
-          },
-          { agentId: "main", env: state.env },
-        ),
+        runOpenClawAgentWriteTransaction(() => {
+          expect(
+            assignSessionOwner(scope, {
+              owner: { type: "agent", id: "rolled-back-owner" },
+              assignedBy: { type: "human", id: "profile-assigner" },
+              assignedAt: 1233,
+            }),
+          ).not.toBeNull();
+          throw new Error("roll back owner schema");
+        }, scope),
       ).toThrow("roll back owner schema");
       expect(loadSessionEntry(scope)?.owner).toBeUndefined();
 
-      const assignment = {
-        actor: { type: "agent" as const, id: "research" },
-        assignedBy: { type: "human" as const, id: "profile-assigner" },
-        assignedAt: 1234,
-      };
-      const database = openOpenClawAgentDatabase({ agentId: "main", env: state.env });
+      const assignment = ownerAssignment();
+      const database = openOpenClawAgentDatabase(scope);
       const identity = readOpenClawAgentDatabaseIdentity(database).identity;
       if (typeof identity !== "string") {
         throw new Error("Expected a physical owner-assignment database");
@@ -167,13 +167,7 @@ describe("SQLite session owner assignment", () => {
       });
       try {
         expect(predicate.isCurrent()).toBe(true);
-        expect(
-          assignSessionOwner(scope, {
-            owner: assignment.actor,
-            assignedBy: assignment.assignedBy,
-            assignedAt: assignment.assignedAt,
-          }),
-        ).toEqual(assignment);
+        expect(assignSessionOwner(scope, ownerParams(assignment))).toEqual(assignment);
         expect(predicate.isCurrent()).toBe(false);
       } finally {
         predicate.release();
@@ -183,7 +177,7 @@ describe("SQLite session owner assignment", () => {
       await closeOpenClawAgentDatabasesAsync();
       closeOpenClawAgentDatabasesForTest();
       expect(loadSessionEntry(scope)?.owner).toEqual(assignment);
-      const reopened = openOpenClawAgentDatabase({ agentId: "main", env: state.env });
+      const reopened = openOpenClawAgentDatabase(scope);
       const columns = reopened.db.prepare("PRAGMA table_info(session_nodes)").all() as Array<{
         name: string;
         notnull: number;
