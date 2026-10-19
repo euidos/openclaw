@@ -1,9 +1,12 @@
+import { GatewayClientRequestTimeoutError } from "../../packages/gateway-client/src/client.js";
 import { GatewayClientRequestError } from "../../packages/gateway-client/src/request-error.js";
 import { GATEWAY_STARTUP_ADMISSION_WAIT_MS } from "../../packages/gateway-protocol/src/startup-unavailable.js";
 import type { GatewayClient } from "../gateway/client.js";
 import { parseAgentSessionKey } from "../routing/session-key.js";
 import { sleep } from "../utils/sleep.js";
 import type { TuiRequestScope } from "./tui-backend.js";
+
+type WriteRequest = <T>(method: string, params: unknown) => Promise<T>;
 
 const STARTUP_CHAT_HISTORY_RETRY_TIMEOUT_MS = 60_000;
 const STARTUP_CHAT_HISTORY_DEFAULT_RETRY_MS = 500;
@@ -51,9 +54,6 @@ export class GatewayChatRequests {
 
   stop(): void {
     this.lifetime.abort();
-    for (const pending of this.pendingWrites) {
-      pending.controller.abort();
-    }
   }
 
   cancelPending(scope: TuiRequestScope): boolean {
@@ -72,17 +72,34 @@ export class GatewayChatRequests {
     return cancelled;
   }
 
-  async write<T>(method: string, params: unknown, scope: TuiRequestScope): Promise<T> {
+  async write<T>(
+    scope: TuiRequestScope,
+    operation: (request: WriteRequest) => Promise<T>,
+  ): Promise<T> {
     const pending = {
       ...scope,
       agentId: scope.agentId ?? parseAgentSessionKey(scope.sessionKey)?.agentId,
       controller: new AbortController(),
     };
+    const signal = AbortSignal.any([this.signal, pending.controller.signal]);
+    const deadline = Date.now() + GATEWAY_STARTUP_ADMISSION_WAIT_MS;
     this.pendingWrites.add(pending);
     try {
-      return await this.client.request<T>(method, params, {
-        timeoutMs: GATEWAY_STARTUP_ADMISSION_WAIT_MS,
-        signal: pending.controller.signal,
+      return await operation(<R>(method: string, params: unknown) => {
+        signal.throwIfAborted();
+        const timeoutMs = deadline - Date.now();
+        if (timeoutMs <= 0) {
+          throw new GatewayClientRequestTimeoutError({
+            method,
+            timeoutMs: GATEWAY_STARTUP_ADMISSION_WAIT_MS,
+            requestSent: false,
+          });
+        }
+        return this.client.request<R>(method, params, {
+          timeoutMs,
+          signal,
+          retainSentResultOnAbort: true,
+        });
       });
     } finally {
       this.pendingWrites.delete(pending);
@@ -90,30 +107,28 @@ export class GatewayChatRequests {
   }
 
   async abortChat(opts: TuiRequestScope) {
-    const cancelled = this.cancelPending(opts);
+    this.cancelPending(opts);
     const params = {
       sessionKey: opts.sessionKey,
       ...(opts.agentId ? { agentId: opts.agentId } : {}),
       ...(opts.runId ? { runId: opts.runId } : {}),
     };
     try {
-      const result = await this.client.request<{
+      return await this.client.request<{
         ok: boolean;
         aborted: boolean;
         runIds?: string[];
       }>("chat.abort", opts.runId ? params : { ...params, preserveSideRuns: true });
-      return { ...result, aborted: result.aborted || cancelled };
     } catch (err) {
       // Protocol v4 peers reject unknown fields. Keep their shipped abort shape.
       if (opts.runId || !isLegacyParameterError(err, "chat.abort", "preservesideruns")) {
         throw err;
       }
-      const result = await this.client.request<{
+      return await this.client.request<{
         ok: boolean;
         aborted: boolean;
         runIds?: string[];
       }>("chat.abort", params);
-      return { ...result, aborted: result.aborted || cancelled };
     }
   }
 

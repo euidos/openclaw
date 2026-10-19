@@ -757,7 +757,11 @@ describe("chat pane model controls", () => {
           queueMode: "steer",
           idempotencyKey: steer.sendRunId,
         }),
-        { timeoutMs: GATEWAY_STARTUP_ADMISSION_WAIT_MS, signal: expect.any(AbortSignal) },
+        {
+          timeoutMs: GATEWAY_STARTUP_ADMISSION_WAIT_MS,
+          signal: expect.any(AbortSignal),
+          retainSentResultOnAbort: true,
+        },
       ),
     );
     expect(state.chatSending).toBe(true);

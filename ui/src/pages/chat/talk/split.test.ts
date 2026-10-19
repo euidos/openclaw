@@ -226,7 +226,11 @@ function harness(provider?: string) {
       expect(request).toHaveBeenCalledWith(
         "chat.send",
         expect.objectContaining({ sessionKey, message: transcript, ...extra }),
-        { timeoutMs: GATEWAY_STARTUP_ADMISSION_WAIT_MS, signal: expect.any(AbortSignal) },
+        {
+          timeoutMs: GATEWAY_STARTUP_ADMISSION_WAIT_MS,
+          signal: expect.any(AbortSignal),
+          retainSentResultOnAbort: true,
+        },
       ),
     requireReview: () => {
       state.sessionsResult = sessionsResult(

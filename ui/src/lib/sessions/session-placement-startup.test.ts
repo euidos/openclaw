@@ -3,6 +3,7 @@
 import { describe, expect, it, onTestFinished, vi } from "vitest";
 import { GatewayPendingRequests } from "../../../../packages/gateway-client/src/pending-request.js";
 import type { GatewayProtocolRequestOptions } from "../../../../packages/gateway-client/src/protocol-client.js";
+import type { RequestFrame } from "../../../../packages/gateway-protocol/src/schema/frames.js";
 import { GATEWAY_STARTUP_ADMISSION_WAIT_MS } from "../../../../packages/gateway-protocol/src/startup-unavailable.js";
 import { GatewayRequestError, type GatewayBrowserClient } from "../../api/gateway.ts";
 import {
@@ -151,6 +152,70 @@ describe("session placement startup", () => {
       expect(await outcome).toMatchObject({ status: cancel ? "cancelled" : "started" });
       expect(writes).toBe(cancel ? 0 : 1);
       expect(new Set(frames).size).toBe(1);
+      expect(pending.hasPending).toBe(false);
+    },
+  );
+
+  it.each([false, true])(
+    "settles a dispatched send before cancellation cleanup (cleanup=%s)",
+    async (cleanup) => {
+      fakeTimers();
+      const abort = new AbortController();
+      const dispatched = Promise.withResolvers<RequestFrame>();
+      const frames: RequestFrame[] = [];
+      const pending = new GatewayPendingRequests({
+        createRequestId: () => "placement-late-ack",
+        nowMs: Date.now,
+      });
+      onTestFinished(() => pending.flush(new Error("test disposed")));
+      const request = vi.fn(
+        (method: string, input?: unknown, options?: GatewayProtocolRequestOptions) => {
+          if (method !== "sessions.send") {
+            return Promise.resolve(method === "sessions.dispatch" ? placement("active") : {});
+          }
+          return pending.request(
+            {
+              send(raw) {
+                const frame = JSON.parse(raw) as RequestFrame;
+                frames.push(frame);
+                dispatched.resolve(frame);
+              },
+            },
+            method,
+            input,
+            options,
+          );
+        },
+      );
+      const outcome = start(
+        request,
+        {
+          messageId: "retained-message",
+          signal: abort.signal,
+          cleanupOnCancellation: () => cleanup,
+        },
+        () => !abort.signal.aborted,
+      );
+      let settled = false;
+      void outcome.then(() => (settled = true));
+      const frame = await dispatched.promise;
+      abort.abort();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(settled).toBe(false);
+      expect(request).not.toHaveBeenCalledWith("sessions.reclaim", expect.anything());
+
+      pending.handleResponse({
+        type: "res",
+        id: frame.id,
+        ok: true,
+        payload: { status: "started", runId: "accepted-after-cancellation" },
+      });
+      await expect(outcome).resolves.toEqual({ status: cleanup ? "cancelled" : "interrupted" });
+      expect(request.mock.calls.filter(([method]) => method === "sessions.reclaim")).toHaveLength(
+        cleanup ? 1 : 0,
+      );
+      await vi.advanceTimersByTimeAsync(GATEWAY_STARTUP_ADMISSION_WAIT_MS);
+      expect(frames).toHaveLength(1);
       expect(pending.hasPending).toBe(false);
     },
   );

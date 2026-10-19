@@ -402,7 +402,11 @@ it.each(
         expect(host.request).toHaveBeenCalledWith(
           "chat.send",
           expect.objectContaining({ sessionKey: host.sessionKey, message }),
-          { timeoutMs: GATEWAY_STARTUP_ADMISSION_WAIT_MS, signal: expect.any(AbortSignal) },
+          {
+            timeoutMs: GATEWAY_STARTUP_ADMISSION_WAIT_MS,
+            signal: expect.any(AbortSignal),
+            retainSentResultOnAbort: true,
+          },
         );
         expect(
           host.request.mock.calls.filter(([method]) => method === "chat.history"),

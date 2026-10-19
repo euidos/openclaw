@@ -72,7 +72,11 @@ it("dispatches a fresh-pane send without waiting for background roster loading",
       expect.objectContaining({
         message: "send without changing a picker",
       }),
-      { timeoutMs: GATEWAY_STARTUP_ADMISSION_WAIT_MS, signal: expect.any(AbortSignal) },
+      {
+        timeoutMs: GATEWAY_STARTUP_ADMISSION_WAIT_MS,
+        signal: expect.any(AbortSignal),
+        retainSentResultOnAbort: true,
+      },
     );
   } finally {
     roster.resolve(createSessionsListResult());

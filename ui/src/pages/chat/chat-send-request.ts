@@ -93,7 +93,11 @@ export async function requestChatSend(
         attachments: buildChatApiAttachments(params.attachments),
       },
       // This bounds receipt of the admission ACK, not execution of the admitted turn.
-      { timeoutMs: GATEWAY_STARTUP_ADMISSION_WAIT_MS, signal: request.signal },
+      {
+        timeoutMs: GATEWAY_STARTUP_ADMISSION_WAIT_MS,
+        signal: request.signal,
+        retainSentResultOnAbort: true,
+      },
     );
   } finally {
     request.release();

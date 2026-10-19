@@ -59,9 +59,10 @@ MCP app new-conversation handling loads when the app requests a conversation.
 New Session includes its completion handler in the route bundle, so submission
 does not pause for another chunk before sending the creation request.
 
-Session creation retains a dispatched result after its view is canceled, so the
-owning flow can reconcile the created session. Cancellation still stops unsent
-work and requests refused before dispatch.
+Session creation and message sends retain a dispatched result after Stop or view
+cancellation, so the owning flow can reconcile accepted work before settling or
+cleaning up its placement. Cancellation still stops unsent work and requests
+refused before dispatch.
 
 After a Gateway update, already-open tabs reload the current build when they encounter a missing old asset. Reloading is automatic when no unsaved-work guard blocks it; otherwise, save or discard the protected work and use the **Reload** banner. The Gateway and service worker keep only the current build's assets.
 

@@ -452,7 +452,11 @@ export async function startSessionPlacementInitialTurn(
         attachments: params.attachments,
         idempotencyKey: messageId,
       },
-      { timeoutMs: GATEWAY_STARTUP_ADMISSION_WAIT_MS, signal: params.signal },
+      {
+        timeoutMs: GATEWAY_STARTUP_ADMISSION_WAIT_MS,
+        signal: params.signal,
+        retainSentResultOnAbort: true,
+      },
     );
     if (!isCurrent()) {
       return await cancelSessionPlacement(client, params, cleanupOnCancellation, messageId);

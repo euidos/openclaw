@@ -28,7 +28,8 @@ type ProtocolHarness = {
 
 const clients: GatewayChatClient[] = [];
 
-function createFixture() {
+function createFixture(delayWrites = false) {
+  const replies: Array<(error?: { code: string; message: string }) => void> = [];
   const client = new GatewayChatClient({ url: "ws://tui-startup.invalid" });
   clients.push(client);
   const gateway = (client as unknown as { client: GatewayClient }).client;
@@ -70,31 +71,39 @@ function createFixture() {
         default:
           payload = { messages: [], sessionInfo: { hasActiveRun: false } };
       }
-      protocol.handleMessage(
-        socket,
-        1,
-        JSON.stringify({
-          type: "res",
-          id: req.id,
-          ok: !write || ready,
-          ...(write && !ready
-            ? {
-                error: {
-                  code: "UNAVAILABLE",
-                  message: "Agent is preparing",
-                  retryable: true,
-                  retryAfterMs: 1_000,
-                  details: { reason: "startup-sidecars", method: req.method },
-                },
-              }
-            : { payload }),
-        }),
-      );
+      const reply = (error?: { code: string; message: string }) =>
+        protocol.handleMessage(
+          socket,
+          1,
+          JSON.stringify({
+            type: "res",
+            id: req.id,
+            ok: !error && (!write || ready),
+            ...(error
+              ? { error }
+              : write && !ready
+                ? {
+                    error: {
+                      code: "UNAVAILABLE",
+                      message: "Agent is preparing",
+                      retryable: true,
+                      retryAfterMs: 1_000,
+                      details: { reason: "startup-sidecars", method: req.method },
+                    },
+                  }
+                : { payload }),
+          }),
+        );
+      if (write && ready && delayWrites) {
+        replies.push(reply);
+      } else {
+        reply();
+      }
     },
   };
   Object.assign(protocol, { socket, stopped: false, generation: 1 });
   const state = createBaseState({ historyLoaded: true });
-  const chatLog = makeChatLog();
+  const chatLog = makeChatLog({ addSystem: vi.fn() });
   const tui = makeTui();
   const setActivityStatus = (value: string) => {
     state.activityStatus = value;
@@ -115,6 +124,12 @@ function createFixture() {
   });
   return {
     state,
+    chatLog,
+    finishWrite: (error?: { code: string; message: string }) => {
+      const reply = replies.shift();
+      assert(reply, "expected a dispatched write");
+      reply(error);
+    },
     attempts,
     writes,
     actions,
@@ -132,6 +147,89 @@ afterEach(async () => {
 });
 
 describe("TUI startup admission", () => {
+  it.each(["new", "send"] as const)(
+    "retains a dispatched %s through Stop and a repeated submit",
+    async (action) => {
+      const fixture = createFixture(true);
+      fixture.ready();
+      const submit = () =>
+        action === "new"
+          ? fixture.commands.handleCommand("/new")
+          : fixture.commands.sendMessage("Synthetic retained request");
+      let settled = false;
+      const operation = submit().then(() => {
+        settled = true;
+      });
+      expect(fixture.writes).toHaveLength(1);
+      const firstWrite = fixture.writes[0];
+      assert(firstWrite);
+      await fixture.actions.abortActive();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(settled).toBe(false);
+      expect(fixture.state.activityStatus).not.toBe("aborted");
+      await submit();
+      expect(fixture.writes).toEqual([firstWrite]);
+      fixture.finishWrite();
+      await operation;
+      const params = firstWrite.params as { key?: string; idempotencyKey?: string };
+      if (action === "new") {
+        expect(fixture.state.currentSessionKey).toBe(`agent:main:${params.key}`);
+      } else {
+        expect(fixture.state.pendingSubmit).toMatchObject({
+          phase: "accepted",
+          runId: params.idempotencyKey,
+        });
+      }
+      expect(fixture.chatLog.addSystem.mock.calls.flat()).not.toEqual(
+        expect.arrayContaining([expect.stringMatching(/(?:new session|send) (?:canceled|failed)/)]),
+      );
+      await vi.advanceTimersByTimeAsync(GATEWAY_STARTUP_ADMISSION_WAIT_MS);
+      expect(fixture.writes).toEqual([firstWrite]);
+    },
+  );
+
+  it("does not start a legacy creation retry after Stop", async () => {
+    const fixture = createFixture(true);
+    fixture.ready();
+    fixture.state.currentSessionId = "original-session";
+    const originalKey = fixture.state.currentSessionKey;
+    const operation = fixture.commands.handleCommand("/new");
+    expect(fixture.writes).toHaveLength(1);
+    await fixture.actions.abortActive();
+    fixture.finishWrite({
+      code: "INVALID_REQUEST",
+      message: "invalid sessions.create params: unexpected property 'succeedsParent'",
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fixture.writes).toHaveLength(1);
+    await operation;
+    expect(fixture.state.currentSessionKey).toBe(originalKey);
+  });
+
+  it("keeps the original deadline and key through a legacy creation retry", async () => {
+    const fixture = createFixture(true);
+    fixture.ready();
+    fixture.state.currentSessionId = "original-session";
+    let settled = false;
+    const operation = fixture.commands.handleCommand("/new").then(() => {
+      settled = true;
+    });
+    await vi.advanceTimersByTimeAsync(240_000);
+    fixture.finishWrite({
+      code: "INVALID_REQUEST",
+      message: "invalid sessions.create params: unexpected property 'succeedsParent'",
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fixture.writes).toHaveLength(2);
+    expect(fixture.writes.map((frame) => (frame.params as { key: string }).key)).toEqual([
+      (fixture.writes[0].params as { key: string }).key,
+      (fixture.writes[0].params as { key: string }).key,
+    ]);
+    await vi.advanceTimersByTimeAsync(GATEWAY_STARTUP_ADMISSION_WAIT_MS - 240_000);
+    expect(settled).toBe(true);
+    await operation;
+  });
+
   it.each([
     ["send", 45_000],
     ["send", 240_000],

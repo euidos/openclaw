@@ -90,7 +90,10 @@ it.each(["send", "send-consumed", "receipt"] as const)(
   },
 );
 
-async function startPreparingSend(message = "Wait for this agent") {
+async function startPreparingSend(
+  message = "Wait for this agent",
+  testOptions: { holdResponse?: boolean } = {},
+) {
   vi.useFakeTimers();
   let ready = false;
   const attempts: string[] = [];
@@ -104,6 +107,9 @@ async function startPreparingSend(message = "Wait for this agent") {
       attempts.push(raw);
       if (ready) {
         writes.push(request);
+        if (testOptions.holdResponse) {
+          return;
+        }
       }
       pending.handleResponse({
         type: "res",
@@ -134,6 +140,7 @@ async function startPreparingSend(message = "Wait for this agent") {
     connected: true,
     sessionKey: "agent:main:startup",
     chatMessage: message,
+    chatError: null,
   });
   const sending = handleSendChat(host);
   await issued.promise;
@@ -191,3 +198,53 @@ it.each(["steer", "redirect"] as const)("Stop retires a startup /%s send", async
   expect(fixture.pending.hasPending).toBe(false);
   expect(fixture.writes).toHaveLength(0);
 });
+
+it.each([
+  ["send", false],
+  ["steer", false],
+  ["redirect", false],
+  ["send", true],
+  ["steer", true],
+  ["redirect", true],
+] as const)(
+  "retains a dispatched %s result after Stop (selection changed=%s)",
+  async (kind, selectionChanged) => {
+    const message = kind === "send" ? "Keep this submission" : `/${kind} Keep this submission`;
+    const fixture = await startPreparingSend(message, { holdResponse: true });
+    fixture.ready();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(fixture.writes).toHaveLength(1);
+    const request = fixture.writes[0]!;
+
+    await handleAbortChat(fixture.host, { scope: "session" });
+    if (selectionChanged) {
+      fixture.host.sessionKey = "agent:main:newer";
+      fixture.host.chatMessage = "A newer draft";
+    }
+    const selectedSessionKey = fixture.host.sessionKey;
+    const selectedMessages = fixture.host.chatMessages;
+    fixture.pending.handleResponse({
+      type: "res",
+      id: request.id,
+      ok: true,
+      payload: {
+        status: selectionChanged ? "started" : "ok",
+        runId: "accepted-after-stop",
+        messageSeq: 1,
+      },
+    });
+    await fixture.sending;
+
+    expect(fixture.host.chatError).toBeNull();
+    expect(fixture.host.chatMessage).toBe(selectionChanged ? "A newer draft" : "");
+    expect(fixture.host.sessionKey).toBe(selectedSessionKey);
+    if (selectionChanged) {
+      expect(fixture.host.chatMessages).toBe(selectedMessages);
+    }
+    expect(fixture.host.chatQueue).toEqual([]);
+    expect(fixture.host.chatRunId).toBeNull();
+    await vi.advanceTimersByTimeAsync(GATEWAY_STARTUP_ADMISSION_WAIT_MS);
+    expect(fixture.writes).toHaveLength(1);
+    expect(fixture.pending.hasPending).toBe(false);
+  },
+);

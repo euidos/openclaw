@@ -906,7 +906,11 @@ describe("executeSlashCommand /redirect (hard kill-and-restart)", () => {
         queueMode: "interrupt",
         idempotencyKey: expect.any(String),
       },
-      { timeoutMs: GATEWAY_STARTUP_ADMISSION_WAIT_MS, signal: undefined },
+      {
+        timeoutMs: GATEWAY_STARTUP_ADMISSION_WAIT_MS,
+        signal: undefined,
+        retainSentResultOnAbort: true,
+      },
     );
   });
 });

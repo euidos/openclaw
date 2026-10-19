@@ -598,7 +598,11 @@ async function executeRunCommand(
           : { queueMode: "interrupt" }),
         idempotencyKey: context.runRequest?.runId ?? generateUUID(),
       },
-      { timeoutMs: GATEWAY_STARTUP_ADMISSION_WAIT_MS, signal: context.runRequest?.signal },
+      {
+        timeoutMs: GATEWAY_STARTUP_ADMISSION_WAIT_MS,
+        signal: context.runRequest?.signal,
+        retainSentResultOnAbort: true,
+      },
     );
     const ackStatus = normalizeChatSendAckStatus(response?.status);
     if (ackStatus === "timeout" || ackStatus === "error") {

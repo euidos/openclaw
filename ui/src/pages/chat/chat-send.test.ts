@@ -2,7 +2,6 @@ import { reduceSessionProjection } from "@openclaw/gateway-client/browser";
 /* @vitest-environment jsdom */
 import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
-import { GATEWAY_STARTUP_ADMISSION_WAIT_MS } from "../../../../packages/gateway-protocol/src/startup-unavailable.js";
 import { createDeferred } from "../../../../test/helpers/promise.js";
 import { GatewayRequestError } from "../../api/gateway.ts";
 import type { AgentsListResult, GatewaySessionRow, SessionsListResult } from "../../api/types.ts";
@@ -45,6 +44,8 @@ import type { ChatHistoryResult } from "./chat-history-snapshot.ts";
 import { getChatHistoryLoadState } from "./chat-history-state.ts";
 import { loadChatHistory } from "./chat-history.ts";
 import {
+  expectNoRpc,
+  expectRpc,
   findRequestPayload,
   makeChatHost,
   makeRequestMock,
@@ -125,20 +126,6 @@ function queuedMessage<T extends Partial<ChatQueueItem>>(id: string, text: strin
 
 function expectItems(actual: unknown, ...items: unknown[]): void {
   expect(actual).toEqual(items.map((item) => expect.objectContaining(item)));
-}
-
-function expectRpc(request: unknown, method: string, payload: unknown = expect.anything()): void {
-  expect(request).toHaveBeenCalledWith(
-    method,
-    payload,
-    method === "chat.send"
-      ? { timeoutMs: GATEWAY_STARTUP_ADMISSION_WAIT_MS, signal: expect.any(AbortSignal) }
-      : { timeoutMs: 30_000 },
-  );
-}
-
-function expectNoRpc(request: unknown, method: string, payload: unknown = expect.anything()): void {
-  expect(request).not.toHaveBeenCalledWith(method, payload, expect.anything());
 }
 
 function asChatPageHost(host: TestChatHost): ChatPageHost {

@@ -71,6 +71,7 @@ it.each([
       expect(host.request).toHaveBeenCalledWith("chat.send", expect.anything(), {
         timeoutMs: GATEWAY_STARTUP_ADMISSION_WAIT_MS,
         signal: expect.any(AbortSignal),
+        retainSentResultOnAbort: true,
       }),
     );
     expect(host.chatStream).toBe("Already visible response text");

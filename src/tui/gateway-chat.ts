@@ -290,19 +290,19 @@ export class GatewayChatClient implements TuiBackend {
 
   async sendChat(opts: ChatSendOptions): Promise<TuiChatSendResult> {
     const runId = opts.runId ?? randomUUID();
-    const response = await this.requests.write<{ runId?: unknown; status?: unknown }>(
-      "chat.send",
-      {
-        sessionKey: opts.sessionKey,
-        ...(opts.agentId ? { agentId: opts.agentId } : {}),
-        ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
-        message: opts.message,
-        thinking: opts.thinking,
-        deliver: opts.deliver,
-        timeoutMs: opts.timeoutMs,
-        idempotencyKey: runId,
-      },
+    const response = await this.requests.write(
       { sessionKey: opts.sessionKey, agentId: opts.agentId, runId },
+      (request) =>
+        request<{ runId?: unknown; status?: unknown }>("chat.send", {
+          sessionKey: opts.sessionKey,
+          ...(opts.agentId ? { agentId: opts.agentId } : {}),
+          ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
+          message: opts.message,
+          thinking: opts.thinking,
+          deliver: opts.deliver,
+          timeoutMs: opts.timeoutMs,
+          idempotencyKey: runId,
+        }),
     );
     const acceptedRunId = normalizeOptionalString(response?.runId) ?? runId;
     const status = normalizeOptionalString(response?.status);
@@ -418,41 +418,31 @@ export class GatewayChatClient implements TuiBackend {
       ...opts,
       emitCommandHooks: Boolean(opts.parentSessionKey),
     };
-    try {
-      return await this.requests.write<TuiSessionMutationResult>(
-        "sessions.create",
-        params,
-        requestScope,
-      );
-    } catch (err) {
-      if (
-        opts.succeedsParent === undefined ||
-        !isLegacyParameterError(err, "sessions.create", "succeedsparent")
-      ) {
-        throw err;
+    return await this.requests.write(requestScope, async (request) => {
+      try {
+        return await request<TuiSessionMutationResult>("sessions.create", params);
+      } catch (err) {
+        if (
+          opts.succeedsParent === undefined ||
+          !isLegacyParameterError(err, "sessions.create", "succeedsparent")
+        ) {
+          throw err;
+        }
+        const { succeedsParent: _succeedsParent, ...legacyParams } = params;
+        if (!opts.succeedsParent) {
+          // Older Gateways cannot express a linked parallel child. Preserve the
+          // parent's lifecycle by retrying as an unlinked child, never a rollover.
+          const {
+            parentSessionKey: _parentSessionKey,
+            emitCommandHooks: _emitCommandHooks,
+            ...parallelParams
+          } = legacyParams;
+          return await request<TuiSessionMutationResult>("sessions.create", parallelParams);
+        }
+        // Legacy rollover is equivalent to an explicit successor request.
+        return await request<TuiSessionMutationResult>("sessions.create", legacyParams);
       }
-      const { succeedsParent: _succeedsParent, ...legacyParams } = params;
-      if (!opts.succeedsParent) {
-        // Older Gateways cannot express a linked parallel child. Preserve the
-        // parent's lifecycle by retrying as an unlinked child, never a rollover.
-        const {
-          parentSessionKey: _parentSessionKey,
-          emitCommandHooks: _emitCommandHooks,
-          ...parallelParams
-        } = legacyParams;
-        return await this.requests.write<TuiSessionMutationResult>(
-          "sessions.create",
-          parallelParams,
-          requestScope,
-        );
-      }
-      // Legacy rollover is equivalent to an explicit successor request.
-      return await this.requests.write<TuiSessionMutationResult>(
-        "sessions.create",
-        legacyParams,
-        requestScope,
-      );
-    }
+    });
   }
 
   async resetSession(
