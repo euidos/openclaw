@@ -127,13 +127,17 @@ it.skipIf(!isLiveTestEnabled() || process.platform === "win32")(
         const deviceIdentity = loadOrCreateDeviceIdentity({
           path: instance.state.path("proof-device.sqlite"),
         });
+        const observerDeviceIdentity = loadOrCreateDeviceIdentity({
+          path: instance.state.path("observer-device.sqlite"),
+        });
         const connect = (controlUi: boolean) =>
           acquireGatewayTestClient(
             {
               url: instance.url,
               origin: controlUi ? `http://127.0.0.1:${instance.port}` : undefined,
               token: instance.gatewayToken,
-              deviceIdentity,
+              // A different auth class must not reissue the interrupted UI's device token.
+              deviceIdentity: controlUi ? deviceIdentity : observerDeviceIdentity,
               clientName: controlUi ? GATEWAY_CLIENT_IDS.CONTROL_UI : GATEWAY_CLIENT_IDS.TEST,
               clientBuildId: controlUi ? buildId : undefined,
               mode: controlUi ? "webchat" : "test",

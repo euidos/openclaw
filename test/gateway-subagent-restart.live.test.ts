@@ -22,6 +22,7 @@ import {
 } from "../src/config/sessions/session-accessor.js";
 import type { GatewayClient } from "../src/gateway/client.js";
 import type { SessionsListResult } from "../src/gateway/session-utils.types.js";
+import { loadOrCreateDeviceIdentity } from "../src/infra/device-identity.js";
 import { redactSecrets } from "../src/logging/redact.js";
 import {
   extractAssistantPhaseText,
@@ -330,14 +331,18 @@ it.skipIf(!isLiveTestEnabled() || process.platform === "win32")(
           agentId: "main",
           env: instance.env,
         });
+        const deviceIdentity = loadOrCreateDeviceIdentity({
+          path: instance.state.path("restart-operator-device.sqlite"),
+        });
         const connect = () =>
           acquireGatewayTestClient(
             {
               url: instance.url,
               token: instance.gatewayToken,
-              deviceIdentity: null,
-              clientName: GATEWAY_CLIENT_NAMES.GATEWAY_CLIENT,
-              mode: GATEWAY_CLIENT_MODES.BACKEND,
+              deviceIdentity,
+              // Ephemeral backend clients have no durable operator profile to restore.
+              clientName: GATEWAY_CLIENT_NAMES.TUI,
+              mode: GATEWAY_CLIENT_MODES.UI,
               scopes: ["operator.admin", "operator.read", "operator.write"],
               requestTimeoutMs: WAIT_MS,
             },
