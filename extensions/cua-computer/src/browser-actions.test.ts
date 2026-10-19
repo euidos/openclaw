@@ -3,7 +3,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { driver, execution } from "./commands.test-helpers.js";
 import {
-  CUA_DRIVER_CONTRACT_FIXTURES,
+  CUA_DRIVER_CONTRACT_FIXTURES as fixtures,
   cuaToolResult,
 } from "./cua-driver-contract.test-fixtures.js";
 import type { CuaToolResult } from "./driver-client.js";
@@ -25,13 +25,30 @@ async function bindBrowser(computer: Awaited<ReturnType<typeof execution>>) {
   ) as { details: { browserRef: string; pages: Array<{ pageRef: string }> } };
 }
 
+function browserDriver(
+  snapshot = () => cuaToolResult(fixtures.browserSnapshot),
+  fallback = () => cuaToolResult(fixtures.browserNavigate),
+) {
+  const active = driver();
+  active.callTool.mockImplementation(async (name, args) => {
+    if (name === "list_windows") {
+      return cuaToolResult(fixtures.listWindows);
+    }
+    if (name === "get_browser_state") {
+      return "target_id" in args ? snapshot() : cuaToolResult(fixtures.browserBinding);
+    }
+    return fallback();
+  });
+  return active;
+}
+
 describe("cua-computer browser actions", () => {
   it("maps every browser action to the pinned driver tool contract", async () => {
     const { session, callTool } = driver();
     let downloadedFile = "";
     const binding = {
-      ...CUA_DRIVER_CONTRACT_FIXTURES.browserBinding,
-      tabs: CUA_DRIVER_CONTRACT_FIXTURES.browserBinding.tabs.map((tab) => ({
+      ...fixtures.browserBinding,
+      tabs: fixtures.browserBinding.tabs.map((tab) => ({
         ...tab,
         title: "",
         active: false,
@@ -39,8 +56,8 @@ describe("cua-computer browser actions", () => {
       })),
     };
     const snapshot = {
-      ...CUA_DRIVER_CONTRACT_FIXTURES.browserSnapshot,
-      refs: CUA_DRIVER_CONTRACT_FIXTURES.browserSnapshot.refs.map((ref) => ({
+      ...fixtures.browserSnapshot,
+      refs: fixtures.browserSnapshot.refs.map((ref) => ({
         ...ref,
         value: "",
         states: [],
@@ -51,32 +68,29 @@ describe("cua-computer browser actions", () => {
     callTool.mockImplementation(async (name, args) => {
       switch (name) {
         case "list_windows":
-          return cuaToolResult(CUA_DRIVER_CONTRACT_FIXTURES.listWindows);
+          return cuaToolResult(fixtures.listWindows);
         case "get_browser_state":
           return cuaToolResult("target_id" in args ? snapshot : binding, {
             image: "target_id" in args,
           });
         case "browser_prepare":
-          return cuaToolResult(CUA_DRIVER_CONTRACT_FIXTURES.browserPrepare);
+          return cuaToolResult(fixtures.browserPrepare);
         case "browser_navigate":
-          return cuaToolResult(CUA_DRIVER_CONTRACT_FIXTURES.browserNavigate);
+          return cuaToolResult(fixtures.browserNavigate);
         case "browser_dialog":
-          return cuaToolResult(CUA_DRIVER_CONTRACT_FIXTURES.browserDialog);
+          return cuaToolResult(fixtures.browserDialog);
         case "browser_set_input_files":
-          return cuaToolResult(CUA_DRIVER_CONTRACT_FIXTURES.browserFiles);
+          return cuaToolResult(fixtures.browserFiles);
         case "browser_download":
           downloadedFile = path.join(String(args.destination_root), "download.txt");
           await fs.writeFile(downloadedFile, "download");
-          return cuaToolResult(CUA_DRIVER_CONTRACT_FIXTURES.browserDownload);
+          return cuaToolResult(fixtures.browserDownload);
         case "browser_click":
         case "browser_type":
         case "browser_pointer":
           return cuaToolResult(
             {},
-            {
-              action:
-                CUA_DRIVER_CONTRACT_FIXTURES.confirmedBackgroundAction as unknown as CuaToolResult["action"],
-            },
+            { action: fixtures.confirmedBackgroundAction as unknown as CuaToolResult["action"] },
           );
         default:
           return cuaToolResult({});
@@ -115,25 +129,16 @@ describe("cua-computer browser actions", () => {
       details: { elements: Array<{ elementRef: string }> };
     };
     expect(observed.observation.kind).toBe("browser");
+    const expectedElement = {
+      elementRef: expect.any(String),
+      kind: "action",
+      value: "",
+      states: [],
+      frame: "main",
+    };
     expect(observed.details.elements).toEqual([
-      {
-        elementRef: expect.any(String),
-        kind: "action",
-        node: "BUTTON",
-        label: "Continue",
-        value: "",
-        states: [],
-        frame: "main",
-      },
-      {
-        elementRef: expect.any(String),
-        kind: "action",
-        node: "INPUT",
-        label: "Name",
-        value: "",
-        states: [],
-        frame: "main",
-      },
+      { ...expectedElement, node: "BUTTON", label: "Continue" },
+      { ...expectedElement, node: "INPUT", label: "Name" },
     ]);
     const observationId = observed.observation.observationId;
     const observedTarget = { ...target, observationId };
@@ -236,20 +241,7 @@ describe("cua-computer browser actions", () => {
   });
 
   it("invalidates browser capabilities across navigation, generation, and execution", async () => {
-    const first = driver();
-    first.callTool.mockImplementation(async (name, args) => {
-      if (name === "list_windows") {
-        return cuaToolResult(CUA_DRIVER_CONTRACT_FIXTURES.listWindows);
-      }
-      if (name === "get_browser_state") {
-        return cuaToolResult(
-          "target_id" in args
-            ? CUA_DRIVER_CONTRACT_FIXTURES.browserSnapshot
-            : CUA_DRIVER_CONTRACT_FIXTURES.browserBinding,
-        );
-      }
-      return cuaToolResult(CUA_DRIVER_CONTRACT_FIXTURES.browserNavigate);
-    });
+    const first = browserDriver();
     const computer = await execution(first.session);
     const bound = await bindBrowser(computer);
     const browserRef = bound.details.browserRef;
@@ -295,7 +287,7 @@ describe("cua-computer browser actions", () => {
 
   it("keeps existing-profile browser attachment outside the accepted contract", async () => {
     const { session, callTool } = driver();
-    callTool.mockResolvedValueOnce(cuaToolResult(CUA_DRIVER_CONTRACT_FIXTURES.listWindows));
+    callTool.mockResolvedValueOnce(cuaToolResult(fixtures.listWindows));
     const computer = await execution(session);
     const windowRef = await listWindow(computer);
 
@@ -313,27 +305,20 @@ describe("cua-computer browser actions", () => {
   });
 
   it("rechecks browser generation and structured stale refusals after driver calls", async () => {
-    const active = driver();
     let staleOnSnapshot = true;
-    active.callTool.mockImplementation(async (name, args) => {
-      if (name === "list_windows") {
-        return cuaToolResult(CUA_DRIVER_CONTRACT_FIXTURES.listWindows);
-      }
-      if (name === "get_browser_state" && !("target_id" in args)) {
-        return cuaToolResult(CUA_DRIVER_CONTRACT_FIXTURES.browserBinding);
-      }
-      if (name === "get_browser_state" && staleOnSnapshot) {
-        active.setGeneration("execution-2");
-        return cuaToolResult(CUA_DRIVER_CONTRACT_FIXTURES.browserSnapshot);
-      }
-      if (name === "get_browser_state") {
-        return cuaToolResult(CUA_DRIVER_CONTRACT_FIXTURES.browserSnapshot);
-      }
-      return cuaToolResult({
-        status: "refused",
-        refusal: { code: "browser_ref_stale", message: "page changed" },
-      });
-    });
+    const active = browserDriver(
+      () => {
+        if (staleOnSnapshot) {
+          active.setGeneration("execution-2");
+        }
+        return cuaToolResult(fixtures.browserSnapshot);
+      },
+      () =>
+        cuaToolResult({
+          status: "refused",
+          refusal: { code: "browser_ref_stale", message: "page changed" },
+        }),
+    );
     const computer = await execution(active.session);
     const firstBinding = await bindBrowser(computer);
     await expect(
