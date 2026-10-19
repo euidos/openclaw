@@ -113,15 +113,12 @@ export class ShellOwner
     this.renderedShellElements.renderedElement(tagName) ??
     this.routeOutlet?.renderedElement?.(tagName) ??
     null;
-  queryRenderedElements<K extends keyof HTMLElementTagNameMap>(
-    tagName: K,
-  ): HTMLElementTagNameMap[K][];
-  queryRenderedElements(tagName: string): HTMLElement[];
-  queryRenderedElements(tagName: string): HTMLElement[] {
-    return [
-      ...this.renderedShellElements.renderedElements(tagName),
-      ...(this.routeOutlet?.renderedElements?.(tagName) ?? []),
-    ];
+  queryRenderedElements<K extends keyof HTMLElementTagNameMap>(tag: K): HTMLElementTagNameMap[K][];
+  queryRenderedElements(tag: string): HTMLElement[];
+  queryRenderedElements(tag: string): HTMLElement[] {
+    return this.renderedShellElements
+      .renderedElements(tag)
+      .concat(this.routeOutlet?.renderedElements?.(tag) ?? []);
   }
   readonly elements: ShellOwnedElements = {};
   commandPaletteTarget: CommandPaletteTargetDetail | undefined;
