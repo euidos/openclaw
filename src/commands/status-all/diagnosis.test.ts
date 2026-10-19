@@ -1,15 +1,12 @@
-// Status-all diagnosis tests cover port checks, restart logs, config issues, and safe diagnostic output.
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
+import type { resolveGatewayLogPaths } from "../../daemon/restart-logs.js";
 import { buildWorkspaceSkillReadiness } from "../../skills/discovery/status.js";
 import { createCanonicalFixtureSkill } from "../../skills/test-support/test-helpers.js";
+import { createStatusCommandOverviewRowsParams } from "../status.test-support.ts";
 
-type GatewayLogPaths = {
-  logDir: string;
-  stdoutPath: string;
-  stderrPath: string;
-};
+type GatewayLogPaths = ReturnType<typeof resolveGatewayLogPaths>;
 
 const restartLogMocks = vi.hoisted(() => ({
   resolveGatewayLogPaths: vi.fn<() => GatewayLogPaths>(() => {
@@ -30,16 +27,8 @@ const gatewayMocks = vi.hoisted(() => ({
   ),
 }));
 
-vi.mock("../../daemon/restart-logs.js", () => ({
-  resolveGatewayLogPaths: restartLogMocks.resolveGatewayLogPaths,
-  resolveGatewaySupervisorLogPaths: restartLogMocks.resolveGatewaySupervisorLogPaths,
-  resolveGatewayRestartLogPath: restartLogMocks.resolveGatewayRestartLogPath,
-}));
-
-vi.mock("./gateway.js", () => ({
-  readFileTailLines: gatewayMocks.readFileTailLines,
-  summarizeLogTail: gatewayMocks.summarizeLogTail,
-}));
+vi.mock("../../daemon/restart-logs.js", () => restartLogMocks);
+vi.mock("./gateway.js", () => gatewayMocks);
 
 import { appendStatusAllDiagnosis, readStatusAllLogTails } from "./diagnosis.js";
 
@@ -90,7 +79,7 @@ function diagnose(overrides: Partial<DiagnosisParams> = {}) {
   return params.lines.join("\n");
 }
 
-function deliveryParams(
+function delivery(
   [received, started, completed, turns, processed]: [number, number, number, number, number],
   type: string,
   ageMs: number,
@@ -114,15 +103,9 @@ function deliveryParams(
 
 describe("status-all diagnosis port checks", () => {
   beforeEach(() => {
-    restartLogMocks.resolveGatewayLogPaths.mockImplementation(() => {
-      throw new Error("skip log tail");
-    });
-    restartLogMocks.resolveGatewaySupervisorLogPaths.mockImplementation(() => {
-      throw new Error("skip log tail");
-    });
-    restartLogMocks.resolveGatewayRestartLogPath.mockReturnValue("/tmp/gateway-restart.log");
-    gatewayMocks.readFileTailLines.mockResolvedValue([]);
-    gatewayMocks.summarizeLogTail.mockImplementation((lines: string[]) => lines);
+    for (const mock of Object.values({ ...restartLogMocks, ...gatewayMocks })) {
+      mock.mockReset();
+    }
   });
 
   it("keeps first config issue locations and exact pairs before applying the display cap", () => {
@@ -155,15 +138,7 @@ describe("status-all diagnosis port checks", () => {
       "  - legacy.json:7 — a: b:c",
       "  - a:b: c",
       "  - a: different",
-      "  - field0: invalid",
-      "  - field1: invalid",
-      "  - field2: invalid",
-      "  - field3: invalid",
-      "  - field4: invalid",
-      "  - field5: invalid",
-      "  - field6: invalid",
-      "  - field7: invalid",
-      "  - field8: invalid",
+      ...Array.from({ length: 9 }, (_, i) => `  - field${i}: invalid`),
       "  … +2 more",
     ]);
     expect(params.snap).toEqual(original);
@@ -217,16 +192,7 @@ describe("status-all diagnosis port checks", () => {
   it("retains queue warnings from a successful gateway health snapshot", () => {
     const params = createBaseParams();
     params.health = {
-      ok: true,
-      ts: 0,
-      durationMs: 42,
-      heartbeatSeconds: 60,
-      defaultAgentId: "main",
-      agents: [],
-      sessions: { path: "/tmp/sessions.json", count: 0, recent: [] },
-      channels: {},
-      channelOrder: [],
-      channelLabels: {},
+      ...createStatusCommandOverviewRowsParams().health!,
       deliveryQueues: {
         failed: [{ queueName: "outbound", count: 2 }],
         ingressPressure: [
@@ -267,26 +233,20 @@ describe("status-all diagnosis port checks", () => {
     expect(diagnose()).toContain("✓ Tailscale exposure: off · daemon unknown");
   });
 
-  it("treats same-process dual-stack loopback listeners as healthy", () => {
-    const params = createBaseParams([
-      { pid: 5001, commandLine: "openclaw-gateway", address: "127.0.0.1:18789" },
-      { pid: 5001, commandLine: "openclaw-gateway", address: "[::1]:18789" },
-    ]);
-
+  it.each([
+    [["127.0.0.1:18789", "[::1]:18789"], "Detected dual-stack loopback listeners"],
+    [["0.0.0.0:18789"], "Detected OpenClaw Gateway listener on the configured port."],
+  ] as const)("treats same-process %j listeners as healthy", (addresses, detail) => {
+    const params = createBaseParams(
+      addresses.map((address) => ({
+        pid: 5001,
+        commandLine: "openclaw-gateway",
+        address,
+      })),
+    );
     const output = diagnose(params);
     expect(output).toContain("✓ Port 18789");
-    expect(output).toContain("Detected dual-stack loopback listeners");
-    expect(output).not.toContain("Port 18789 is already in use.");
-  });
-
-  it("treats a single wildcard Gateway listener as healthy", () => {
-    const params = createBaseParams([
-      { pid: 5001, commandLine: "openclaw-gateway", address: "0.0.0.0:18789" },
-    ]);
-
-    const output = diagnose(params);
-    expect(output).toContain("✓ Port 18789");
-    expect(output).toContain("Detected OpenClaw Gateway listener on the configured port.");
+    expect(output).toContain(detail);
     expect(output).not.toContain("Port 18789 is already in use.");
   });
 
@@ -346,38 +306,28 @@ describe("status-all diagnosis port checks", () => {
     },
   );
 
-  it("emits a soft warning when no agent sessions were active in the last 30m", () => {
+  it.each([
+    [31, null, 0, "!"],
+    [5, 45, 1, "✓"],
+  ] as const)("reports agent activity for ages %s/%s minutes", (main, worker, active, icon) => {
     const output = diagnose({
       agentStatus: {
         totalSessions: 2,
         agents: [
-          { id: "main", lastActiveAgeMs: 31 * 60_000 },
-          { id: "worker", lastActiveAgeMs: null },
+          { id: "main", lastActiveAgeMs: main * 60_000 },
+          { id: "worker", lastActiveAgeMs: worker === null ? null : worker * 60_000 },
         ],
       },
     });
-    expect(output).toContain("! Agent activity: 0 active in 30m · 2 sessions");
-    expect(output).toContain("verify inbound dispatch and turn creation");
-  });
-
-  it("keeps agent activity healthy when a session was recently updated", () => {
-    const output = diagnose({
-      agentStatus: {
-        totalSessions: 2,
-        agents: [
-          { id: "main", lastActiveAgeMs: 5 * 60_000 },
-          { id: "worker", lastActiveAgeMs: 45 * 60_000 },
-        ],
-      },
-    });
-    expect(output).toContain("✓ Agent activity: 1 active in 30m · 2 sessions");
-    expect(output).not.toContain("verify inbound dispatch and turn creation");
+    expect(output).toContain(`${icon} Agent activity: ${active} active in 30m · 2 sessions`);
+    const hint = "verify inbound dispatch and turn creation";
+    expect(output).toEqual(
+      active ? expect.not.stringContaining(hint) : expect.stringContaining(hint),
+    );
   });
 
   it("summarizes inbound delivery telemetry proof counters", () => {
-    const params = deliveryParams([2, 2, 2, 2, 2], "session.turn.created", 60_000);
-
-    const output = diagnose(params);
+    const output = diagnose(delivery([2, 2, 2, 2, 2], "session.turn.created", 60_000));
     expect(output).toContain(
       "✓ Inbound delivery telemetry: received 2 · dispatch 2/2 · turns 2 · processed 2",
     );
@@ -409,9 +359,7 @@ describe("status-all diagnosis port checks", () => {
     expect(output).toContain(
       "diagnostics-otel · traces · failed · OTLP/HTTP protobuf (explicit endpoint) · export failed",
     );
-    expect(output).not.toContain("collector.example");
-    expect(output).not.toContain("secret");
-    expect(output).not.toContain("raw failure");
+    expect(output).not.toMatch(/collector\.example|secret|raw failure/);
   });
 
   it("renders failed diagnostics as unavailable instead of empty", () => {
@@ -437,35 +385,27 @@ describe("status-all diagnosis port checks", () => {
     );
     expect(output).toContain("Retry: openclaw gateway stability");
     expect(output).not.toContain("received 0 · dispatch 0/0 · turns 0 · processed 0");
-    expect(output).not.toContain("probe-user");
-    expect(output).not.toContain("probe-pass");
-    expect(output).not.toContain("probe-secret");
+    expect(output).not.toMatch(/probe-user|probe-pass|probe-secret/);
   });
 
-  it("keeps handled terminal delivery paths healthy without dispatch starts", () => {
-    const params = deliveryParams([1, 0, 0, 0, 1], "message.processed", 30_000);
-
-    const output = diagnose(params);
-    expect(output).toContain(
-      "✓ Inbound delivery telemetry: received 1 · dispatch 0/0 · turns 0 · processed 1",
-    );
-    expect(output).not.toContain("Messages were received, but no gateway dispatch started");
-  });
-
-  it("keeps handled terminal dispatches healthy without agent turns", () => {
-    const params = deliveryParams([1, 1, 1, 0, 1], "message.processed", 30_000);
-
-    const output = diagnose(params);
-    expect(output).toContain(
-      "✓ Inbound delivery telemetry: received 1 · dispatch 1/1 · turns 0 · processed 1",
-    );
-    expect(output).not.toContain("Gateway dispatch started, but no agent turn was created");
-  });
+  it.each([
+    [0, "Messages were received, but no gateway dispatch started"],
+    [1, "Gateway dispatch started, but no agent turn was created"],
+  ] as const)(
+    "keeps handled terminal delivery healthy with %s dispatches",
+    (dispatches, warning) => {
+      const output = diagnose(
+        delivery([1, dispatches, dispatches, 0, 1], "message.processed", 30_000),
+      );
+      expect(output).toContain(
+        `✓ Inbound delivery telemetry: received 1 · dispatch ${dispatches}/${dispatches} · turns 0 · processed 1`,
+      );
+      expect(output).not.toContain(warning);
+    },
+  );
 
   it("warns when received messages never reach agent turn creation", () => {
-    const params = deliveryParams([3, 3, 1, 0, 1], "message.dispatch.started", 120_000);
-
-    const output = diagnose(params);
+    const output = diagnose(delivery([3, 3, 1, 0, 1], "message.dispatch.started", 120_000));
     expect(output).toContain(
       "! Inbound delivery telemetry: received 3 · dispatch 3/1 · turns 0 · processed 1",
     );
@@ -475,21 +415,12 @@ describe("status-all diagnosis port checks", () => {
 
   it("avoids unreachable gateway diagnosis in node-only mode", () => {
     const params = createBaseParams();
-    params.connectionDetailsForReport = [
-      "Node-only mode detected",
-      "Local gateway: not expected on this machine",
-      "Remote gateway target: gateway.example.com:19000",
-    ].join("\n");
+    params.connectionDetailsForReport = "Node-only mode detected";
     params.health = undefined;
     params.nodeOnlyGateway = {
       gatewayTarget: "gateway.example.com:19000",
-      gatewayValue: "node → gateway.example.com:19000 · no local gateway",
-      connectionDetails: [
-        "Node-only mode detected",
-        "Local gateway: not expected on this machine",
-        "Remote gateway target: gateway.example.com:19000",
-        "Inspect the remote gateway host for live channel and health details.",
-      ].join("\n"),
+      gatewayValue: "",
+      connectionDetails: "",
     };
     params.gatewayReachable = true;
     const failedProbe = {
@@ -522,32 +453,25 @@ describe("status-all diagnosis port checks", () => {
     const originalPlatform = process.platform;
     Object.defineProperty(process, "platform", { value: "darwin" });
     try {
+      const logDir = "/Users/test/Library/Logs/openclaw";
+      const stdoutPath = path.join(logDir, "gateway.log"),
+        stderrPath = path.join(logDir, "gateway.err.log");
       restartLogMocks.resolveGatewaySupervisorLogPaths.mockReturnValue({
-        logDir: "/Users/test/Library/Logs/openclaw",
-        stdoutPath: "/Users/test/Library/Logs/openclaw/gateway.log",
-        stderrPath: "/Users/test/Library/Logs/openclaw/gateway.err.log",
+        logDir,
+        stdoutPath,
+        stderrPath,
       });
       restartLogMocks.resolveGatewayRestartLogPath.mockReturnValue(
         "/tmp/openclaw/logs/gateway-restart.log",
       );
-      gatewayMocks.readFileTailLines.mockImplementation(async (filePath: string) => {
-        if (filePath.endsWith("gateway.log")) {
-          return ["gateway stdout current"];
-        }
-        if (filePath.endsWith("gateway.err.log")) {
-          return ["failed to bind gateway socket stale"];
-        }
-        return [];
-      });
-      const params = createBaseParams();
-      params.logTails = await readStatusAllLogTails();
-
-      const output = diagnose(params);
-      expect(gatewayMocks.readFileTailLines).not.toHaveBeenCalledWith(
-        "/Users/test/Library/Logs/openclaw/gateway.err.log",
-        40,
-      );
-      expect(output).toContain("# stdout: /Users/test/Library/Logs/openclaw/gateway.log");
+      const tails = {
+        [stdoutPath]: ["gateway stdout current"],
+        [stderrPath]: ["failed to bind gateway socket stale"],
+      };
+      gatewayMocks.readFileTailLines.mockImplementation(async (filePath) => tails[filePath] ?? []);
+      const output = diagnose({ logTails: await readStatusAllLogTails() });
+      expect(gatewayMocks.readFileTailLines).not.toHaveBeenCalledWith(stderrPath, 40);
+      expect(output).toContain(`# stdout: ${stdoutPath}`);
       expect(output).toContain("gateway stdout current");
       expect(output).not.toContain("# stderr:");
       expect(output).not.toContain("failed to bind gateway socket stale");
