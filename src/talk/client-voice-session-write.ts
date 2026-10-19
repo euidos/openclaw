@@ -55,6 +55,7 @@ import {
   captureClientVoiceEntrySource,
   createClientVoiceSessionSource,
   prepareClientVoiceSessionSourceChecks,
+  selectPreparedClientVoiceSource,
   type ClientVoiceSessionSource,
 } from "./client-voice-session-source.js";
 import type { ClientVoiceSessionRecord } from "./client-voice-session-store.js";
@@ -494,22 +495,7 @@ export async function mutateAuthorizedClientVoiceSession<T>(
           if (!workerGrant?.transaction) {
             resources.push(authority);
           }
-          const preparedSources = [
-            ...authority.checks.map(({ predicate }) => predicate.source),
-            ...(authority.transaction ? [authority.transaction.source] : []),
-          ].filter((source) =>
-            [...sourceIdentities.values()].some(
-              (identity) =>
-                typeof source.databaseIdentity === "string" &&
-                identity.key === `file:${source.databaseIdentity}` &&
-                identity.birthtime === source.databaseBirthtime,
-            ),
-          );
-          const preparedSource = preparedSources.every(
-            (source) => source.databaseIdentity === preparedSources[0]?.databaseIdentity,
-          )
-            ? preparedSources[0]
-            : undefined;
+          const preparedSource = selectPreparedClientVoiceSource(authority, sourceIdentities);
           const canonical = resolveUnsuffixedSqliteTargetFromSessionStorePath(
             params.source.storePath,
           );

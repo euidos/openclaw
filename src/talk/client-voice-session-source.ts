@@ -107,6 +107,28 @@ export function captureClientVoiceSessionSource(agentId: string) {
 
 export type ClientVoiceSessionSource = ReturnType<typeof captureClientVoiceSessionSource>;
 
+export function selectPreparedClientVoiceSource(
+  authority: PreparedSessionSourceAuthority,
+  identities: ReadonlyMap<string, DatabasePathIdentity>,
+) {
+  const preparedSources = [
+    ...authority.checks.map(({ predicate }) => predicate.source),
+    ...(authority.transaction ? [authority.transaction.source] : []),
+  ].filter((source) =>
+    [...identities.values()].some(
+      (identity) =>
+        typeof source.databaseIdentity === "string" &&
+        identity.key === `file:${source.databaseIdentity}` &&
+        identity.birthtime === source.databaseBirthtime,
+    ),
+  );
+  return preparedSources.every(
+    (source) => source.databaseIdentity === preparedSources[0]?.databaseIdentity,
+  )
+    ? preparedSources[0]
+    : undefined;
+}
+
 /** An explicit source qualifies the run's store; an omitted source retains replay custody. */
 export function matchesClientVoiceRunSource(
   owner: { binding: ClientVoiceRunBinding; source: ClientVoiceSessionSource } | undefined,

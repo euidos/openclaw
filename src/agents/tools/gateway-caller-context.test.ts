@@ -245,7 +245,7 @@ describe("gateway caller context wrapper", () => {
 
   it("retains the source receiver while executing in the admitted caller context", async () => {
     const tool = makeTool();
-    tool.execute = async function (this: AnyAgentTool) {
+    tool.execute = async function () {
       expect(this).toBe(tool);
       expect(getCaller()).toEqual(agentCaller);
       return { content: [], details: {} };
