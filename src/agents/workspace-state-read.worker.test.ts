@@ -24,13 +24,15 @@ import { WorkspaceAliasRepointedError } from "./workspace-state-identity.js";
 import {
   clearExpiredWorkspaceStateForVanishedWorkspace,
   deleteWorkspaceState,
-  mergeWorkspaceSetupState,
+  mergeWorkspaceSetupState as merge,
   prepareWorkspaceStateDeletion,
-  readWorkspaceStateSnapshot,
-  replaceWorkspaceAttestation,
+  readWorkspaceStateSnapshot as read,
+  replaceWorkspaceAttestation as attest,
 } from "./workspace-state-store.js";
 
 const WORKSPACE_ATTESTATION_RECENT_MS = 24 * 60 * 60 * 1000;
+const seededAt = "2026-07-16T01:00:00.000Z";
+const completedAt = "2026-07-16T02:00:00.000Z";
 
 let state: OpenClawTestState;
 beforeEach(async () => {
@@ -43,26 +45,20 @@ afterEach(async () => {
 });
 
 async function seed() {
-  await mergeWorkspaceSetupState(
-    state.workspaceDir,
-    {
-      bootstrapSeededAt: "2026-07-16T01:00:00.000Z",
-    },
-    1_000,
-  );
-  await replaceWorkspaceAttestation({
+  await merge(state.workspaceDir, { bootstrapSeededAt: seededAt }, 1_000);
+  await attest({
     workspaceDir: state.workspaceDir,
     attestedAtMs: 1_000,
     nowMs: 1_000,
     generatedHashes: new Map([["AGENTS.md", "a".repeat(64)]]),
   });
-  return await readWorkspaceStateSnapshot(state.workspaceDir);
+  return await read(state.workspaceDir);
 }
 
-async function withoutMainThreadSql<T>(read: () => Promise<T>): Promise<T> {
+async function withoutMainThreadSql<T>(run: () => Promise<T>): Promise<T> {
   const sql = observeMainThreadSql();
   try {
-    const result = await read();
+    const result = await run();
     sql.expectIdle();
     return result;
   } finally {
@@ -71,34 +67,28 @@ async function withoutMainThreadSql<T>(read: () => Promise<T>): Promise<T> {
 }
 
 it("reuses unchanged workspace facts and refreshes them after each owning write", async () => {
-  expect((await readWorkspaceStateSnapshot(state.workspaceDir)).setupExists).toBe(false);
+  expect((await read(state.workspaceDir)).setupExists).toBe(false);
   const initial = await seed();
-  expect(initial.setup.bootstrapSeededAt).toBe("2026-07-16T01:00:00.000Z");
+  expect(initial.setup.bootstrapSeededAt).toBe(seededAt);
   const execute = vi.spyOn(stateWorker, "runOpenClawStateWorkerOperation");
-  const unchanged = await withoutMainThreadSql(() =>
-    readWorkspaceStateSnapshot(state.workspaceDir),
-  );
+  const unchanged = await withoutMainThreadSql(() => read(state.workspaceDir));
   expect(unchanged).toEqual(initial);
   expect(execute).not.toHaveBeenCalled();
 
-  await mergeWorkspaceSetupState(state.workspaceDir, {
-    setupCompletedAt: "2026-07-16T02:00:00.000Z",
-  });
-  expect((await readWorkspaceStateSnapshot(state.workspaceDir)).setup.setupCompletedAt).toBe(
-    "2026-07-16T02:00:00.000Z",
-  );
-  await replaceWorkspaceAttestation({
+  await merge(state.workspaceDir, { setupCompletedAt: completedAt });
+  expect((await read(state.workspaceDir)).setup.setupCompletedAt).toBe(completedAt);
+  await attest({
     workspaceDir: state.workspaceDir,
     attestedAtMs: 2_000,
     nowMs: 2_000,
     generatedHashes: new Map([["TOOLS.md", "b".repeat(64)]]),
   });
-  expect((await readWorkspaceStateSnapshot(state.workspaceDir)).attestation).toEqual({
+  expect((await read(state.workspaceDir)).attestation).toEqual({
     attestedAtMs: 2_000,
     generatedHashes: new Map([["TOOLS.md", "b".repeat(64)]]),
   });
   await deleteWorkspaceState(prepareWorkspaceStateDeletion(state.workspaceDir));
-  expect(await readWorkspaceStateSnapshot(state.workspaceDir)).toMatchObject({
+  expect(await read(state.workspaceDir)).toMatchObject({
     setupExists: false,
     setup: { version: 1 },
   });
@@ -114,18 +104,15 @@ it("rolls back setup when a recovery hold arrives after caller preparation", asy
     ]);
   });
   await withoutMainThreadSql(async () => {
-    const refusal = await mergeWorkspaceSetupState(
-      state.workspaceDir,
-      { setupCompletedAt: "2026-07-16T02:00:00.000Z" },
-      2_000,
-      { recoveryHoldPredicate },
-    ).catch((error: unknown) => error);
+    const refusal = await merge(state.workspaceDir, { setupCompletedAt: completedAt }, 2_000, {
+      recoveryHoldPredicate,
+    }).catch((error: unknown) => error);
     expect(refusal).toBeInstanceOf(DuplicateAgentError);
     expect(refusal).toMatchObject({
       message:
         "Agent new has held databases. Restore its original agentDir and session.store configuration, then run agents add explicitly to restore the preserved store.",
     });
-    expect(await readWorkspaceStateSnapshot(state.workspaceDir)).toEqual(before);
+    expect(await read(state.workspaceDir)).toEqual(before);
   });
 });
 
@@ -151,20 +138,15 @@ it.each(["merge", "delete"] as const)(
       };
       const pending =
         operation === "merge"
-          ? mergeWorkspaceSetupState(
-              alias,
-              { setupCompletedAt: "2026-07-16T02:00:00.000Z" },
-              2_000,
-              options,
-            )
+          ? merge(alias, { setupCompletedAt: completedAt }, 2_000, options)
           : deleteWorkspaceState(prepareWorkspaceStateDeletion(alias), options);
       await expect(pending).rejects.toBe(refusal);
       spy.mockRestore();
       expect(retired).toBe(true);
-      expect(await readWorkspaceStateSnapshot(state.workspaceDir)).toEqual(before);
+      expect(await read(state.workspaceDir)).toEqual(before);
     }
     fs.unlinkSync(alias);
-    expect((await readWorkspaceStateSnapshot(alias)).setupExists).toBe(false);
+    expect((await read(alias)).setupExists).toBe(false);
   },
 );
 
@@ -190,7 +172,7 @@ it.each(["transaction", "commit"] as const)(
     ).rejects.toThrow("Workspace filesystem changed");
     spy.mockRestore();
     expect(restored).toBe(true);
-    expect(await readWorkspaceStateSnapshot(state.workspaceDir)).toEqual(before);
+    expect(await read(state.workspaceDir)).toEqual(before);
     expect(readWorkspaceFileCache(filePath, "identity")).toBe("cached");
   },
 );
@@ -219,22 +201,20 @@ it.each(["expiry", "deletion"] as const)(
     expect(spy).toHaveBeenCalledTimes(1);
     spy.mockRestore();
     expect(readWorkspaceFileCache(filePath, "identity")).toBeUndefined();
-    expect((await readWorkspaceStateSnapshot(state.workspaceDir)).setupExists).toBe(false);
+    expect((await read(state.workspaceDir)).setupExists).toBe(false);
   },
 );
 
 it("keeps captured first-writer setup milestones across queued merges and reopen", async () => {
   await seed();
-  const next = { setupCompletedAt: "2026-07-16T02:00:00.000Z" };
-  const first = mergeWorkspaceSetupState(state.workspaceDir, next, 2_000);
+  const next = { setupCompletedAt: completedAt };
+  const first = merge(state.workspaceDir, next, 2_000);
   next.setupCompletedAt = "2026-07-17T02:00:00.000Z";
-  const second = mergeWorkspaceSetupState(state.workspaceDir, next, 3_000);
-  expect((await first).setupCompletedAt).toBe("2026-07-16T02:00:00.000Z");
-  expect((await second).setupCompletedAt).toBe("2026-07-16T02:00:00.000Z");
+  const second = merge(state.workspaceDir, next, 3_000);
+  expect((await first).setupCompletedAt).toBe(completedAt);
+  expect((await second).setupCompletedAt).toBe(completedAt);
   await closeOpenClawStateDatabaseAsync();
-  expect((await readWorkspaceStateSnapshot(state.workspaceDir)).setup.setupCompletedAt).toBe(
-    "2026-07-16T02:00:00.000Z",
-  );
+  expect((await read(state.workspaceDir)).setup.setupCompletedAt).toBe(completedAt);
 });
 
 it("rolls back alias registration when its symlink is repointed before commit", async () => {
@@ -250,13 +230,11 @@ it("rolls back alias registration when its symlink is repointed before commit", 
     }
     admit(request, grant);
   });
-  await expect(readWorkspaceStateSnapshot(alias)).rejects.toBeInstanceOf(
-    WorkspaceAliasRepointedError,
-  );
+  await expect(read(alias)).rejects.toBeInstanceOf(WorkspaceAliasRepointedError);
   spy.mockRestore();
   fs.unlinkSync(alias);
-  expect((await readWorkspaceStateSnapshot(alias)).setupExists).toBe(false);
-  expect(await readWorkspaceStateSnapshot(state.workspaceDir)).toEqual(before);
+  expect((await read(alias)).setupExists).toBe(false);
+  expect(await read(state.workspaceDir)).toEqual(before);
 });
 
 it("joins a granted workspace mutation before closing its database", async () => {
@@ -276,11 +254,7 @@ it("joins a granted workspace mutation before closing its database", async () =>
     });
   });
   await expect(
-    mergeWorkspaceSetupState(
-      state.workspaceDir,
-      { setupCompletedAt: "2026-07-16T02:00:00.000Z" },
-      2_000,
-    ),
+    merge(state.workspaceDir, { setupCompletedAt: completedAt }, 2_000),
   ).rejects.toMatchObject({
     message: "SQLite committed facts publication failed",
     code: "outcome-unknown",
@@ -293,9 +267,7 @@ it("joins a granted workspace mutation before closing its database", async () =>
   await close;
   spy.mockRestore();
   expect(closed).toBe(true);
-  expect((await readWorkspaceStateSnapshot(state.workspaceDir)).setup.setupCompletedAt).toBe(
-    "2026-07-16T02:00:00.000Z",
-  );
+  expect((await read(state.workspaceDir)).setup.setupCompletedAt).toBe(completedAt);
 });
 
 it.each([false, true])(
@@ -309,9 +281,7 @@ it.each([false, true])(
       "Synthetic setup instructions.\n",
     );
     if (completed) {
-      await mergeWorkspaceSetupState(state.workspaceDir, {
-        setupCompletedAt: "2026-07-16T02:00:00.000Z",
-      });
+      await merge(state.workspaceDir, { setupCompletedAt: completedAt });
     }
     await closeOpenClawStateDatabaseAsync();
     const files = await withoutMainThreadSql(() =>
@@ -328,19 +298,14 @@ it.each([false, true])(
 it("keeps workspace reads on the selected composite snapshot", async () => {
   const initial = await seed();
   await withOpenClawStateDatabaseReadSnapshot(async () => {
-    await mergeWorkspaceSetupState(state.workspaceDir, {
-      setupCompletedAt: "2026-07-16T02:00:00.000Z",
-    });
-    expect(
-      await withoutMainThreadSql(() =>
-        readWorkspaceStateSnapshot(state.workspaceDir, { readOnly: true }),
-      ),
-    ).toEqual(initial);
+    await merge(state.workspaceDir, { setupCompletedAt: completedAt });
+    expect(await withoutMainThreadSql(() => read(state.workspaceDir, { readOnly: true }))).toEqual(
+      initial,
+    );
   });
-  expect(
-    (await readWorkspaceStateSnapshot(state.workspaceDir, { readOnly: true })).setup
-      .setupCompletedAt,
-  ).toBe("2026-07-16T02:00:00.000Z");
+  expect((await read(state.workspaceDir, { readOnly: true })).setup.setupCompletedAt).toBe(
+    completedAt,
+  );
 });
 
 it("reads committed workspace state while the cached writer has an open transaction", async () => {
@@ -348,13 +313,9 @@ it("reads committed workspace state while the cached writer has an open transact
   const database = openOpenClawStateDatabase();
   database.db.exec("BEGIN IMMEDIATE");
   try {
-    database.db
-      .prepare("UPDATE workspace_setup_state SET setup_completed_at = ?")
-      .run("2026-07-16T02:00:00.000Z");
+    database.db.prepare("UPDATE workspace_setup_state SET setup_completed_at = ?").run(completedAt);
     expect(
-      await withoutMainThreadSql(() =>
-        readWorkspaceStateSnapshot(state.workspaceDir, { database, readOnly: true }),
-      ),
+      await withoutMainThreadSql(() => read(state.workspaceDir, { database, readOnly: true })),
     ).toEqual(expected);
     expect(database.db.isOpen).toBe(true);
   } finally {
@@ -368,7 +329,7 @@ it("preserves repointed workspace alias error identity and repair details", asyn
   const replacement = state.path("replacement");
   fs.mkdirSync(replacement);
   fs.symlinkSync(state.workspaceDir, alias, process.platform === "win32" ? "junction" : "dir");
-  await readWorkspaceStateSnapshot(alias);
+  await read(alias);
   fs.unlinkSync(alias);
   fs.symlinkSync(replacement, alias, process.platform === "win32" ? "junction" : "dir");
   await closeOpenClawStateDatabaseAsync();

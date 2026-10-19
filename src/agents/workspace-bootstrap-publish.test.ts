@@ -1,5 +1,3 @@
-// Bootstrap publication atomicity: a failed first-time write must never leave
-// a partial AGENTS.md behind, and an existing complete winner is never clobbered.
 import syncFs from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -17,15 +15,10 @@ const {
   seedWorkspaceBootstrap,
 } = workspace;
 
-async function expectPathMissing(filePath: string): Promise<void> {
-  await expect(fs.access(filePath)).rejects.toHaveProperty("code", "ENOENT");
-}
-
 async function injectPartialPublicationFailure(dir: string, fileName: string) {
   const realOpen = fs.open.bind(fs);
   const resolvedDir = await fs.realpath(dir);
   const targetPath = path.join(resolvedDir, fileName);
-  const stagedPaths: string[] = [];
   let injected = true;
   const openSpy = vi.spyOn(fs, "open").mockImplementation(async (...args) => {
     const handle = await realOpen(...args);
@@ -43,7 +36,6 @@ async function injectPartialPublicationFailure(dir: string, fileName: string) {
       (target === targetPath || (path.dirname(target) === resolvedDir && exclusiveCreate))
     ) {
       injected = false;
-      stagedPaths.push(target);
       vi.spyOn(handle, "write").mockImplementationOnce(async () => {
         await handle.writeFile("# PARTIAL\n");
         throw Object.assign(new Error("ENOSPC"), { code: "ENOSPC" });
@@ -51,10 +43,7 @@ async function injectPartialPublicationFailure(dir: string, fileName: string) {
     }
     return handle;
   });
-  return {
-    restore: () => openSpy.mockRestore(),
-    stagedPaths,
-  };
+  return () => openSpy.mockRestore();
 }
 
 async function listTempSiblings(dir: string): Promise<string[]> {
@@ -64,32 +53,30 @@ async function listTempSiblings(dir: string): Promise<string[]> {
 
 describe("bootstrap publication atomicity", () => {
   let nativeModeEnv: ReturnType<typeof captureEnv>;
-  beforeEach(() => {
+  let tempDir: string;
+  let agentsPath: string;
+  const ensure = () => ensureAgentWorkspace({ dir: tempDir, ensureBootstrapFiles: true });
+  beforeEach(async () => {
     nativeModeEnv = captureEnv(["FS_SAFE_NATIVE_MODE"]);
     // Inject actual write/publication failures through the supported JavaScript backend.
     setTestEnvValue("FS_SAFE_NATIVE_MODE", "off");
+    tempDir = await makeTempWorkspace("openclaw-workspace-");
+    agentsPath = path.join(tempDir, DEFAULT_AGENTS_FILENAME);
   });
-  afterEach(() => {
+  afterEach(async () => {
     vi.restoreAllMocks();
     nativeModeEnv.restore();
+    await fs.chmod(tempDir, 0o700);
+    await fs.rm(tempDir, { recursive: true, force: true });
   });
 
   it("does not publish a partial AGENTS.md when the first write fails", async () => {
-    const tempDir = await makeTempWorkspace("openclaw-workspace-");
-    const agentsPath = path.join(tempDir, DEFAULT_AGENTS_FILENAME);
-    const failure = await injectPartialPublicationFailure(tempDir, DEFAULT_AGENTS_FILENAME);
-
-    try {
-      await expect(
-        ensureAgentWorkspace({ dir: tempDir, ensureBootstrapFiles: true }),
-      ).rejects.toMatchObject({ cause: { code: "ENOSPC" } });
-      await expectPathMissing(agentsPath);
-      expect(await listTempSiblings(tempDir)).toEqual([]);
-    } finally {
-      failure.restore();
-    }
-
-    await ensureAgentWorkspace({ dir: tempDir, ensureBootstrapFiles: true });
+    const restore = await injectPartialPublicationFailure(tempDir, DEFAULT_AGENTS_FILENAME);
+    await expect(ensure()).rejects.toMatchObject({ cause: { code: "ENOSPC" } });
+    await expect(fs.access(agentsPath)).rejects.toHaveProperty("code", "ENOENT");
+    expect(await listTempSiblings(tempDir)).toEqual([]);
+    restore();
+    await ensure();
     const content = await fs.readFile(agentsPath, "utf-8");
     expect(content).not.toBe("# PARTIAL\n");
     expect(content.trim().length).toBeGreaterThan(0);
@@ -98,50 +85,33 @@ describe("bootstrap publication atomicity", () => {
   it.runIf(process.platform !== "win32" && process.getuid?.() !== 0)(
     "reuses an established read-only workspace without creating bootstrap files",
     async () => {
-      const tempDir = await makeTempWorkspace("openclaw-workspace-readonly-");
       const files = ["AGENTS.md", "SOUL.md", "IDENTITY.md", "USER.md"];
       for (const name of files) {
         await fs.writeFile(path.join(tempDir, name), `Authored ${name}\n`);
       }
-      await ensureAgentWorkspace({ dir: tempDir, ensureBootstrapFiles: true });
+      await ensure();
       await fs.chmod(tempDir, 0o555);
-
-      try {
-        await ensureAgentWorkspace({ dir: tempDir, ensureBootstrapFiles: true });
-
-        for (const name of files) {
-          expect(await fs.readFile(path.join(tempDir, name), "utf8")).toBe(`Authored ${name}\n`);
-        }
-        expect((await fs.readdir(tempDir)).toSorted()).toEqual(files.toSorted());
-      } finally {
-        await fs.chmod(tempDir, 0o700);
-        await fs.rm(tempDir, { recursive: true, force: true });
+      await ensure();
+      for (const name of files) {
+        expect(await fs.readFile(path.join(tempDir, name), "utf8")).toBe(`Authored ${name}\n`);
       }
+      expect((await fs.readdir(tempDir)).toSorted()).toEqual(files.toSorted());
     },
   );
 
   it.runIf(process.platform !== "win32" && process.getuid?.() !== 0)(
     "preserves an existing dangling bootstrap symlink in a read-only workspace",
     async () => {
-      const tempDir = await makeTempWorkspace("openclaw-workspace-dangling-");
-      const agentsPath = path.join(tempDir, DEFAULT_AGENTS_FILENAME);
       await fs.symlink("missing.md", agentsPath);
       await fs.chmod(tempDir, 0o555);
 
-      try {
-        await expect(publishBootstrapFile(agentsPath, "replacement\n")).resolves.toBe(false);
-        expect(await fs.readlink(agentsPath)).toBe("missing.md");
-        expect(await fs.readdir(tempDir)).toEqual([DEFAULT_AGENTS_FILENAME]);
-      } finally {
-        await fs.chmod(tempDir, 0o700);
-        await fs.rm(tempDir, { recursive: true, force: true });
-      }
+      await expect(publishBootstrapFile(agentsPath, "replacement\n")).resolves.toBe(false);
+      expect(await fs.readlink(agentsPath)).toBe("missing.md");
+      expect(await fs.readdir(tempDir)).toEqual([DEFAULT_AGENTS_FILENAME]);
     },
   );
 
   it("publishes one complete winner", async () => {
-    const tempDir = await makeTempWorkspace("openclaw-workspace-");
-    const agentsPath = path.join(tempDir, DEFAULT_AGENTS_FILENAME);
     const contents = ["FIRST-COMPLETE\n", "SECOND-COMPLETE\n"];
 
     const created = await Promise.all(
@@ -155,51 +125,36 @@ describe("bootstrap publication atomicity", () => {
   });
 
   it("keeps a safe reader on the complete single-link file", async () => {
-    const tempDir = await makeTempWorkspace("openclaw-workspace-");
-    const agentsPath = path.join(tempDir, DEFAULT_AGENTS_FILENAME);
     const realLink = syncFs.linkSync.bind(syncFs);
     let concurrentRead: ReturnType<typeof workspace.loadWorkspaceBootstrapFiles> | undefined;
-    const linkSpy = vi.spyOn(syncFs, "linkSync").mockImplementation((source, target) => {
+    vi.spyOn(syncFs, "linkSync").mockImplementation((source, target) => {
       realLink(source, target);
       concurrentRead = workspace.loadWorkspaceBootstrapFiles(tempDir);
     });
 
-    try {
-      await publishBootstrapFile(agentsPath, "COMPLETE\n");
-      if (!concurrentRead) {
-        throw new Error("concurrent reader was not started");
-      }
-      const agents = (await concurrentRead).find((file) => file.name === DEFAULT_AGENTS_FILENAME);
-      expect(agents).toMatchObject({ content: "COMPLETE\n", missing: false });
-      expect((await fs.lstat(agentsPath)).nlink).toBe(1);
-    } finally {
-      linkSpy.mockRestore();
+    await publishBootstrapFile(agentsPath, "COMPLETE\n");
+    if (!concurrentRead) {
+      throw new Error("concurrent reader was not started");
     }
+    const agents = (await concurrentRead).find((file) => file.name === DEFAULT_AGENTS_FILENAME);
+    expect(agents).toMatchObject({ content: "COMPLETE\n", missing: false });
+    expect((await fs.lstat(agentsPath)).nlink).toBe(1);
   });
 
   it("publishes complete bootstrap bytes without hard-link support", async () => {
-    const tempDir = await makeTempWorkspace("openclaw-workspace-");
-    const agentsPath = path.join(tempDir, DEFAULT_AGENTS_FILENAME);
-    const linkSpy = vi.spyOn(syncFs, "linkSync").mockImplementation(() => {
+    vi.spyOn(syncFs, "linkSync").mockImplementation(() => {
       throw Object.assign(new Error("not supported"), { code: "ENOTSUP" });
     });
 
-    try {
-      await expect(publishBootstrapFile(agentsPath, "complete\n")).resolves.toBe(true);
-      await expect(publishBootstrapFile(agentsPath, "replacement\n")).resolves.toBe(false);
-      expect(await fs.readFile(agentsPath, "utf8")).toBe("complete\n");
-      expect((await fs.lstat(agentsPath)).nlink).toBe(1);
-      expect(await listTempSiblings(tempDir)).toEqual([]);
-    } finally {
-      linkSpy.mockRestore();
-    }
+    await expect(publishBootstrapFile(agentsPath, "complete\n")).resolves.toBe(true);
+    await expect(publishBootstrapFile(agentsPath, "replacement\n")).resolves.toBe(false);
+    expect(await fs.readFile(agentsPath, "utf8")).toBe("complete\n");
+    expect((await fs.lstat(agentsPath)).nlink).toBe(1);
+    expect(await listTempSiblings(tempDir)).toEqual([]);
   });
 
   it("preserves the raw bootstrap bytes including a UTF-8 BOM", async () => {
-    // The Claw bootstrap flow approves raw bytes and later re-verifies them by
-    // byte equality. Writing the decoded text (TextDecoder strips a leading
-    // BOM) would persist different bytes and trip the existing-winner check.
-    const tempDir = await makeTempWorkspace("openclaw-workspace-");
+    // TextDecoder strips the BOM, but approval and existing-winner checks require raw bytes.
     const bom = Buffer.from([0xef, 0xbb, 0xbf]);
     const content = Buffer.concat([bom, Buffer.from("# BOOTSTRAP\n")]);
 

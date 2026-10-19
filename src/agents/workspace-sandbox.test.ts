@@ -5,10 +5,13 @@ import { expect, it, vi } from "vitest";
 import { observeHostDataSql } from "../../test/helpers/sqlite-statement-execution-counter.js";
 import { captureRuntimeConfigAsyncReader } from "../config/io.js";
 import { upsertSessionEntryCore } from "../config/sessions/session-accessor.js";
+import type { AgentSandboxConfig } from "../config/types.agents-shared.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { prepareSystemAgentRunAdmission } from "./admitted-run-context.js";
 import { createSandboxTestContext } from "./sandbox/test-fixtures.js";
 import { resolveAttemptWorkspaceSandbox, resolveHarnessWorkspace } from "./workspace-sandbox.js";
+
+const sandboxConfig = (sandbox: AgentSandboxConfig) => ({ agents: { defaults: { sandbox } } });
 
 it("keeps cwd authority with the selected local or remote workspace owner", () => {
   const sandbox = createSandboxTestContext({
@@ -22,13 +25,8 @@ it("keeps cwd authority with the selected local or remote workspace owner", () =
     effectiveCwd: "/private",
     effectiveWorkspace: "/private",
     resolvedWorkspace: "/canonical",
-    effectiveFsWorkspaceOnly: true,
     sessionPermissionRoot: "/private",
-    sessionPermissionPolicy: undefined,
     sandbox,
-    sandboxReport: { mode: "all" as const, sandboxed: true },
-    sandboxSessionKey: "guest",
-    sessionAgentId: "main",
   };
   expect(() =>
     resolveHarnessWorkspace("/canonical", { cwd: "/outside" }, prepared, sandbox),
@@ -72,9 +70,7 @@ it("keeps writable placement policy without preparing its paths locally", async 
       sessionKey: "agent:main:remote-policy",
       agentId: "main",
       requireWorkspaceOnly: true,
-      config: {
-        agents: { defaults: { sandbox: { mode: "all", backend: "unavailable-fixture" } } },
-      },
+      config: sandboxConfig({ mode: "all", backend: "unavailable-fixture" }),
       placementSandbox: createSandboxTestContext({
         overrides: {
           workspaceDir: remoteWorkspace,
@@ -159,7 +155,7 @@ it("reports the selected sandbox policy without duplicate workspace creation", a
         sandboxSessionKey: sessionKey,
         sessionId: "execution",
         workspaceDir: state.workspaceDir,
-        config: { agents: { defaults: { sandbox: { mode: "all" } } } },
+        config: sandboxConfig({ mode: "all" }),
       });
       expect(prepared.sandbox).toBeNull();
       expect(prepared.sandboxReport).toEqual({ mode: "all", sandboxed: false });
@@ -189,24 +185,18 @@ it("enforces required sandboxing for an independent policy session even when mod
         sandboxSessionKey: sessionKey,
         sessionId: "execution",
         workspaceDir: state.workspaceDir,
-        config: {
-          agents: {
-            defaults: {
-              sandbox: {
-                mode: "off",
-                backend: "ssh",
-                ssh: {
-                  target: "sandbox@example.invalid",
-                  identityData: {
-                    source: "env",
-                    provider: "default",
-                    id: "UNMATERIALIZED_SANDBOX_IDENTITY",
-                  },
-                },
-              },
+        config: sandboxConfig({
+          mode: "off",
+          backend: "ssh",
+          ssh: {
+            target: "sandbox@example.invalid",
+            identityData: {
+              source: "env",
+              provider: "default",
+              id: "UNMATERIALIZED_SANDBOX_IDENTITY",
             },
           },
-        },
+        }),
       }),
     ).rejects.toMatchObject({
       code: "sandbox_provisioning",

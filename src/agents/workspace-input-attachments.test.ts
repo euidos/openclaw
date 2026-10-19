@@ -29,12 +29,14 @@ import { createWorkspaceAttachmentPreparer } from "./workspace-attachment-prepar
 const dirs = useAutoCleanupTempDirTracker(afterEach);
 const digest = (value: Buffer | string) => createHash("sha256").update(value).digest("hex");
 let root: string;
+let f: Awaited<ReturnType<typeof fixture>>;
 
 beforeEach(async () => {
   root = await fs.realpath(dirs.make("openclaw-workspace-inputs-"));
   vi.stubEnv("OPENCLAW_STATE_DIR", path.join(root, "state"));
   await fs.mkdir(path.join(getMediaDir(), "inbound"), { recursive: true });
   await fs.mkdir(path.join(getMediaDir(), "remote-cache"));
+  f = await fixture();
 });
 afterEach(() => vi.unstubAllEnvs());
 
@@ -85,25 +87,43 @@ async function fixture() {
 }
 
 const turn = (media: MediaFact[]) => ({ timeoutMs: 60_000, media });
-
+const prepareMedia = (media: MediaFact[]) => f.prepare(turn(media), () => {});
+const loadImages = (params: Partial<Parameters<typeof detectAndLoadPromptImages>[0]>) =>
+  detectAndLoadPromptImages({
+    prompt: "Inspect the attachment",
+    workspaceDir: f.gateway,
+    model: { input: ["text", "image"] },
+    sandbox: { root: f.harness, bridge: f.bridge },
+    ...params,
+  });
+async function withAccess(run: () => Promise<void>) {
+  const release = registerAgentWorkspaceAccess(f.gateway, {
+    bridge: f.bridge,
+    prepareTurnAttachments: f.prepare,
+  });
+  try {
+    await run();
+  } finally {
+    release();
+  }
+}
+async function writeMedia(name = "inbound/report.txt", data: string | Buffer = "input") {
+  const source = path.join(getMediaDir(), name);
+  await fs.writeFile(source, data);
+  return source;
+}
 // These fixtures run the Linux remote host locally (including GNU stat).
 const describeLinux = describe.runIf(process.platform === "linux");
 describeLinux("workspace attachment adapter with the real remote-shell bridge", () => {
   it("keeps images readable on Gateway and transfers their originals without a local workspace copy", async () => {
-    const f = await fixture();
-    const source = path.join(getMediaDir(), "inbound", "input.png");
     const bytes = Buffer.from(
       "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACXBIWXMAAAsTAAALEwEAmpwYAAAADUlEQVR4nGP4////KwAJ5gPoxLp9owAAAABJRU5ErkJggg==",
       "base64",
     );
-    await fs.writeFile(source, bytes);
+    const source = await writeMedia("inbound/input.png", bytes);
     const media = [{ path: source, contentType: "image/png" }];
     const ctx = { media };
-    const release = registerAgentWorkspaceAccess(f.gateway, {
-      bridge: f.bridge,
-      prepareTurnAttachments: f.prepare,
-    });
-    try {
+    await withAccess(async () => {
       await stageSandboxMedia({
         ctx,
         sessionCtx: ctx,
@@ -113,46 +133,24 @@ describeLinux("workspace attachment adapter with the real remote-shell bridge", 
       });
       expect(ctx.media).toBe(media);
       expect(await fs.readdir(f.gateway)).toEqual([]);
-      await f.prepare(turn(media), () => {});
+      await prepareMedia(media);
       expect(await fs.readFile(f.destination(source))).toEqual(bytes);
-      const result = await detectAndLoadPromptImages({
-        prompt: "Inspect the attachment",
-        media,
-        workspaceDir: f.gateway,
-        model: { input: ["text", "image"] },
-        workspaceOnly: true,
-        sandbox: { root: f.harness, bridge: f.bridge },
-      });
+      const result = await loadImages({ media, workspaceOnly: true });
       expect(result.failedMediaCount).toBe(0);
       expect(result.images).toHaveLength(1);
-      const promptOnly = await detectAndLoadPromptImages({
-        prompt: `Inspect ${source}`,
-        workspaceDir: f.gateway,
-        model: { input: ["text", "image"] },
-        sandbox: { root: f.harness, bridge: f.bridge },
-      });
+      const promptOnly = await loadImages({ prompt: `Inspect ${source}` });
       expect(promptOnly.images).toHaveLength(0);
       const outside = path.join(f.gateway, "private.png");
       await fs.writeFile(outside, bytes);
-      const rejected = await detectAndLoadPromptImages({
-        prompt: "Inspect the attachment",
-        media: [{ path: outside, contentType: "image/png" }],
-        workspaceDir: f.gateway,
-        model: { input: ["text", "image"] },
-        sandbox: { root: f.harness, bridge: f.bridge },
-      });
+      const rejected = await loadImages({ media: [{ path: outside, contentType: "image/png" }] });
       expect(rejected.images).toHaveLength(0);
       expect(rejected.failedMediaCount).toBe(1);
-    } finally {
-      release();
-    }
+    });
   });
 
   it("transfers 50 MiB without a Gateway workspace copy and preserves subsequent Harness edits", async () => {
-    const f = await fixture();
-    const source = path.join(getMediaDir(), "remote-cache", "report.bin");
     const data = Buffer.alloc(50 * 1024 * 1024, 0xa5);
-    await fs.writeFile(source, data);
+    const source = await writeMedia("remote-cache/report.bin", data);
     const input = turn([{ path: source }]);
     const original = JSON.stringify(input);
     const note = await f.prepare(input, () => {});
@@ -168,9 +166,7 @@ describeLinux("workspace attachment adapter with the real remote-shell bridge", 
   });
 
   it("retains an explicitly configured allowance above the ordinary staging limit", async () => {
-    const f = await fixture();
-    const source = path.join(getMediaDir(), "remote-cache", "configured.bin");
-    await fs.writeFile(source, "");
+    const source = await writeMedia("remote-cache/configured.bin", "");
     await fs.truncate(source, 51 * 1024 * 1024);
     await f.prepare(
       { ...turn([{ path: source }]), config: { agents: { defaults: { mediaMaxMb: 51 } } } },
@@ -180,19 +176,14 @@ describeLinux("workspace attachment adapter with the real remote-shell bridge", 
   });
 
   it("hydrates a managed video for a sandboxed remote turn without rewriting its recorded reference", async () => {
-    const f = await fixture();
     const bytes = Buffer.from("0000001c6674797069736f6d0000000069736f6d0000000000000000", "hex");
-    await fs.writeFile(path.join(getMediaDir(), "inbound", "input.mp4"), bytes);
+    await writeMedia("inbound/input.mp4", bytes);
     const message = buildPersistedUserTurnMessage({
       text: "Inspect the video",
       media: [{ kind: "video", contentType: "video/mp4", url: "media://inbound/input.mp4" }],
     });
     const original = JSON.stringify(message);
-    const release = registerAgentWorkspaceAccess(f.gateway, {
-      bridge: f.bridge,
-      prepareTurnAttachments: f.prepare,
-    });
-    try {
+    await withAccess(async () => {
       const provider = await materializeProviderContext({
         context: { systemPrompt: "system", messages: convertToLlm([message]), tools: [] },
         workspaceDir: f.gateway,
@@ -205,26 +196,18 @@ describeLinux("workspace attachment adapter with the real remote-shell bridge", 
         mimeType: "video/mp4",
       });
       expect(JSON.stringify(message)).toBe(original);
-    } finally {
-      release();
-    }
+    });
   });
 
   it("uses canonical originals, deduplicates aliases, and separates sources with the same basename", async () => {
-    const f = await fixture();
-    const first = path.join(getMediaDir(), "inbound", "report.txt");
-    const second = path.join(getMediaDir(), "remote-cache", "report.txt");
-    await fs.writeFile(first, "original");
-    await fs.writeFile(second, "other");
-    const note = await f.prepare(
-      turn([
-        { path: "/stale/workspace/copy", url: "media://inbound/report.txt" },
-        { path: first },
-        { url: pathToFileURL(first).href },
-        { path: second },
-      ]),
-      () => {},
-    );
+    const first = await writeMedia("inbound/report.txt", "original");
+    const second = await writeMedia("remote-cache/report.txt", "other");
+    const note = await prepareMedia([
+      { path: "/stale/workspace/copy", url: "media://inbound/report.txt" },
+      { path: first },
+      { url: pathToFileURL(first).href },
+      { path: second },
+    ]);
     expect(note?.split("\n")).toEqual(
       [first, second].map((source) => `[media attached: ${f.destination(source)}]`),
     );
@@ -236,7 +219,6 @@ describeLinux("workspace attachment adapter with the real remote-shell bridge", 
   it.each(["outside", "symlink", "invalid-uri", "oversized"])(
     "rejects %s input before any remote mutation",
     async (kind) => {
-      const f = await fixture();
       const outside = path.join(f.gateway, "secret.txt");
       await fs.writeFile(outside, "secret");
       let source = outside;
@@ -246,13 +228,10 @@ describeLinux("workspace attachment adapter with the real remote-shell bridge", 
       } else if (kind === "invalid-uri") {
         source = "media://inbound/nested%2Fsecret.txt";
       } else if (kind === "oversized") {
-        source = path.join(getMediaDir(), "remote-cache", "large.bin");
-        await fs.writeFile(source, "");
+        source = await writeMedia("remote-cache/large.bin", "");
         await fs.truncate(source, 50 * 1024 * 1024 + 1);
       }
-      await expect(
-        f.prepare(turn([{ path: source, workspaceDir: f.gateway }]), () => {}),
-      ).rejects.toThrow();
+      await expect(prepareMedia([{ path: source, workspaceDir: f.gateway }])).rejects.toThrow();
       expect(f.create).not.toHaveBeenCalled();
       expect(await fs.readdir(f.harness)).toEqual([]);
     },
@@ -261,12 +240,10 @@ describeLinux("workspace attachment adapter with the real remote-shell bridge", 
   it.each(["unmarked-directory", "bad-marker", "non-file"])(
     "does not overwrite an existing %s",
     async (kind) => {
-      const f = await fixture();
-      const source = path.join(getMediaDir(), "inbound", "report.txt");
-      await fs.writeFile(source, "input");
+      const source = await writeMedia();
       const destination = f.destination(source);
       if (kind === "non-file") {
-        await f.prepare(turn([{ path: source }]), () => {});
+        await prepareMedia([{ path: source }]);
         await fs.unlink(destination);
         await fs.mkdir(destination);
       } else {
@@ -276,7 +253,7 @@ describeLinux("workspace attachment adapter with the real remote-shell bridge", 
         }
       }
       f.create.mockClear();
-      await expect(f.prepare(turn([{ path: source }]), () => {})).rejects.toThrow();
+      await expect(prepareMedia([{ path: source }])).rejects.toThrow();
       if (kind !== "non-file") {
         expect(f.create).not.toHaveBeenCalled();
       }
@@ -289,9 +266,7 @@ describeLinux("workspace attachment adapter with the real remote-shell bridge", 
   );
 
   it("stops between preparation and mutation when the source authority closes", async () => {
-    const f = await fixture();
-    const source = path.join(getMediaDir(), "inbound", "report.txt");
-    await fs.writeFile(source, "input");
+    const source = await writeMedia();
     let active = true;
     const prepare = createWorkspaceAttachmentPreparer({
       remoteRoot: f.harness,
@@ -316,17 +291,14 @@ describeLinux("workspace attachment adapter with the real remote-shell bridge", 
   });
 
   it("does not fetch HTTP references or invent source files for inline images", async () => {
-    const f = await fixture();
     await expect(
-      f.prepare(turn([{ url: "https://example.test/input" }, { kind: "image" }]), () => {}),
+      prepareMedia([{ url: "https://example.test/input" }, { kind: "image" }]),
     ).resolves.toBeUndefined();
     expect(f.create).not.toHaveBeenCalled();
   });
 
   it("checks message authority at command admission after in-flight path validation", async () => {
-    const f = await fixture();
-    const source = path.join(getMediaDir(), "inbound", "report.txt");
-    await fs.writeFile(source, "input");
+    const source = await writeMedia();
     let active = true;
     let creating = false;
     let validationCompleted = false;

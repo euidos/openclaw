@@ -32,29 +32,47 @@ import {
 } from "./workspace-state-store.js";
 import { registerWorkspaceStateAliasIdentitiesInTransaction } from "./workspace-state-store.kernel.js";
 
-let testState: OpenClawTestState | undefined;
+let testState: OpenClawTestState;
+let dir: string;
+const seededAt = "2026-07-16T01:00:00.000Z";
 
 beforeEach(async () => {
   testState = await createOpenClawTestState({
     layout: "state-only",
     prefix: "openclaw-workspace-store-",
   });
+  dir = testState.workspaceDir;
 });
 
 afterEach(async () => {
-  if (testState) {
-    retireWorkspaceFileCache(testState.workspaceDir);
-  }
+  retireWorkspaceFileCache(dir);
   closeOpenClawStateDatabaseForTest();
-  await testState?.cleanup();
-  testState = undefined;
+  await testState.cleanup();
 });
 
-function workspaceDir(): string {
-  if (!testState) {
-    throw new Error("test state unavailable");
-  }
-  return testState.workspaceDir;
+function seed() {
+  return mergeWorkspaceSetupState(dir, { bootstrapSeededAt: seededAt }, 1_000);
+}
+
+function observeFacts() {
+  const observed = new Map<string, unknown>();
+  const unsubscribe = workspaceStatePublication.subscribeFacts((change) => {
+    if (change.kind === "committed") {
+      for (const [key, fact] of change.receipt.facts) {
+        observed.set(key, fact);
+      }
+    }
+  });
+  return { observed, unsubscribe };
+}
+
+function attest(nowMs: number, hashes: [string, string][]) {
+  return replaceWorkspaceAttestation({
+    workspaceDir: dir,
+    attestedAtMs: nowMs,
+    nowMs,
+    generatedHashes: new Map(hashes),
+  });
 }
 
 async function deleteState(targetDir: string): Promise<void> {
@@ -62,7 +80,7 @@ async function deleteState(targetDir: string): Promise<void> {
 }
 
 function insertPersistedAttestationHash(filename: string, sha256: string): void {
-  const identity = resolveWorkspaceStateIdentity(workspaceDir());
+  const identity = resolveWorkspaceStateIdentity(dir);
   const db = openOpenClawStateDatabase().db;
   db.prepare(
     `INSERT INTO workspace_setup_state (
@@ -76,18 +94,11 @@ function insertPersistedAttestationHash(filename: string, sha256: string): void 
 
 describe("workspace state store", () => {
   it("registers alias batches once and rolls back conflicts without publishing partial aliases", () => {
-    const identity = resolveWorkspaceStateIdentity(workspaceDir());
+    const identity = resolveWorkspaceStateIdentity(dir);
     const aliases = Array.from({ length: 70 }, (_, index) =>
-      createWorkspaceStateIdentity(testState!.path(`alias-${index}`)),
+      createWorkspaceStateIdentity(testState.path(`alias-${index}`)),
     );
-    const observed = new Map<string, unknown>();
-    const unsubscribe = workspaceStatePublication.subscribeFacts((change) => {
-      if (change.kind === "committed") {
-        for (const [key, fact] of change.receipt.facts) {
-          observed.set(key, fact);
-        }
-      }
-    });
+    const { observed, unsubscribe } = observeFacts();
     const register = (entries: typeof aliases, updatedAtMs: number, target = identity) =>
       runOpenClawStateWriteTransaction((database) =>
         registerWorkspaceStateAliasIdentitiesInTransaction({
@@ -111,14 +122,14 @@ describe("workspace state store", () => {
         });
       }
       const missing = Array.from({ length: 65 }, (_, index) =>
-        createWorkspaceStateIdentity(testState!.path(`rollback-${index}`)),
+        createWorkspaceStateIdentity(testState.path(`rollback-${index}`)),
       );
       observed.clear();
       expect(() =>
         register(
           [...missing, aliases[0]!],
           3000,
-          createWorkspaceStateIdentity(testState!.path("other")),
+          createWorkspaceStateIdentity(testState.path("other")),
         ),
       ).toThrow("workspace path alias conflicts with canonical state");
       expect(observed.size).toBe(0);
@@ -131,36 +142,18 @@ describe("workspace state store", () => {
   });
 
   it("publishes complete hash replacement and exact alias/setup/attestation tombstones", async () => {
-    const dir = workspaceDir();
     const identity = resolveWorkspaceStateIdentity(dir);
-    const observed = new Map<string, unknown>();
-    const unsubscribe = workspaceStatePublication.subscribeFacts((change) => {
-      if (change.kind === "committed") {
-        for (const [key, fact] of change.receipt.facts) {
-          observed.set(key, fact);
-        }
-      }
-    });
+    const { observed, unsubscribe } = observeFacts();
     try {
-      await mergeWorkspaceSetupState(dir, { bootstrapSeededAt: "2026-07-16T01:00:00.000Z" }, 1000);
-      const alias = testState!.path("receipt-workspace-link");
+      await seed();
+      const alias = testState.path("receipt-workspace-link");
       fs.symlinkSync(dir, alias, process.platform === "win32" ? "junction" : "dir");
       await readWorkspaceStateSnapshot(alias);
-      await replaceWorkspaceAttestation({
-        workspaceDir: dir,
-        attestedAtMs: 1000,
-        nowMs: 1000,
-        generatedHashes: new Map([
-          ["AGENTS.md", "a".repeat(64)],
-          ["TOOLS.md", "b".repeat(64)],
-        ]),
-      });
-      await replaceWorkspaceAttestation({
-        workspaceDir: dir,
-        attestedAtMs: 2000,
-        nowMs: 2000,
-        generatedHashes: new Map([["AGENTS.md", "c".repeat(64)]]),
-      });
+      await attest(1000, [
+        ["AGENTS.md", "a".repeat(64)],
+        ["TOOLS.md", "b".repeat(64)],
+      ]);
+      await attest(2000, [["AGENTS.md", "c".repeat(64)]]);
       expect(observed.get(workspaceStateFactKey("hashes", identity.workspaceKey))).toEqual({
         kind: "postimage",
         value: {
@@ -181,12 +174,12 @@ describe("workspace state store", () => {
   });
 
   it("does not create shared state for a read-only snapshot", async () => {
-    const statePath = resolveOpenClawStateSqlitePath(testState!.env);
+    const statePath = resolveOpenClawStateSqlitePath(testState.env);
     expect(fs.existsSync(statePath)).toBe(false);
 
     expect(
-      await readWorkspaceStateSnapshot(workspaceDir(), {
-        env: testState!.env,
+      await readWorkspaceStateSnapshot(dir, {
+        env: testState.env,
         readOnly: true,
       }),
     ).toMatchObject({ setupExists: false, setup: { version: 1 } });
@@ -198,7 +191,7 @@ describe("workspace state store", () => {
     async (filename) => {
       insertPersistedAttestationHash(filename, "a".repeat(64));
 
-      await expect(readWorkspaceStateSnapshot(workspaceDir())).rejects.toThrow(
+      await expect(readWorkspaceStateSnapshot(dir)).rejects.toThrow(
         "workspace attestation hash row is invalid",
       );
     },
@@ -207,21 +200,15 @@ describe("workspace state store", () => {
   it("rejects a malformed persisted attestation hash", async () => {
     insertPersistedAttestationHash("AGENTS.md", "a".repeat(63));
 
-    await expect(readWorkspaceStateSnapshot(workspaceDir())).rejects.toThrow(
+    await expect(readWorkspaceStateSnapshot(dir)).rejects.toThrow(
       "workspace attestation hash row is invalid",
     );
   });
 
   it("refuses retired ownership before deleting state", async () => {
-    const dir = workspaceDir();
-    const alias = testState!.path("workspace-link");
-    await mergeWorkspaceSetupState(dir, { bootstrapSeededAt: "2026-07-16T01:00:00.000Z" }, 1_000);
-    await replaceWorkspaceAttestation({
-      workspaceDir: dir,
-      attestedAtMs: 1_000,
-      generatedHashes: new Map([["AGENTS.md", "a".repeat(64)]]),
-      nowMs: 1_000,
-    });
+    const alias = testState.path("workspace-link");
+    await seed();
+    await attest(1_000, [["AGENTS.md", "a".repeat(64)]]);
     const before = await readWorkspaceStateSnapshot(dir);
     const db = openOpenClawStateDatabase().db;
     fs.symlinkSync(dir, alias, process.platform === "win32" ? "junction" : "dir");
@@ -242,15 +229,14 @@ describe("workspace state store", () => {
   });
 
   it("registers and retires aliases in the captured caller-selected state database", async () => {
-    const dir = workspaceDir();
-    const alias = testState!.path("workspace-link");
+    const alias = testState.path("workspace-link");
     const env = {
       ...process.env,
-      OPENCLAW_STATE_DIR: testState!.path("custom-state"),
+      OPENCLAW_STATE_DIR: testState.path("custom-state"),
     };
     fs.symlinkSync(dir, alias, process.platform === "win32" ? "junction" : "dir");
     const identity = resolveWorkspaceStateIdentity(dir);
-    await mergeWorkspaceSetupState(dir, { bootstrapSeededAt: "2026-07-16T01:00:00.000Z" }, 1_000, {
+    await mergeWorkspaceSetupState(dir, { bootstrapSeededAt: seededAt }, 1_000, {
       env,
     });
 
@@ -270,12 +256,11 @@ describe("workspace state store", () => {
   });
 
   it("cleans current state and only the stale association for a repointed alias", async () => {
-    const dir = workspaceDir();
-    const alias = testState!.path("workspace-link");
-    const replacement = testState!.path("replacement-workspace");
+    const alias = testState.path("workspace-link");
+    const replacement = testState.path("replacement-workspace");
     fs.mkdirSync(replacement, { recursive: true });
     fs.symlinkSync(dir, alias, process.platform === "win32" ? "junction" : "dir");
-    await mergeWorkspaceSetupState(alias, { bootstrapSeededAt: "2026-07-16T01:00:00.000Z" }, 1_000);
+    await mergeWorkspaceSetupState(alias, { bootstrapSeededAt: seededAt }, 1_000);
     await mergeWorkspaceSetupState(
       replacement,
       { bootstrapSeededAt: "2026-07-16T02:00:00.000Z" },
@@ -297,9 +282,8 @@ describe("workspace state store", () => {
   });
 
   it.each(["delete", "expire"])("keeps %s cache entries when the commit fails", async (cleanup) => {
-    const dir = workspaceDir();
+    await seed();
     const filePath = path.join(dir, "AGENTS.md");
-    await mergeWorkspaceSetupState(dir, { bootstrapSeededAt: "2026-07-16T01:00:00.000Z" }, 1_000);
     writeWorkspaceFileCache({ filePath, content: "cached", identity: "identity" });
     const db = openOpenClawStateDatabase().db;
     db.exec(`CREATE TABLE workspace_commit_guard (
@@ -325,7 +309,6 @@ describe("workspace state store", () => {
   });
 
   it("does not recreate a missing database during delete-only cleanup", async () => {
-    const dir = workspaceDir();
     const filePath = path.join(dir, "AGENTS.md");
     writeWorkspaceFileCache({ filePath, content: "cached", identity: "identity" });
     const databasePath = resolveOpenClawStateSqlitePath();
@@ -340,42 +323,33 @@ describe("workspace state store", () => {
   });
 
   it("deletes migration receipts owned by the workspace", async () => {
-    const dir = workspaceDir();
     const identity = resolveWorkspaceStateIdentity(dir);
     const db = openOpenClawStateDatabase().db;
-    await mergeWorkspaceSetupState(dir, { bootstrapSeededAt: "2026-07-16T01:00:00.000Z" });
+    await mergeWorkspaceSetupState(dir, { bootstrapSeededAt: seededAt });
     const insertRun = db.prepare(
       "INSERT INTO migration_runs (id, started_at, finished_at, status, report_json) VALUES (?, 1, 1, 'completed', '{}')",
     );
-    insertRun.run("owned-run");
-    insertRun.run("shared-run");
-    insertRun.run("unrelated-run");
+    for (const id of ["owned-run", "shared-run", "unrelated-run"]) {
+      insertRun.run(id);
+    }
     const insertReceipt = db.prepare(
       `INSERT INTO migration_sources (
-        source_key,
-        migration_kind,
-        source_path,
-        target_table,
-        last_run_id,
-        status,
-        imported_at,
-        report_json
+        source_key, migration_kind, source_path, target_table,
+        last_run_id, status, imported_at, report_json
       ) VALUES (?, ?, ?, 'workspace_setup_state', ?, 'completed', 1, ?)`,
     );
-    insertReceipt.run(
-      "owned-receipt",
-      WORKSPACE_LEGACY_STATE_MIGRATION_KIND,
-      path.join(dir, ".openclaw", "workspace-state.json"),
-      "owned-run",
-      JSON.stringify({ workspaceKey: identity.workspaceKey }),
-    );
-    insertReceipt.run(
-      "owned-shared-receipt",
-      WORKSPACE_LEGACY_STATE_MIGRATION_KIND,
-      path.join(dir, ".openclaw", "workspace-state.json"),
-      "shared-run",
-      JSON.stringify({ workspaceKey: identity.workspaceKey }),
-    );
+    for (const [receipt, run] of [
+      ["owned-receipt", "owned-run"],
+      ["owned-shared-receipt", "shared-run"],
+    ] as const) {
+      insertReceipt.run(
+        receipt,
+        WORKSPACE_LEGACY_STATE_MIGRATION_KIND,
+        path.join(dir, ".openclaw", "workspace-state.json"),
+        run,
+        JSON.stringify({ workspaceKey: identity.workspaceKey }),
+      );
+    }
     insertReceipt.run(
       "retained-receipt",
       "unrelated-migration-kind",
