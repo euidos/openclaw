@@ -105,6 +105,7 @@ it.each([
     }, scope);
 
     const tracker = trackEntryReadProbes(database);
+    using _ = { [Symbol.dispose]: tracker.restore };
     let boundTextBytes = 0;
     const prepareStatement = database.db.prepare.bind(database.db);
     database.db.prepare = new Proxy(prepareStatement, {
@@ -123,40 +124,34 @@ it.each([
         return statement;
       },
     });
-    try {
-      // Exercise the real writer's previous-entry read; async patch fallbacks can supply a same-ID entry.
-      replaceSessionEntrySync(
-        scope,
-        root === "known"
-          ? { sessionId: entry.sessionId, updatedAt: 20, skillsSnapshot: entry.skillsSnapshot }
-          : entry,
-      );
-      expect(tracker.counts).toEqual({ window: 1, transcript: probes });
-      expect(boundTextBytes).toBeGreaterThan(0);
-      expect(boundTextBytes).toBeLessThanOrEqual(Buffer.byteLength(retainedPrompt) * 1.5 + 4096);
-      const stored = read("session_nodes", "entry_json, entry_valid");
-      expect(stored?.entry_valid).toBe(1);
-      expect(JSON.parse(String(stored?.entry_json))).toMatchObject({ sessionId: entry.sessionId });
-      const savedSkills = database.db
-        .prepare(
-          "SELECT value_json FROM session_entry_snapshots WHERE session_key = ? AND field = 'skillsSnapshot'",
-        )
-        .get(scope.sessionKey);
-      expect(JSON.parse(String(savedSkills?.value_json))).toEqual(entry.skillsSnapshot);
-      expect(database.db.isTransaction).toBe(false);
-      expect(
-        window(
-          "session_entry_provenance, acp_owned, plugin_owner_id, hook_external_content_source",
-        ),
-      ).toEqual({
-        session_entry_provenance: provenance,
-        acp_owned: provenance,
-        plugin_owner_id: provenance ? "plugin-owner" : null,
-        hook_external_content_source: provenance ? "webhook" : null,
-      });
-    } finally {
-      tracker.restore();
-    }
+    // Exercise the real writer's previous-entry read; async patch fallbacks can supply a same-ID entry.
+    replaceSessionEntrySync(
+      scope,
+      root === "known"
+        ? { sessionId: entry.sessionId, updatedAt: 20, skillsSnapshot: entry.skillsSnapshot }
+        : entry,
+    );
+    expect(tracker.counts).toEqual({ window: 1, transcript: probes });
+    expect(boundTextBytes).toBeGreaterThan(0);
+    expect(boundTextBytes).toBeLessThanOrEqual(Buffer.byteLength(retainedPrompt) * 1.5 + 4096);
+    const stored = read("session_nodes", "entry_json, entry_valid");
+    expect(stored?.entry_valid).toBe(1);
+    expect(JSON.parse(String(stored?.entry_json))).toMatchObject({ sessionId: entry.sessionId });
+    const savedSkills = database.db
+      .prepare(
+        "SELECT value_json FROM session_entry_snapshots WHERE session_key = ? AND field = 'skillsSnapshot'",
+      )
+      .get(scope.sessionKey);
+    expect(JSON.parse(String(savedSkills?.value_json))).toEqual(entry.skillsSnapshot);
+    expect(database.db.isTransaction).toBe(false);
+    expect(
+      window("session_entry_provenance, acp_owned, plugin_owner_id, hook_external_content_source"),
+    ).toEqual({
+      session_entry_provenance: provenance,
+      acp_owned: provenance,
+      plugin_owner_id: provenance ? "plugin-owner" : null,
+      hook_external_content_source: provenance ? "webhook" : null,
+    });
   },
 );
 
@@ -166,25 +161,26 @@ it.each(["transcript-first", "entry-first"] as const)(
     const { scope, database, entry, window, append } = createFixture();
     const tracker = trackEntryReadProbes(database);
     const clock = vi.spyOn(Date, "now").mockReturnValue(10);
-    try {
-      runOpenClawAgentWriteTransaction((db) => {
-        if (order === "transcript-first") {
-          append();
-        }
-        writeSessionEntry(db, scope.sessionKey, entry);
-        if (order === "entry-first") {
-          append();
-        }
-      }, scope);
-      expect(tracker.counts.transcript).toBe(order === "transcript-first" ? 1 : 0);
-      expect(window("session_entry_provenance, transcript_observed_at")).toEqual({
-        session_entry_provenance: order === "transcript-first" ? 0 : 1,
-        transcript_observed_at: order === "transcript-first" ? 10 : 20,
-      });
-    } finally {
-      clock.mockRestore();
-      tracker.restore();
-    }
+    using _ = {
+      [Symbol.dispose]() {
+        clock.mockRestore();
+        tracker.restore();
+      },
+    };
+    runOpenClawAgentWriteTransaction((db) => {
+      if (order === "transcript-first") {
+        append();
+      }
+      writeSessionEntry(db, scope.sessionKey, entry);
+      if (order === "entry-first") {
+        append();
+      }
+    }, scope);
+    expect(tracker.counts.transcript).toBe(order === "transcript-first" ? 1 : 0);
+    expect(window("session_entry_provenance, transcript_observed_at")).toEqual({
+      session_entry_provenance: order === "transcript-first" ? 0 : 1,
+      transcript_observed_at: order === "transcript-first" ? 10 : 20,
+    });
   },
 );
 

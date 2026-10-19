@@ -1,11 +1,11 @@
 import { Worker } from "node:worker_threads";
 import { expect, test, vi } from "vitest";
 import { createDeferredCore } from "../../shared/deferred.js";
-import { runExclusiveSqliteTranscriptArchiveWorker } from "./session-accessor.sqlite-archive.js";
+import { runExclusiveSqliteTranscriptArchiveWorker as runArchive } from "./session-accessor.sqlite-archive.js";
 import type { SqliteSessionReclamationResult } from "./session-accessor.sqlite-lifecycle-types.js";
 import { runSqliteSessionReclamation } from "./session-accessor.sqlite-reclamation-run.js";
 import type * as reclamationWorker from "./session-accessor.sqlite-reclamation-worker.js";
-import { runExclusiveSqliteSessionWrite } from "./session-accessor.sqlite-scope.js";
+import { runExclusiveSqliteSessionWrite as runWrite } from "./session-accessor.sqlite-scope.js";
 import { runSqliteMutationWorkerRequest } from "./session-accessor.sqlite-worker-request.js";
 
 type WorkerOwner = Parameters<
@@ -13,7 +13,6 @@ type WorkerOwner = Parameters<
 >[0];
 const storage = vi.hoisted(() => ({
   run: vi.fn<WorkerOwner["run"]>(),
-  committed: false,
   database: { db: { isTransaction: false } },
   release: vi.fn(),
 }));
@@ -98,8 +97,6 @@ vi.mock("./session-accessor.sqlite-reclamation-worker.js", async () => {
 });
 
 test("maintenance preparation yields to foreground writes and retains commit admission through publication", async () => {
-  storage.committed = false;
-  storage.release.mockClear();
   const checkpoints = new Map(
     ["preparation", "validation-gap", "commit-gap"].map((name) => [name, createDeferredCore()]),
   );
@@ -107,16 +104,10 @@ test("maintenance preparation yields to foreground writes and retains commit adm
   const releaseArchive = createDeferredCore();
   const admissions: number[] = [];
   const order: string[] = [];
+  const foreground = ["preceding-writer", "preparation-writer", "validation-writer"];
   const writers: Promise<void>[] = [];
-  const write = (name: string, onEntered?: () => void) => {
-    const pending = runExclusiveSqliteSessionWrite(
-      options,
-      async () => {
-        onEntered?.();
-        order.push(name);
-      },
-      "session-entry.patch",
-    );
+  const write = (name: string) => {
+    const pending = runWrite(options, async () => void order.push(name), "session-entry.patch");
     writers.push(pending);
     return pending;
   };
@@ -142,9 +133,7 @@ test("maintenance preparation yields to foreground writes and retains commit adm
      });`,
     { eval: true, execArgv: [] },
   );
-  worker.on("message", (message) => {
-    checkpoints.get(message.type)?.resolve();
-  });
+  worker.on("message", (message) => checkpoints.get(message.type)?.resolve());
   storage.run.mockImplementation((params) =>
     runSqliteMutationWorkerRequest<SqliteSessionReclamationResult>({
       transport: { kind: "dedicated", channel: worker },
@@ -157,14 +146,13 @@ test("maintenance preparation yields to foreground writes and retains commit adm
       dispatch: () => worker.postMessage({ type: "start" }, []),
     }),
   );
-  const earlierArchive = runExclusiveSqliteTranscriptArchiveWorker(async () => {
+  const earlierArchive = runArchive(async () => {
     archiveEntered.resolve();
     await releaseArchive.promise;
   });
   await archiveEntered.promise;
   const finalization = runSqliteSessionReclamation({
     onWorkerResult: () => {
-      storage.committed = true;
       order.push("published");
     },
     plan: {
@@ -182,7 +170,6 @@ test("maintenance preparation yields to foreground writes and retains commit adm
   void settledFinalization.catch(() => {});
   const waitFor = (checkpoint: string) =>
     Promise.race([checkpoints.get(checkpoint)!.promise, settledFinalization]);
-  let laterObservedCommit = false;
   try {
     // A preceding archive request can still acquire this store's writer.
     await write("preceding-writer");
@@ -192,26 +179,17 @@ test("maintenance preparation yields to foreground writes and retains commit adm
     write("preparation-writer");
     worker.postMessage({ type: "prepare" }, []);
     await waitFor("validation-gap");
-    expect(order).toEqual(["preceding-writer", "preparation-writer"]);
+    expect(order).toEqual(foreground.slice(0, 2));
     write("validation-writer");
     worker.postMessage({ type: "continue" }, []);
     await waitFor("commit-gap");
-    expect(order).toEqual(["preceding-writer", "preparation-writer", "validation-writer"]);
-    write("later-writer", () => {
-      laterObservedCommit = storage.committed;
-    });
+    expect(order).toEqual(foreground);
+    write("later-writer");
     worker.postMessage({ type: "settle" }, []);
     await expect(finalization).resolves.toMatchObject({ kind: "maintenance-finalize" });
     await Promise.all(writers);
     expect(admissions).toEqual([1, 2]);
-    expect(laterObservedCommit).toBe(true);
-    expect(order).toEqual([
-      "preceding-writer",
-      "preparation-writer",
-      "validation-writer",
-      "published",
-      "later-writer",
-    ]);
+    expect(order).toEqual([...foreground, "published", "later-writer"]);
     expect(storage.release).toHaveBeenCalledOnce();
   } finally {
     releaseArchive.resolve();

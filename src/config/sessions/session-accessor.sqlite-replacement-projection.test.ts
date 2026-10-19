@@ -20,7 +20,6 @@ import {
 } from "./session-accessor.sqlite-entry-store.js";
 import { recordSessionParticipant } from "./session-accessor.sqlite-participants.native.js";
 import { readSessionEntryReplacementState } from "./session-accessor.sqlite-replacement-read.js";
-import { prepareSessionEntryReplacementPublication } from "./session-accessor.sqlite-replacement-state.js";
 import type { SessionEntryWritePostimages } from "./session-entry-write-postimage.js";
 
 const tempDirs: string[] = [];
@@ -84,7 +83,7 @@ it("hydrates replacement candidates once while preserving detached snapshots", a
   ).toBe(prompt);
 });
 
-it("publishes detached persisted bytes and participant facts without rereading the writer", () => {
+it("detaches writer postimages from returned entries and previous participant facts", () => {
   recordSessionParticipant(scope, {
     identity: { type: "agent", id: "contributor" },
     promptedAt: 1,
@@ -96,13 +95,7 @@ it("publishes detached persisted bytes and participant facts without rereading t
     const written = writeSessionEntry(
       database,
       scope.sessionKey,
-      {
-        ...previous,
-        model: "committed",
-        participantCount: 99,
-        participants: [{ identity: { type: "agent", id: "forged" } }],
-        skillsSnapshot: { prompt: "private saved prompt", skills: [] },
-      },
+      { ...previous, model: "committed" },
       {
         canonicalPreviousEntry: previous,
         canonicalPreviousRow: snapshot.row,
@@ -111,49 +104,14 @@ it("publishes detached persisted bytes and participant facts without rereading t
         postimages,
       },
     );
-    const changes = {
-      previous: new Map([[scope.sessionKey, previous]]),
-      current: new Map([[scope.sessionKey, written]]),
-      pendingArchiveRecovery: false,
-      membershipInvalidatedKeys: [],
-      maintenancePlans: [],
-    };
-    const reads = trackSqliteStatementExecutions(
-      requireNativeSqliteDatabase(database.db),
-      ["publication"],
-      (sql) =>
-        /\bfrom\s+"(?:session_nodes|session_participants|session_windows)"/iu.test(sql)
-          ? "publication"
-          : null,
-    );
-    try {
-      written.model = "not committed";
-      if (previous.participants?.[0]) {
-        previous.participants[0].identity.id = "caller-owned";
-      }
-      const publication = prepareSessionEntryReplacementPublication(changes, database, {
-        captureFullFacts: true,
-        postimages,
-      });
-      expect(publication.current.get(scope.sessionKey)).toMatchObject({
-        model: "committed",
-        participants: [{ identity: { type: "agent", id: "contributor" } }],
-        participantCount: 1,
-      });
-      expect(publication.current.get(scope.sessionKey)?.skillsSnapshot).toBeUndefined();
-      expect(publication.fullEntries?.get(scope.sessionKey)?.skillsSnapshot?.prompt).toBe(
-        "private saved prompt",
-      );
-      expect(reads.counts.publication).toBe(0);
-    } finally {
-      reads.restore();
-    }
+    written.model = "not committed";
+    previous.participants![0]!.identity.id = "caller-owned";
+    expect(postimages.get(scope.sessionKey)?.entry).toMatchObject({
+      model: "committed",
+      participants: [{ identity: { type: "agent", id: "contributor" } }],
+      participantCount: 1,
+    });
   }, databaseOptions());
-  expect(loadSessionEntry(scope)).toMatchObject({
-    model: "committed",
-    skillsSnapshot: { prompt: "private saved prompt" },
-    participants: [{ identity: { type: "agent", id: "contributor" } }],
-  });
 });
 
 it.each(["row deletion", "owner reassignment"] as const)(

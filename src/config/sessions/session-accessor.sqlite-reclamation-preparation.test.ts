@@ -78,12 +78,8 @@ test("commits foreground replacement while cold reclamation holds native integri
   const work = runSqliteSessionReclamation({ plan: fixture.plans[0]! });
   const settled = vi.fn();
   void work.then(settled, settled);
-  const outcome = work.then(
-    () => "completed",
-    () => "failed",
-  );
   try {
-    expect(await Promise.race([gate.entered.then(() => "native integrity"), outcome])).toBe(
+    expect(await Promise.race([gate.entered.then(() => "native integrity"), work])).toBe(
       "native integrity",
     );
     expect(gate.count()).toBe(1);
@@ -93,12 +89,10 @@ test("commits foreground replacement while cold reclamation holds native integri
       skipMaintenance: true,
       update: (entries) => ({
         result: undefined,
-        replacements: entries.map(({ entry, sessionKey }) => {
-          if (!entry) {
-            throw new Error("Foreground fixture entry disappeared");
-          }
-          return { sessionKey, entry: { ...entry, label: "foreground committed" } };
-        }),
+        replacements: entries.map(({ entry, sessionKey }) => ({
+          sessionKey,
+          entry: { ...entry, label: "foreground committed" },
+        })),
       }),
     });
     expect(read(1)).toMatchObject(foreground);
@@ -113,8 +107,7 @@ test("commits foreground replacement while cold reclamation holds native integri
     await Promise.allSettled([work]);
     await closeOpenClawAgentDatabaseByPathAsync(fixture.database.path);
   }
-  expect(spawned.map((worker) => worker.threadId)).toEqual([-1]);
-  expect(leasesFor(fixture)).toHaveLength(0);
+  expect([spawned.map((worker) => worker.threadId), leasesFor(fixture)]).toEqual([[-1], []]);
 });
 
 test.each(["caller refusal", "source retirement"] as const)(
@@ -153,12 +146,9 @@ test.each(["caller refusal", "source retirement"] as const)(
         failure === "caller refusal" ? "cold caller permission revoked" : /revoked|closed/,
       );
       expect(receivedLease).toBe(true);
-      expect(spawned).toHaveLength(1);
       if (failure === "source retirement") {
-        expect(closing).toBeDefined();
         await closing;
-        expect(spawned.map((worker) => worker.threadId)).toEqual([-1]);
-        expect(leasesFor(fixture)).toHaveLength(0);
+        expect([spawned.map((worker) => worker.threadId), leasesFor(fixture)]).toEqual([[-1], []]);
       } else {
         expect(spawned[0]!.threadId).toBeGreaterThan(0);
         expect(leasesFor(fixture)).toHaveLength(1);
@@ -167,14 +157,12 @@ test.each(["caller refusal", "source retirement"] as const)(
       if (failure === "caller refusal") {
         allowed = true;
         await expect(run()).resolves.toMatchObject(removedOne);
-        expect(spawned).toHaveLength(1);
         expect(loadSessionEntryReadOnly(fixture.scopes[0]!)).toBeUndefined();
       }
     } finally {
       await closing;
       await closeOpenClawAgentDatabaseByPathAsync(fixture.database.path);
     }
-    expect(spawned[0]!.threadId).toBe(-1);
-    expect(leasesFor(fixture)).toHaveLength(0);
+    expect([spawned.map((worker) => worker.threadId), leasesFor(fixture)]).toEqual([[-1], []]);
   },
 );

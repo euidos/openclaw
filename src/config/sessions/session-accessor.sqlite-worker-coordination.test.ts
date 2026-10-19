@@ -15,8 +15,8 @@ import {
   type OpenClawTestState,
 } from "../../test-utils/openclaw-test-state.js";
 import {
-  withSqliteMutationWorkerCoordination,
-  withSqliteWorkerLifecycleCoordination,
+  withSqliteMutationWorkerCoordination as coordinateWorker,
+  withSqliteWorkerLifecycleCoordination as coordinateLifecycle,
 } from "./session-accessor.sqlite-worker-coordination.js";
 
 function withWorkerState(label: string, run: (state: OpenClawTestState) => Promise<void>) {
@@ -68,7 +68,7 @@ it("admits a host profile write while reconciliation publishes a cold quarantine
       state.path("cold.sqlite"),
     );
     try {
-      await withSqliteWorkerLifecycleCoordination(
+      await coordinateLifecycle(
         context,
         "cold-quarantine",
         async (coordination) => {
@@ -119,7 +119,7 @@ it("allows accepted cleanup after the close owner revokes new reads", async () =
         attempted = true;
         expect(() => context.admission.assertCurrent()).toThrow(/read admission is closed/);
         await expect(
-          withSqliteWorkerLifecycleCoordination(context, "retained-close", close, async () => {}),
+          coordinateLifecycle(context, "retained-close", close, async () => {}),
         ).resolves.toBe("closed");
       },
     });
@@ -140,16 +140,11 @@ it("admits another agent lease while a sibling worker retains process ownership"
     const claimant = createCoordinationWorker(state, "lease", release);
     const workers = [holder, claimant];
     const dispatch = (worker: Worker, result: "held" | "claimed") =>
-      withSqliteMutationWorkerCoordination(
-        context,
-        { kind: "dedicated", channel: worker },
-        1,
-        async (coordination) => {
-          const completed = Promise.all([once(worker, "message"), once(worker, "exit")]);
-          worker.postMessage(coordination, []);
-          expect(await completed).toEqual([[result], [0]]);
-        },
-      );
+      coordinateWorker(context, { kind: "dedicated", channel: worker }, 1, async (coordination) => {
+        const completed = Promise.all([once(worker, "message"), once(worker, "exit")]);
+        worker.postMessage(coordination, []);
+        expect(await completed).toEqual([[result], [0]]);
+      });
     const held = once(holder, "message");
     const holding = dispatch(holder, "held");
     try {
@@ -176,25 +171,16 @@ it("joins native worker exit before rejecting failed dispatch", async () => {
   await withWorkerState("mutation-worker-preparation", async () => {
     const context = captureOpenClawStateWorkerContext();
     const worker = new Worker(
-      `const { parentPort } = require("node:worker_threads");
-     parentPort.once("message", (result) => {
-       parentPort.postMessage(result);
-       parentPort.close();
-     });`,
+      'require("node:worker_threads").parentPort.on("message", () => {});',
       { eval: true, execArgv: [] },
     );
     const failure = new Error("Synthetic worker dispatch failure");
     try {
       await once(worker, "online");
       await expect(
-        withSqliteMutationWorkerCoordination(
-          context,
-          { kind: "dedicated", channel: worker },
-          1,
-          async () => {
-            throw failure;
-          },
-        ),
+        coordinateWorker(context, { kind: "dedicated", channel: worker }, 1, async () => {
+          throw failure;
+        }),
       ).rejects.toBe(failure);
       expect(worker.threadId).toBe(-1);
     } finally {

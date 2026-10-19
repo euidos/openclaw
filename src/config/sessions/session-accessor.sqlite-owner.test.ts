@@ -165,12 +165,7 @@ it("lazily adds bare columns and preserves the assignment across reopen", async 
       closeOpenClawAgentDatabasesForTest();
       expect(loadSessionEntry(scope)?.owner).toEqual(assignment);
       const reopened = openOpenClawAgentDatabase(scope);
-      const columns = reopened.db.prepare("PRAGMA table_info(session_nodes)").all() as Array<{
-        name: string;
-        notnull: number;
-        dflt_value: unknown;
-        type: string;
-      }>;
+      const columns = reopened.db.prepare("PRAGMA table_info(session_nodes)").all();
       expect(columns.some((column) => column.name === "legacy_acp_migration_json")).toBe(false);
       for (const definition of SESSION_OWNER_COLUMN_DEFINITIONS) {
         expect(columns.find((column) => column.name === definition.columnName)).toMatchObject({

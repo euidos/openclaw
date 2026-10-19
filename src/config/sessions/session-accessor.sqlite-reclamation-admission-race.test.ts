@@ -62,7 +62,6 @@ beforeEach(() => {
 afterEach(async () => {
   archiveMaterializationHook.beforeMaterialize = undefined;
   archiveMaterializationHook.beforeReclaim = undefined;
-  vi.restoreAllMocks();
   await closeOpenClawAgentDatabasesAsync();
   closeOpenClawAgentDatabasesForTest();
 });
@@ -103,13 +102,9 @@ it.runIf(process.platform !== "win32")(
       fs.symlinkSync(replacementPath, alias);
     };
 
-    await expect(remove({ storePath: alias })).resolves.toMatchObject({
-      deleted: true,
-    });
+    await expect(remove({ storePath: alias })).resolves.toMatchObject({ deleted: true });
     expect(loadSessionEntry(scope(originalPath))).toBeUndefined();
-    expect(loadSessionEntry(scope(replacementPath))).toMatchObject({
-      sessionId,
-    });
+    expect(loadSessionEntry(scope(replacementPath))).toMatchObject({ sessionId });
   },
 );
 
