@@ -62,7 +62,25 @@ const tempDirs = useAutoCleanupTempDirTracker((cleanup) =>
 async function makeStore() {
   const root = tempDirs.make("openclaw-skill-upload-commit-");
   const databasePath = path.join(root, "openclaw.sqlite");
-  return { databasePath };
+  const database = openOpenClawStateDatabase({ path: databasePath });
+  return { databasePath, database, options: { database, path: databasePath } };
+}
+
+type UploadOptions = Parameters<typeof beginSkillUploadInDatabase>[1];
+type BeginParams = Parameters<typeof beginSkillUploadInDatabase>[0];
+
+function beginUpload(options: UploadOptions, overrides: Partial<BeginParams> = {}) {
+  return beginSkillUploadInDatabase(
+    {
+      kind: "skill-archive",
+      slug: "test-skill",
+      sizeBytes: 1,
+      force: false,
+      ttlMs: 60_000,
+      ...overrides,
+    },
+    options,
+  );
 }
 
 function stageUpload(databasePath: string, slug: string, archive: Buffer, expectedSha?: string) {
@@ -70,17 +88,7 @@ function stageUpload(databasePath: string, slug: string, archive: Buffer, expect
     database: openOpenClawStateDatabase({ path: databasePath }),
     path: databasePath,
   };
-  const begun = beginSkillUploadInDatabase(
-    {
-      kind: "skill-archive",
-      slug,
-      sizeBytes: archive.length,
-      sha256: expectedSha,
-      force: false,
-      ttlMs: 60_000,
-    },
-    options,
-  );
+  const begun = beginUpload(options, { slug, sizeBytes: archive.length, sha256: expectedSha });
   appendSkillUploadChunkInDatabase(
     { uploadId: begun.uploadId, offset: 0, decoded: archive },
     options,
@@ -149,21 +157,11 @@ describe("skill upload transaction kernels", () => {
   it.each([Number.NaN, MAX_DATE_TIMESTAMP_MS])(
     "rejects a begin when the admitted clock %s cannot produce a valid expiry",
     async (now) => {
-      const { databasePath } = await makeStore();
-      const database = openOpenClawStateDatabase({ path: databasePath });
+      const { database, options } = await makeStore();
       const admitted = advanceClockAtAdmission(database, Date.now(), now);
-      expect(() =>
-        beginSkillUploadInDatabase(
-          {
-            kind: "skill-archive",
-            slug: "invalid-clock",
-            sizeBytes: 1,
-            force: false,
-            ttlMs: 60_000,
-          },
-          { database, path: databasePath },
-        ),
-      ).toThrow("invalid upload expiry");
+      expect(() => beginUpload(options, { slug: "invalid-clock" })).toThrow(
+        "invalid upload expiry",
+      );
       expect(admitted).toHaveBeenCalledOnce();
       expect(database.db.prepare("SELECT count(*) AS count FROM skill_uploads").get()).toEqual({
         count: 0,
@@ -174,29 +172,21 @@ describe("skill upload transaction kernels", () => {
   it.each(["idempotency", "capacity"] as const)(
     "starts the full TTL and evaluates %s after admission",
     async (boundary) => {
-      const { databasePath } = await makeStore();
-      const database = openOpenClawStateDatabase({ path: databasePath });
-      const options = { database, path: databasePath };
+      const { databasePath, database, options } = await makeStore();
       const before = Date.now();
       vi.spyOn(Date, "now").mockReturnValue(before);
-      const request = {
-        kind: "skill-archive" as const,
-        slug: "admitted-begin",
-        sizeBytes: 1,
-        force: false,
-        ttlMs: 60_000,
-      };
-      const first = beginSkillUploadInDatabase({ ...request, keyHash: "same-key" }, options);
+      const request = { slug: "admitted-begin", ttlMs: 60_000 };
+      const first = beginUpload(options, { ...request, keyHash: "same-key" });
       if (boundary === "capacity") {
         for (let index = 1; index < 32; index += 1) {
-          beginSkillUploadInDatabase(request, options);
+          beginUpload(options, request);
         }
       }
       const admitted = advanceClockAtAdmission(database, before, first.expiresAt);
-      const next = beginSkillUploadInDatabase(
-        { ...request, ...(boundary === "idempotency" ? { keyHash: "same-key" } : {}) },
-        options,
-      );
+      const next = beginUpload(options, {
+        ...request,
+        ...(boundary === "idempotency" ? { keyHash: "same-key" } : {}),
+      });
       expect(admitted).toHaveBeenCalledOnce();
       expect(next.uploadId).not.toBe(first.uploadId);
       expect(next.expiresAt).toBe(first.expiresAt + request.ttlMs);
@@ -219,20 +209,12 @@ describe("skill upload transaction kernels", () => {
   ] as const)(
     "rejects $operation across native admission expiry with external lease=$leased",
     async ({ operation, leased }) => {
-      const { databasePath } = await makeStore();
-      const database = openOpenClawStateDatabase({ path: databasePath });
-      const options = { database, path: databasePath };
+      const { databasePath, database, options } = await makeStore();
       const archive = Buffer.from("a");
-      const begun = beginSkillUploadInDatabase(
-        {
-          kind: "skill-archive",
-          slug: "admitted-expiry",
-          sizeBytes: operation === "chunk" ? 2 : 1,
-          force: false,
-          ttlMs: 60_000,
-        },
-        options,
-      );
+      const begun = beginUpload(options, {
+        slug: "admitted-expiry",
+        sizeBytes: operation === "chunk" ? 2 : 1,
+      });
       appendSkillUploadChunkInDatabase(
         { uploadId: begun.uploadId, offset: 0, decoded: archive },
         options,
@@ -293,9 +275,7 @@ describe("skill upload transaction kernels", () => {
   it.each([false, true])(
     "resamples sweep deletion at admission with a lease expiring during admission=%s",
     async (leased) => {
-      const { databasePath } = await makeStore();
-      const database = openOpenClawStateDatabase({ path: databasePath });
-      const options = { database, path: databasePath };
+      const { databasePath, database, options } = await makeStore();
       const begun = stageUpload(databasePath, "sweep-admission", Buffer.from("a"));
       const before = begun.expiresAt - 1;
       const after = begun.expiresAt + 1;
@@ -331,11 +311,7 @@ describe("skill upload transaction kernels", () => {
   );
 
   it("keeps archive bytes out of metadata reads until the install claim", async () => {
-    const { databasePath } = await makeStore();
-    const options = {
-      database: openOpenClawStateDatabase({ path: databasePath }),
-      path: databasePath,
-    };
+    const { databasePath, options } = await makeStore();
     const db = requireNativeSqliteDatabase(stateDatabase(databasePath));
     const archiveReads: Array<{ bytes: number; inTransaction: boolean }> = [];
     const nativeBlobs = new WeakSet<Uint8Array>();
@@ -382,31 +358,17 @@ describe("skill upload transaction kernels", () => {
       const firstChunk = Buffer.alloc(4 * 1024 * 1024, 0x61);
       const secondChunk = Buffer.alloc(4 * 1024 * 1024, 0x62);
       const archive = Buffer.concat([firstChunk, secondChunk]);
-      const begin = beginSkillUploadInDatabase(
-        {
-          kind: "skill-archive",
-          slug: "large-skill",
-          sizeBytes: archive.length,
-          keyHash: "large-upload",
-          force: false,
-          ttlMs: 60_000,
-        },
+      const begin = beginUpload(options, {
+        slug: "large-skill",
+        sizeBytes: archive.length,
+        keyHash: "large-upload",
+      });
+      appendSkillUploadChunkInDatabase(
+        { uploadId: begin.uploadId, offset: 0, decoded: firstChunk },
         options,
       );
       appendSkillUploadChunkInDatabase(
-        {
-          uploadId: begin.uploadId,
-          offset: 0,
-          decoded: firstChunk,
-        },
-        options,
-      );
-      appendSkillUploadChunkInDatabase(
-        {
-          uploadId: begin.uploadId,
-          offset: firstChunk.length,
-          decoded: secondChunk,
-        },
+        { uploadId: begin.uploadId, offset: firstChunk.length, decoded: secondChunk },
         options,
       );
       const staged = stateDatabase(databasePath)
@@ -425,38 +387,24 @@ describe("skill upload transaction kernels", () => {
       expect(committed.bytes).toBe(archive.length);
       expect(chunkCount(databasePath, begin.uploadId)).toBe(0);
       expect(
-        beginSkillUploadInDatabase(
-          {
-            kind: "skill-archive",
-            slug: "large-skill",
-            sizeBytes: archive.length,
-            keyHash: "large-upload",
-            force: false,
-            ttlMs: 60_000,
-          },
-          options,
-        ),
+        beginUpload(options, {
+          slug: "large-skill",
+          sizeBytes: archive.length,
+          keyHash: "large-upload",
+        }),
       ).toMatchObject({ uploadId: begin.uploadId, receivedBytes: archive.length });
       expect(commitSkillUploadInDatabase({ uploadId: begin.uploadId }, options)).toMatchObject({
         sha256: sha256(archive),
       });
       expect(() =>
         appendSkillUploadChunkInDatabase(
-          {
-            uploadId: begin.uploadId,
-            offset: archive.length,
-            decoded: Buffer.from("a"),
-          },
+          { uploadId: begin.uploadId, offset: archive.length, decoded: Buffer.from("a") },
           options,
         ),
       ).toThrow("upload is already committed");
       expect(archiveReads).toEqual([]);
       const claimed = claimSkillUploadInDatabase(
-        {
-          uploadId: begin.uploadId,
-          leaseOwner: "metadata-proof",
-          installLeaseMs: 60_000,
-        },
+        { uploadId: begin.uploadId, leaseOwner: "metadata-proof", installLeaseMs: 60_000 },
         options,
       );
       expect(claimed.archive_blob.constructor).toBe(Uint8Array);
