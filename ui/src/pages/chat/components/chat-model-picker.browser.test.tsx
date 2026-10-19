@@ -2,7 +2,7 @@ import { createSignal } from "solid-js";
 import { afterEach, expect, it, vi } from "vitest";
 import { page, userEvent } from "vitest/browser";
 import { mountSolid } from "../../../test-helpers/mount-solid.ts";
-import { flush } from "../../../test-helpers/solid-settle.ts";
+import { flush, waitForSolid } from "../../../test-helpers/solid-settle.ts";
 import "../../../styles/base.css";
 import "../../../styles/chat/composer.css";
 import { focusChatComposerFromPrintableKeydown } from "../chat-pane-shared.ts";
@@ -47,15 +47,16 @@ function mountPicker(optionsReady = true) {
         setProps(() => ({ ...params }));
         flush();
       };
+      let textarea!: HTMLTextAreaElement;
       return (
         <div
           class="agent-chat__input"
-          onPointerDown={(event) => focusComposerFromChrome(event, true)}
-          onClick={(event) => focusComposerFromChrome(event, true)}
+          onPointerDown={(event) => focusComposerFromChrome(event, true, textarea)}
+          onClick={(event) => focusComposerFromChrome(event, true, textarea)}
           onKeyDown={(event) => focusChatComposerFromPrintableKeydown(container, event)}
         >
           <div class="agent-chat__composer-combobox">
-            <textarea />
+            <textarea ref={(element) => (textarea = element)} />
           </div>
           <ChatModelPicker {...props()} />
         </div>
@@ -75,6 +76,11 @@ function mountPicker(optionsReady = true) {
     await toggled;
     flush();
     await new Promise(requestAnimationFrame);
+    if (picker.open) {
+      await waitForSolid(() =>
+        expect(picker.querySelector(".chat-controls__model-menu")).not.toBeNull(),
+      );
+    }
   };
   return { params, update, picker, trigger, composer, toggle, modelOptions };
 }
