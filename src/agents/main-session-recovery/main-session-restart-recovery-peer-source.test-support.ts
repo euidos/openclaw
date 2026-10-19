@@ -12,7 +12,9 @@ import {
   prepareAgentRunUserTurn,
   releasePreparedAgentRunUserTurn,
 } from "../../gateway/agent-turn/agent-run-user-turn.js";
+import { captureAgentTurnPrincipal } from "../../gateway/agent-turn/principal.js";
 import { createDirectChatContext } from "../../gateway/server-chat.agent-events.test-helpers.js";
+import { createSyntheticPluginRuntimeClient } from "../../gateway/server-plugin-runtime-client.js";
 import {
   readSessionSendDelivery,
   type SessionSendDeliveryEndpoint,
@@ -21,6 +23,7 @@ import { resolveGatewaySessionStoreTargetInWorker } from "../../gateway/session-
 import { withPluginRuntimeGatewayContextResolver } from "../../plugins/runtime/gateway-request-scope.js";
 import { buildCurrentRunRestartRecoveryClaim } from "../agent-command-restart-recovery.js";
 import { buildAgentRunTerminalOutcome } from "../agent-run-terminal-outcome.js";
+import type { RequesterOrigin } from "../requester-origin.js";
 import { prepareSessionsSendCommunication } from "../tools/sessions-send-communication.js";
 
 /** Persist the real accepted peer envelope, then leave only its interrupted durable input. */
@@ -29,6 +32,7 @@ export async function seedConsumedPeerRestartInput(params: {
   source: SessionSendDeliveryEndpoint & { storePath: string };
   target: SessionSendDeliveryEndpoint & { storePath: string };
   runId: string;
+  requesterOrigin?: RequesterOrigin;
 }) {
   const { cfg, source, target, runId } = params;
   const message = "Complete the saved peer task.";
@@ -68,7 +72,17 @@ export async function seedConsumedPeerRestartInput(params: {
       images: [],
       offloadedRefs: [],
       runId,
-      client: null,
+      client: params.requesterOrigin
+        ? captureAgentTurnPrincipal(
+            createSyntheticPluginRuntimeClient({
+              agentToolCaller: {
+                agentId: source.agentId,
+                sessionKey: source.sessionKey,
+                requesterOrigin: params.requesterOrigin,
+              },
+            }),
+          )
+        : null,
       context: createAgentTurnTestContext(),
     });
     try {

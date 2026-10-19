@@ -7,6 +7,7 @@ import {
 import { loadSessionEntry, loadTranscriptEvents } from "../../config/sessions/session-accessor.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { GatewayRecoveryRuntime } from "../../gateway/server-instance-runtime.types.js";
+import { prepareConsumedSessionSendSource } from "../../gateway/session-send-recovery-source.js";
 import { rotateAgentEventLifecycleGeneration } from "../../infra/agent-events.js";
 import { resetGatewayWorkAdmission } from "../../process/gateway-work-admission.js";
 import { testing } from "../../sessions/session-controller.test-support.js";
@@ -21,6 +22,57 @@ afterEach(() => {
   resetGatewayWorkAdmission();
   clearRuntimeConfigSnapshot();
   vi.restoreAllMocks();
+});
+
+it("leaves authenticated consumed inputs to their private requester recovery owner", async () => {
+  await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+    const storePath = state.statePath("agents", "main", "sessions", "sessions.json");
+    const cfg: OpenClawConfig = {
+      agents: { defaults: { workspace: state.workspaceDir }, entries: { main: {} } },
+      session: { store: storePath, communication: { send: "always", receive: "always" } },
+      tools: { sessions: { visibility: "all" } },
+    };
+    setRuntimeConfigSnapshot(cfg);
+    for (const kind of ["channel", "operator"] as const) {
+      const source = {
+        agentId: "main",
+        sessionKey: `agent:main:authenticated-source-${kind}`,
+        sessionId: `authenticated-source-${kind}`,
+        lifecycleRevision: `source-generation-${kind}`,
+        storePath,
+      };
+      const target = {
+        agentId: "main",
+        sessionKey: `agent:main:authenticated-target-${kind}`,
+        sessionId: `authenticated-target-${kind}`,
+        lifecycleRevision: `target-generation-${kind}`,
+        storePath,
+      };
+      const runId = `authenticated-peer-${kind}`;
+      const { receiver, originalTranscript } = await seedConsumedPeerRestartInput({
+        cfg,
+        source,
+        target,
+        runId,
+        requesterOrigin: {
+          sessionKey: source.sessionKey,
+          ...(kind === "channel"
+            ? { messageProvider: "telegram", senderId: "fixture-requester" }
+            : { operatorProfileId: "fixture-operator" }),
+        },
+      });
+      expect(
+        await prepareConsumedSessionSendSource({
+          config: cfg,
+          target,
+          sourceRunId: runId,
+          assertCurrent() {},
+        }),
+      ).toBeUndefined();
+      expect(receiver).toHaveBeenCalledOnce();
+      expect(await loadTranscriptEvents(target)).toEqual(originalTranscript);
+    }
+  });
 });
 
 it("recovers a consumed peer input through two process losses without replaying the input", async () => {
