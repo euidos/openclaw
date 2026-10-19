@@ -30,19 +30,15 @@ describe("parseDiscordTarget", () => {
       { input: "123", expectedMessage: /Ambiguous Discord recipient/ },
       { input: "@bob", expectedMessage: /Discord DMs require a user id/ },
     ] as const;
-    for (const testCase of cases) {
-      expect(() => parseDiscordTarget(testCase.input), testCase.input).toThrow(
-        testCase.expectedMessage,
-      );
+    for (const { input, expectedMessage } of cases) {
+      expect(() => parseDiscordTarget(input), input).toThrow(expectedMessage);
     }
   });
 });
 
-describe("resolveDiscordChannelId", () => {
-  it("strips channel: prefix and accepts raw ids", () => {
-    expect(resolveDiscordChannelId("channel:123")).toBe("123");
-    expect(resolveDiscordChannelId("123")).toBe("123");
-  });
+it("resolveDiscordChannelId strips channel: prefix and accepts raw ids", () => {
+  expect(resolveDiscordChannelId("channel:123")).toBe("123");
+  expect(resolveDiscordChannelId("123")).toBe("123");
 });
 
 describe("resolveDiscordTarget", () => {
@@ -133,7 +129,6 @@ const groupContext =
 describe("discord group policy", () => {
   it("prefers channel policy, then guild policy, with sender-specific overrides", () => {
     const discordCfg = config({
-      token: "discord-test",
       guilds: {
         guild1: {
           requireMention: false,
@@ -173,7 +168,6 @@ describe("discord group policy", () => {
 
   it("honors account-scoped guild and channel overrides", () => {
     const discordCfg = config({
-      token: "discord-test",
       guilds: {
         guild1: {
           requireMention: true,
@@ -182,7 +176,6 @@ describe("discord group policy", () => {
       },
       accounts: {
         work: {
-          token: "discord-work",
           guilds: {
             guild1: {
               requireMention: false,

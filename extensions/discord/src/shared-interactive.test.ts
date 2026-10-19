@@ -357,28 +357,12 @@ describe("buildDiscordInteractiveComponents", () => {
     ]);
   });
 
-  it("preserves typed command actions for command-only select options", () => {
-    expect(
-      renderSelect([
-        {
-          label: "Run",
-          action: { type: "command", command: "/codex permissions yolo" },
-          value: "/codex permissions yolo",
-        },
-      ]),
-    ).toEqual(select("command", [{ label: "Run", value: "/codex permissions yolo" }]));
-  });
-
-  it("marks typed callback actions for callback-only select options", () => {
-    expect(
-      renderSelect([
-        {
-          label: "Inspect",
-          action: { type: "callback", value: "inspect:123" },
-          value: "inspect:123",
-        },
-      ]),
-    ).toEqual(select("callback", [{ label: "Inspect", value: "inspect:123" }]));
+  it.each([
+    { kind: "command", label: "Run", value: "/codex permissions yolo" },
+    { kind: "callback", label: "Inspect", value: "inspect:123" },
+  ] as const)("preserves typed $kind select actions", ({ kind, label, value }) => {
+    const action = kind === "command" ? { type: kind, command: value } : { type: kind, value };
+    expect(renderSelect([{ label, action, value }])).toEqual(select(kind, [{ label, value }]));
   });
 
   it("does not render mixed command and callback select actions", () => {
