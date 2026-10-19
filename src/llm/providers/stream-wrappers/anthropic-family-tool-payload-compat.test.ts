@@ -1,6 +1,5 @@
 import type { StreamFn } from "openclaw/plugin-sdk/agent-core";
-import type { Model } from "openclaw/plugin-sdk/llm";
-import { createAssistantMessageEventStream } from "openclaw/plugin-sdk/llm";
+import { createAssistantMessageEventStream, type Model } from "openclaw/plugin-sdk/llm";
 import { describe, expect, it } from "vitest";
 import { createOpenAIAnthropicToolPayloadCompatibilityWrapper } from "./anthropic-family-tool-payload-compat.js";
 
@@ -10,13 +9,13 @@ function emptySchema() {
 function querySchema() {
   return { type: "object", properties: { query: { type: "string" } } };
 }
-function lookupTool() {
-  return { name: "lookup", parameters: querySchema() };
+function lookupTool(parameters: unknown = querySchema()) {
+  return { name: "lookup", parameters };
 }
 function functionTool(definition: Record<string, unknown>) {
   return { type: "function", function: definition };
 }
-function customTool(input_schema = emptySchema()) {
+function customTool(input_schema: Record<string, unknown> = emptySchema()) {
   return { type: "custom", custom: { name: "shell", input_schema } };
 }
 function allowedTools(mode: string, tools: unknown[]) {
@@ -97,7 +96,7 @@ describe("createOpenAIAnthropicToolPayloadCompatibilityWrapper", () => {
     const payload = runWrapper(
       {
         reasoning_effort: "low",
-        tools: [{ name: "lookup", parameters: emptySchema() }],
+        tools: [lookupTool(emptySchema())],
       },
       { ...model, id: "gpt-5.6-luna" },
     );
@@ -107,14 +106,7 @@ describe("createOpenAIAnthropicToolPayloadCompatibilityWrapper", () => {
 
   it("skips invalid schemas while preserving a healthy pinned tool", () => {
     const payload = runWrapper({
-      tools: [
-        invalidTool(),
-        {
-          name: "lookup",
-          description: "Lookup",
-          parameters: querySchema(),
-        },
-      ],
+      tools: [invalidTool(), { ...lookupTool(), description: "Lookup" }],
       tool_choice: { type: "tool", name: "lookup" },
     });
 
@@ -141,28 +133,22 @@ describe("createOpenAIAnthropicToolPayloadCompatibilityWrapper", () => {
   });
 
   it("skips unreadable and structurally invalid schemas while preserving healthy siblings", () => {
-    const circularSchema: Record<string, unknown> = {
-      type: "object",
-      properties: {},
-    };
+    const circularSchema: Record<string, unknown> = emptySchema();
     circularSchema.self = circularSchema;
     const payload = runWrapper({
       tools: [
         { name: "circular_schema", parameters: circularSchema },
-        {
-          type: "function",
-          function: {
-            name: "nested_getter",
-            parameters: {
-              type: "object",
-              properties: {
-                get value(): never {
-                  throw new Error("nested schema getter exploded");
-                },
+        functionTool({
+          name: "nested_getter",
+          parameters: {
+            type: "object",
+            properties: {
+              get value(): never {
+                throw new Error("nested schema getter exploded");
               },
             },
           },
-        },
+        }),
         { name: "invalid_properties", parameters: { type: "object", properties: false } },
         invalidTool("invalid_required"),
         { name: "invalid_root", input_schema: [] },
@@ -206,16 +192,7 @@ describe("createOpenAIAnthropicToolPayloadCompatibilityWrapper", () => {
 
   it("normalizes null object schema keywords", () => {
     const payload = runWrapper({
-      tools: [
-        {
-          name: "lookup",
-          parameters: {
-            type: "object",
-            properties: null,
-            required: null,
-          },
-        },
-      ],
+      tools: [lookupTool({ type: "object", properties: null, required: null })],
     });
 
     expect(payload?.tools).toEqual([
@@ -261,15 +238,12 @@ describe("createOpenAIAnthropicToolPayloadCompatibilityWrapper", () => {
       properties: { command: { type: "string" } },
       required: ["command"],
     };
+    const tool = customTool(schema);
     const payload = runWrapper({
       tools: [
         {
           type: "custom",
-          custom: {
-            name: "shell",
-            description: "Run a shell command.",
-            input_schema: schema,
-          },
+          custom: { ...tool.custom, description: "Run a shell command." },
         },
       ],
       tool_choice: {
@@ -282,10 +256,7 @@ describe("createOpenAIAnthropicToolPayloadCompatibilityWrapper", () => {
       tools: [
         functionTool({ name: "shell", description: "Run a shell command.", parameters: schema }),
       ],
-      tool_choice: {
-        type: "function",
-        function: { name: "shell" },
-      },
+      tool_choice: functionTool({ name: "shell" }),
     });
   });
 
@@ -367,10 +338,7 @@ describe("createOpenAIAnthropicToolPayloadCompatibilityWrapper", () => {
   ] as const)("rejects %s choices for invalid tools", (name, tool_choice, error) => {
     expect(() =>
       runWrapper({
-        tools: [
-          invalidTool(),
-          ...(name === "pinned" ? [{ name: "lookup", parameters: emptySchema() }] : []),
-        ],
+        tools: [invalidTool(), ...(name === "pinned" ? [lookupTool(emptySchema())] : [])],
         tool_choice,
       }),
     ).toThrow(error);
