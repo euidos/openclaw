@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import assert from "node:assert/strict";
+import { beforeEach, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
 import { resolveSubagentModelAndThinkingPlan } from "./subagents/spawn/subagent-spawn-plan.js";
 import { resolveSubagentThinkingOverride } from "./subagents/spawn/subagent-spawn-thinking.js";
@@ -18,130 +19,120 @@ const planFor = (options: Partial<Parameters<typeof resolveSubagentModelAndThink
   resolveSubagentModelAndThinkingPlan({ cfg: {}, targetAgentId: "research", ...options });
 const nativeModel = "minimax/MiniMax-M2.7";
 
-describe("subagent initial model plan", () => {
-  it("threads explicit fast mode into the initial child session patch", async () => {
-    const plan = await planFor({ fastMode: "ultrafast" });
-    expect(plan).toMatchObject({ status: "ok", initialSessionPatch: { fastMode: "ultrafast" } });
+it("threads explicit fast mode into the initial child session patch", async () => {
+  const plan = await planFor({ fastMode: "ultrafast" });
+  expect(plan).toMatchObject({ status: "ok", initialSessionPatch: { fastMode: "ultrafast" } });
+});
+it("applies an explicit native model instead of ACP defaults", async () => {
+  const plan = await planFor({
+    cfg: {
+      agents: {
+        defaults: { subagents: { model: "minimax/MiniMax-M2.7" } },
+        entries: { research: acpAgent },
+      },
+    },
+    targetAgentConfig: acpAgent,
+    modelOverride: "openrouter/meta-llama/llama-3.3-70b:free",
   });
-  it("applies an explicit native model instead of ACP defaults", async () => {
+  expect(plan).toMatchObject({
+    status: "ok",
+    resolvedModel: "openrouter/meta-llama/llama-3.3-70b:free",
+    modelApplied: true,
+    initialSessionPatch: {
+      model: "meta-llama/llama-3.3-70b:free",
+      modelOverrideSource: "user",
+    },
+  });
+  assert(plan.status === "ok");
+  expect(plan.initialSessionPatch.modelOverrideFallbackOriginProvider).toBeUndefined();
+  expect(plan.initialSessionPatch.modelOverrideFallbackOriginModel).toBeUndefined();
+});
+
+it("rejects invalid thinking before preparing a model", async () => {
+  expect(await planFor({ thinkingOverrideRaw: "banana" })).toMatchObject({
+    status: "error",
+    error: expect.stringMatching(/Invalid thinking level/i),
+  });
+  expect(modelChoice).not.toHaveBeenCalled();
+});
+
+it("uses the target default provider for a bare configured subagent model", async () => {
+  expect(
+    await planFor({
+      cfg: {
+        agents: {
+          defaults: { model: { primary: "openai/gpt-5.5" }, subagents: { model: "gpt-5.4" } },
+        },
+      },
+    }),
+  ).toMatchObject({
+    status: "ok",
+    resolvedModel: "openai/gpt-5.4",
+    initialSessionPatch: {
+      model: "gpt-5.4",
+      modelOverrideSource: "auto",
+      modelOverrideFallbackOriginProvider: "openai",
+      modelOverrideFallbackOriginModel: "gpt-5.4",
+    },
+  });
+});
+
+it.each([
+  ["agent subagent model", "opencode/claude", nativeModel, "opencode", "claude", true],
+  ["default subagent model", undefined, nativeModel, "minimax", "MiniMax-M2.7", true],
+  ["native default, not ACP primary", undefined, undefined, "minimax", "MiniMax-M2.7", false],
+] as const)(
+  "selects %s for a native child",
+  async (_name, agentModel, defaultModel, provider, model, hasOrigin) => {
+    const targetAgentConfig = { ...acpAgent, subagents: { model: agentModel } };
     const plan = await planFor({
       cfg: {
         agents: {
-          defaults: { subagents: { model: "minimax/MiniMax-M2.7" } },
-          entries: { research: acpAgent },
+          defaults: {
+            model: { primary: "minimax/MiniMax-M2.7" },
+            subagents: { model: defaultModel },
+          },
+          entries: { research: targetAgentConfig },
         },
       },
-      targetAgentConfig: acpAgent,
-      modelOverride: "openrouter/meta-llama/llama-3.3-70b:free",
+      targetAgentConfig,
     });
-    expect(plan).toMatchObject({
-      status: "ok",
-      resolvedModel: "openrouter/meta-llama/llama-3.3-70b:free",
-      modelApplied: true,
-      initialSessionPatch: {
-        model: "meta-llama/llama-3.3-70b:free",
-        modelOverrideSource: "user",
-      },
+    assert(plan.status === "ok");
+    expect(plan).toMatchObject({ resolvedModel: `${provider}/${model}` });
+    expect(plan.initialSessionPatch).toMatchObject({
+      modelProvider: provider,
+      model,
+      modelOverrideSource: "auto",
     });
-    if (plan.status !== "ok") {
-      throw new Error(plan.error);
-    }
-    expect(plan.initialSessionPatch.modelOverrideFallbackOriginProvider).toBeUndefined();
-    expect(plan.initialSessionPatch.modelOverrideFallbackOriginModel).toBeUndefined();
-  });
-
-  it("rejects invalid thinking before preparing a model", async () => {
-    expect(await planFor({ thinkingOverrideRaw: "banana" })).toMatchObject({
-      status: "error",
-      error: expect.stringMatching(/Invalid thinking level/i),
-    });
-    expect(modelChoice).not.toHaveBeenCalled();
-  });
-
-  it("uses the target default provider for a bare configured subagent model", async () => {
+    expect(plan.initialSessionPatch.modelOverrideFallbackOriginProvider).toBe(
+      hasOrigin ? provider : undefined,
+    );
+    expect(plan.initialSessionPatch.modelOverrideFallbackOriginModel).toBe(
+      hasOrigin ? model : undefined,
+    );
+  },
+);
+it.each([
+  ["requester over target", "low", "medium", "high", "high", undefined, "low", "low"],
+  ["target off over global", undefined, "off", "high", "high", undefined, "off", "off"],
+  ["global over caller", undefined, undefined, "high", "medium", undefined, "high", "high"],
+  ["inherited caller off", undefined, undefined, undefined, "off", undefined, "off", undefined],
+  ["request over requester", "low", "medium", "high", "off", "xhigh", "xhigh", "xhigh"],
+] as const)(
+  "preserves subagent thinking precedence: %s",
+  (_name, requester, target, global, caller, requestOverride, expected, override) => {
     expect(
-      await planFor({
-        cfg: {
-          agents: {
-            defaults: { model: { primary: "openai/gpt-5.5" }, subagents: { model: "gpt-5.4" } },
-          },
-        },
+      resolveSubagentThinkingOverride({
+        cfg: { agents: { defaults: { subagents: { thinking: global } } } },
+        requesterAgentConfig: { subagents: { thinking: requester } },
+        targetAgentConfig: { subagents: { thinking: target } },
+        thinkingOverrideRaw: requestOverride,
+        callerThinkingRaw: caller,
       }),
-    ).toMatchObject({
+    ).toEqual({
       status: "ok",
-      resolvedModel: "openai/gpt-5.4",
-      initialSessionPatch: {
-        model: "gpt-5.4",
-        modelOverrideSource: "auto",
-        modelOverrideFallbackOriginProvider: "openai",
-        modelOverrideFallbackOriginModel: "gpt-5.4",
-      },
+      thinkingOverride: override,
+      initialSessionPatch: expected === undefined ? {} : { thinkingLevel: expected },
     });
-  });
-
-  it.each([
-    ["agent subagent model", "opencode/claude", nativeModel, "opencode", "claude", true],
-    ["default subagent model", undefined, nativeModel, "minimax", "MiniMax-M2.7", true],
-    ["native default, not ACP primary", undefined, undefined, "minimax", "MiniMax-M2.7", false],
-  ] as const)(
-    "selects %s for a native child",
-    async (_name, agentModel, defaultModel, provider, model, hasOrigin) => {
-      const targetAgentConfig = { ...acpAgent, subagents: { model: agentModel } };
-      const plan = await planFor({
-        cfg: {
-          agents: {
-            defaults: {
-              model: { primary: "minimax/MiniMax-M2.7" },
-              subagents: { model: defaultModel },
-            },
-            entries: { research: targetAgentConfig },
-          },
-        },
-        targetAgentConfig,
-      });
-      expect(plan.status).toBe("ok");
-      if (plan.status !== "ok") {
-        throw new Error(plan.error);
-      }
-      expect(plan).toMatchObject({ resolvedModel: `${provider}/${model}` });
-      expect(plan.initialSessionPatch).toMatchObject({
-        modelProvider: provider,
-        model,
-        modelOverrideSource: "auto",
-      });
-      expect(plan.initialSessionPatch.modelOverrideFallbackOriginProvider).toBe(
-        hasOrigin ? provider : undefined,
-      );
-      expect(plan.initialSessionPatch.modelOverrideFallbackOriginModel).toBe(
-        hasOrigin ? model : undefined,
-      );
-    },
-  );
-});
-
-describe("subagent thinking precedence", () => {
-  it.each([
-    ["requester over target", "low", "medium", "high", "high", undefined, "low", "low"],
-    ["target off over global", undefined, "off", "high", "high", undefined, "off", "off"],
-    ["global over caller", undefined, undefined, "high", "medium", undefined, "high", "high"],
-    ["inherited caller off", undefined, undefined, undefined, "off", undefined, "off", undefined],
-    ["request over requester", "low", "medium", "high", "off", "xhigh", "xhigh", "xhigh"],
-  ] as const)(
-    "preserves %s",
-    (_name, requester, target, global, caller, requestOverride, expected, override) => {
-      expect(
-        resolveSubagentThinkingOverride({
-          cfg: { agents: { defaults: { subagents: { thinking: global } } } },
-          requesterAgentConfig: { subagents: { thinking: requester } },
-          targetAgentConfig: { subagents: { thinking: target } },
-          thinkingOverrideRaw: requestOverride,
-          callerThinkingRaw: caller,
-        }),
-      ).toEqual({
-        status: "ok",
-        thinkingOverride: override,
-        initialSessionPatch: expected === undefined ? {} : { thinkingLevel: expected },
-      });
-    },
-  );
-});
+  },
+);

@@ -1,5 +1,4 @@
 import path from "node:path";
-import { createAssistantMessageEventStream, type Model } from "openclaw/plugin-sdk/llm";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
@@ -45,6 +44,7 @@ import {
   createAssistant,
   createAssistantResultStream,
   createTestSession,
+  holdAssistantResponse,
   registerAgentSessionLoopTestLifecycle,
   streamMocks,
 } from "./sessions/agent-session-loop-correctness.test-support.js";
@@ -76,6 +76,28 @@ function userEntries(scope: Parameters<typeof SessionManager.open>[0], dir: stri
       entry.type === "message" && entry.message.role === "user" ? [entry.message] : [],
     );
 }
+async function steeringFixture(sessionKey: string, alternateStore = false, updatedAt = Date.now()) {
+  const dir = tempDirs.make("openclaw-steering-");
+  const scope = {
+    agentId: "leasing-ops",
+    sessionId: "caller-active-session",
+    sessionKey,
+    storePath: alternateStore
+      ? resolveSessionStorePathCore(undefined, { agentId: "leasing-ops" })
+      : path.join(dir, "sessions.json"),
+  };
+  const testConfig = {
+    ...config,
+    session: {
+      ...config.session,
+      store: alternateStore
+        ? path.join(dir, "agents", "{agentId}", "sessions", "sessions.json")
+        : scope.storePath,
+    },
+  };
+  await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt });
+  return { dir, scope, testConfig };
+}
 registerAgentSessionLoopTestLifecycle();
 beforeEach(() => {
   resetGatewayWorkAdmission();
@@ -92,17 +114,14 @@ it.each(["missing", "different", "different account"] as const)(
   "explicit sessions_send steering refuses %s requester identity without starting other work",
   async (identity) => {
     const targetKey = "agent:leasing-ops:dashboard:active-target";
-    const dir = tempDirs.make("openclaw-sessions-requester-refusal-");
-    const storePath = path.join(dir, "sessions.json");
-    await upsertSessionEntryCore(
-      { agentId: "leasing-ops", sessionKey: targetKey, storePath },
-      { sessionId: "caller-active-session", updatedAt: 1 },
-    );
+    const {
+      scope: { storePath },
+      testConfig,
+    } = await steeringFixture(targetKey, false, 1);
     await upsertSessionEntryCore(
       { agentId: "re-portal", sessionKey: requesterKey, storePath },
       { sessionId: "requester-session", updatedAt: 1 },
     );
-    const testConfig = { ...config, session: { ...config.session, store: storePath } };
     const queue = await activeRun(targetKey, {
       config: testConfig,
       requesterSessionKey: requesterKey,
@@ -150,29 +169,12 @@ it.each([
       mode === "steer"
         ? "agent:leasing-ops:dashboard:active-target"
         : "agent:leasing-ops:cron:monthly-utility:run:run-fast";
-    const dir = tempDirs.make("openclaw-sessions-steered-provenance-");
-    const scope = {
-      agentId: "leasing-ops",
-      sessionId: "caller-active-session",
-      sessionKey: runScopedCallerKey,
-      storePath: alternateStore
-        ? resolveSessionStorePathCore(undefined, { agentId: "leasing-ops" })
-        : path.join(dir, "sessions.json"),
-    };
-    const testConfig = {
-      ...config,
-      session: {
-        ...config.session,
-        store: alternateStore
-          ? path.join(dir, "agents", "{agentId}", "sessions", "sessions.json")
-          : scope.storePath,
-      },
-    };
-    await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: Date.now() });
+    const { dir, scope, testConfig } = await steeringFixture(runScopedCallerKey, alternateStore);
     const sessionManager = SessionManager.open(scope, dir);
     guardSessionManager(sessionManager);
     const { session } = await createTestSession({ sessionManager });
-    let finishInitialResponse: (() => void) | undefined;
+    const held = holdAssistantResponse("ready");
+    let responding = false;
     let closing = false;
     const initialResponseStarted = createDeferred();
     const queued = createDeferred();
@@ -181,23 +183,13 @@ it.each([
         queued.resolve();
       }
     });
-    streamMocks.streamSimple.mockImplementation((model: Model) => {
-      if (finishInitialResponse || closing) {
-        return createAssistantResultStream(
-          createAssistant(model, [{ type: "text", text: "received" }]),
-        );
+    streamMocks.streamSimple.mockImplementation((model) => {
+      if (responding || closing) {
+        return createAssistantResultStream(createAssistant(model, "received"));
       }
-      const stream = createAssistantMessageEventStream();
-      finishInitialResponse = () => {
-        stream.push({
-          type: "done",
-          reason: "stop",
-          message: createAssistant(model, [{ type: "text", text: "ready" }]),
-        });
-        stream.end();
-      };
+      responding = true;
       initialResponseStarted.resolve();
-      return stream;
+      return held.response;
     });
     const prompt = session.prompt("wait for another session");
     const pending: Promise<unknown>[] = [prompt];
@@ -241,9 +233,8 @@ it.each([
           projectSessionMessages: false,
         });
       }
-      callGatewayMock.mockImplementation(async (opts: unknown) => {
-        const request = opts as { method?: string };
-        if (request.method === "agent") {
+      callGatewayMock.mockImplementation(async ({ method }: { method?: string }) => {
+        if (method === "agent") {
           throw new Error("fallback agent should not start");
         }
         return {};
@@ -282,7 +273,7 @@ it.each([
         expect(session.pendingMessageCount).toBe(1);
         expect(userEntries(scope, dir)).toHaveLength(1);
       }
-      finishInitialResponse?.();
+      held.release();
       const [result] = await Promise.all([send, prompt]);
 
       expect(result.details).toMatchObject({
@@ -322,7 +313,7 @@ it.each([
       // Release even a late provider callback, then join work before fixture teardown.
       closing = true;
       unsubscribe();
-      finishInitialResponse?.();
+      held.release();
       await session.abort();
       await Promise.allSettled(pending);
       clearAgentRunContext(runId);

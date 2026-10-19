@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
+import { afterEach, beforeEach, expect, it, vi, type Mock } from "vitest";
 import { clearRuntimeConfigSnapshot, setRuntimeConfigSnapshot } from "../config/io.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { createOpenClawTools, createOpenClawToolsAsync } from "./openclaw-tools.js";
@@ -52,164 +52,142 @@ function createTools(options: OpenClawToolsOptions) {
 function expectOptions(mock: Mock, options: object, ...rest: unknown[]) {
   expect(mock).toHaveBeenLastCalledWith(expect.objectContaining(options), ...rest);
 }
+const channelCaller = {
+  kind: "channel",
+  channel: "discord",
+  accountId: "delivery",
+  senderId: "requester",
+};
+const cronKey = "agent:main:cron:daily-media";
+const cronRunKey = `${cronKey}:run:run-123`;
+const qaKey = "agent:main:qa-channel:default:direct:media-requester";
 
-const mediaConfig = {
-  agents: {
-    defaults: {
-      mediaModels: {
-        image: { primary: "image-owner/model" },
-        music: { primary: "music-owner/model" },
-        video: { primary: "video-owner/model" },
-      },
-    },
-  },
-} satisfies OpenClawConfig;
+beforeEach(() => {
+  setRuntimeConfigSnapshot({});
+  vi.clearAllMocks();
+});
+afterEach(() => clearRuntimeConfigSnapshot());
 
-describe("createOpenClawTools context wiring", () => {
-  beforeEach(() => {
-    setRuntimeConfigSnapshot({});
-    vi.clearAllMocks();
+it("passes the session agent and active account configuration into TTS", async () => {
+  const config = {
+    agents: { entries: { reader: {}, main: {} } },
+    channels: { feishu: { accounts: { "feishu-main": { tts: { provider: "microsoft" } } } } },
+  } satisfies OpenClawConfig;
+  const tool = createTools({
+    config,
+    agentSessionKey: "agent:reader:feishu:chat:123",
+    agentChannel: "feishu",
+    agentAccountId: "feishu-main",
+  }).find((candidate) => candidate.name === "tts");
+  expect(tool).toBeDefined();
+  await tool?.execute("call-1", { text: "hello from reader" });
+  expectOptions(mocks.textToSpeech, {
+    text: "hello from reader",
+    agentId: "reader",
+    channel: "feishu",
+    accountId: "feishu-main",
   });
-  afterEach(() => clearRuntimeConfigSnapshot());
+  expect(mocks.textToSpeech.mock.calls[0]?.[0].cfg).toBe(config);
+});
 
-  it("passes the session agent and active account configuration into TTS", async () => {
-    const config = {
-      agents: { entries: { reader: {}, main: {} } },
-      channels: { feishu: { accounts: { "feishu-main": { tts: { provider: "microsoft" } } } } },
-    } satisfies OpenClawConfig;
-    const tool = createTools({
-      config,
-      agentSessionKey: "agent:reader:feishu:chat:123",
-      agentChannel: "feishu",
-      agentAccountId: "feishu-main",
-    }).find((candidate) => candidate.name === "tts");
-    expect(tool).toBeDefined();
-    await tool?.execute("call-1", { text: "hello from reader" });
-    expectOptions(mocks.textToSpeech, {
-      text: "hello from reader",
-      agentId: "reader",
-      channel: "feishu",
-      accountId: "feishu-main",
-    });
-    expect(mocks.textToSpeech.mock.calls[0]?.[0].cfg).toBe(config);
+it.each([
+  ["delivery account", {}, { caller: expect.objectContaining(channelCaller) }],
+  ["missing channel", { gatewayCallerChannel: null }, { callerUnavailable: true }],
+  ["local caller", { gatewayCallerLocal: true }, { callerUnavailable: true }],
+  [
+    "local schedule",
+    { gatewayCallerLocal: true, gatewayCallerScheduled: true },
+    { caller: { kind: "operator", source: "scheduled" } },
+  ],
+] as const)("constructs transcripts with %s provenance", (scenario, options, expected) => {
+  createTools({
+    agentChannel: "discord",
+    agentAccountId: "delivery",
+    gatewayCallerAccountId: scenario === "delivery account" ? undefined : "creator",
+    requesterSenderId: scenario === "local schedule" ? undefined : "requester",
+    ...options,
   });
-
-  it("uses the delivery account when no separate transcript authority exists", () => {
-    createTools({
-      agentChannel: "discord",
-      agentAccountId: "delivery",
-      requesterSenderId: "requester",
-    });
-    expectOptions(mocks.transcripts, {
-      caller: expect.objectContaining({
-        kind: "channel",
-        channel: "discord",
-        accountId: "delivery",
-        senderId: "requester",
-      }),
-    });
-  });
-
-  it("refuses transcripts when caller-channel provenance is unavailable", () => {
-    const caller = {
-      agentChannel: "discord",
-      agentAccountId: "delivery",
-      gatewayCallerAccountId: "creator",
-      requesterSenderId: "requester",
-    };
-    // The definition stays offered; without a caller the tool refuses every call.
-    createTools({ ...caller, gatewayCallerChannel: null });
-    expectOptions(mocks.transcripts, { callerUnavailable: true });
+  expectOptions(mocks.transcripts, expected);
+  if (scenario === "missing channel") {
     expect(mocks.transcripts.mock.lastCall?.[0]).not.toHaveProperty("caller");
-    createTools({ ...caller, gatewayCallerLocal: true });
-    expectOptions(mocks.transcripts, { callerUnavailable: true });
-  });
+  }
+});
 
-  it("keeps transcripts channel-less for explicit local scheduled provenance", () => {
-    createTools({
-      agentChannel: "discord",
-      agentAccountId: "delivery",
-      gatewayCallerAccountId: "creator",
-      gatewayCallerLocal: true,
-      gatewayCallerScheduled: true,
-    });
-    expectOptions(mocks.transcripts, { caller: { kind: "operator", source: "scheduled" } });
-  });
-
-  it.each([
-    [
-      "agent:main:cron:daily-media",
-      "agent:main:cron:daily-media:run:run-123",
-      "agent:main:cron:daily-media:run:run-123",
-    ],
-    [
-      "agent:main:qa-channel:default:direct:media-requester",
-      "agent:main:main",
-      "agent:main:qa-channel:default:direct:media-requester",
-    ],
-    ["agent:main:policy", "agent:work:run", "agent:main:policy"],
-  ])(
-    "passes a separate durable requester key for background media from %s",
-    async (agentSessionKey, runSessionKey, taskSessionKey) => {
-      await createOpenClawToolsAsync({
-        disableMessageTool: true,
-        disablePluginTools: true,
-        authProfileStore: { version: 1, profiles: {} },
-        config: {
-          ...mediaConfig,
-          agents: { ...mediaConfig.agents, entries: { main: {}, work: {} } },
-        },
-        agentSessionKey,
-        sandboxAgentId: "main",
-        sandboxed: true,
-        runSessionKey,
-        onYield: vi.fn(),
-      });
-      for (const factory of [mocks.image, mocks.video, mocks.music]) {
-        expectOptions(
-          factory,
-          {
-            agentSessionKey: taskSessionKey,
-            requesterRunSessionKey: runSessionKey,
-            sandboxSessionKey: agentSessionKey,
-            sandboxAgentId: "main",
-            requesterAgentId: runSessionKey.startsWith("agent:work:") ? "work" : "main",
+it.each([
+  [cronKey, cronRunKey, cronRunKey],
+  [qaKey, "agent:main:main", qaKey],
+  ["agent:main:policy", "agent:work:run", "agent:main:policy"],
+])(
+  "passes a separate durable requester key for background media from %s",
+  async (agentSessionKey, runSessionKey, taskSessionKey) => {
+    await createOpenClawToolsAsync({
+      disableMessageTool: true,
+      disablePluginTools: true,
+      authProfileStore: { version: 1, profiles: {} },
+      config: {
+        agents: {
+          entries: { main: {}, work: {} },
+          defaults: {
+            mediaModels: {
+              image: { primary: "image-owner/model" },
+              music: { primary: "music-owner/model" },
+              video: { primary: "video-owner/model" },
+            },
           },
-          true,
-        );
-      }
-    },
-  );
+        },
+      },
+      agentSessionKey,
+      sandboxAgentId: "main",
+      sandboxed: true,
+      runSessionKey,
+      onYield: vi.fn(),
+    });
+    const expectedOptions = {
+      agentSessionKey: taskSessionKey,
+      requesterRunSessionKey: runSessionKey,
+      sandboxSessionKey: agentSessionKey,
+      sandboxAgentId: "main",
+      requesterAgentId: runSessionKey.startsWith("agent:work:") ? "work" : "main",
+    };
+    for (const factory of [mocks.image, mocks.video, mocks.music]) {
+      expectOptions(factory, expectedOptions, true);
+    }
+  },
+);
 
-  it("passes preserved channel delivery context into cron", () => {
-    const sessionKey = "agent:main:matrix:channel:!abcdef1234567890:example.org";
-    createTools({
-      agentSessionKey: sessionKey,
+it.each([
+  [
+    "channel delivery",
+    {
+      agentSessionKey: "agent:main:matrix:channel:!abcdef1234567890:example.org",
       agentChannel: "matrix",
       agentAccountId: "bot-a",
       agentTo: "room:!FallbackRoom:Example.Org",
       agentThreadId: "$FallbackThread:Example.Org",
       currentChannelId: "room:!AbCdEf1234567890:example.org",
       currentThreadTs: "$RootEvent:Example.Org",
-    });
-    expectOptions(mocks.cron, {
+    },
+    {
       currentDeliveryContext: {
         channel: "matrix",
         to: "room:!AbCdEf1234567890:example.org",
         accountId: "bot-a",
         threadId: "$RootEvent:Example.Org",
       },
-    });
-  });
-
-  it("passes self-remove scope into cron", () => {
-    createTools({
+    },
+  ],
+  [
+    "self-remove scope",
+    {
       agentSessionKey: "agent:main:cron:job-current",
       cronSelfRemoveOnlyJobId: "job-current",
-    });
-    expectOptions(mocks.cron, {
+    },
+    {
       agentSessionKey: "agent:main:cron:job-current",
       selfRemoveOnlyJobId: "job-current",
-    });
-  });
+    },
+  ],
+] as const)("passes %s into cron", (_name, options, expected) => {
+  createTools(options);
+  expectOptions(mocks.cron, expected);
 });
