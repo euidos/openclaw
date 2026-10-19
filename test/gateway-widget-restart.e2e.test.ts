@@ -177,7 +177,9 @@ it.skipIf(process.platform === "win32")(
             const { buildId } = asRecord(
               JSON.parse(await readFile("dist/build-info.json", "utf8")),
             );
-            expect(typeof buildId).toBe("string");
+            if (typeof buildId !== "string") {
+              throw new Error("Widget recovery fixture requires a runtime build ID");
+            }
             const controlUiRoot = instance.state.path("control-ui");
             await mkdir(controlUiRoot, { recursive: true });
             await writeFile(
