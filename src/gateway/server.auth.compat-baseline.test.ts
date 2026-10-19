@@ -60,7 +60,11 @@ async function expectProxyUpgradeRejected(port: number, headers: Record<string, 
   });
 }
 
-async function withSocket(port: number, run: (ws: WebSocket) => Promise<void>, origin?: string) {
+async function withSocket(
+  port: number,
+  origin: string | undefined,
+  run: (ws: WebSocket) => Promise<void>,
+) {
   const ws = await openWs(port, origin ? { origin } : undefined);
   try {
     await run(ws);
@@ -74,7 +78,7 @@ async function expectLocalSharedAuthScopesPreserved(
   auth: { token?: string; password?: string; skipDefaultAuth?: boolean },
   client: typeof BACKEND_GATEWAY_CLIENT | typeof CLI_CLIENT,
 ) {
-  await withSocket(port, async (ws) => {
+  await withSocket(port, undefined, async (ws) => {
     const res = await connectReq(ws, {
       ...auth,
       client,
@@ -116,9 +120,7 @@ describe("gateway auth compatibility baseline", () => {
     );
 
     test("keeps local backend device-token reconnects out of pairing", async () => {
-      const identityPath = makeIdentityPath(
-        `openclaw-backend-device-${process.pid}-${gateway.port}.sqlite`,
-      );
+      const identityPath = makeIdentityPath("backend-device");
       const { loadOrCreateDeviceIdentity, publicKeyRawBase64UrlFromPem } =
         await import("../infra/device-identity.js");
       const { approveDevicePairing } = await import("../infra/device-pairing-approval.js");
@@ -148,7 +150,7 @@ describe("gateway auth compatibility baseline", () => {
       expect(rotatedToken).toBeTypeOf("string");
       expect(rotatedToken.length).toBeGreaterThan(0);
 
-      await withSocket(gateway.port, async (ws) => {
+      await withSocket(gateway.port, undefined, async (ws) => {
         const res = await connectReq(ws, {
           skipDefaultAuth: true,
           client: { ...BACKEND_GATEWAY_CLIENT },
@@ -201,25 +203,21 @@ describe("gateway auth compatibility baseline", () => {
     });
 
     test("rejects auth-none browser-origin backend connects without device identity", async () => {
-      await withSocket(
-        gateway.port,
-        async (ws) => {
-          const res = await connectReq(ws, {
-            skipDefaultAuth: true,
-            client: { ...BACKEND_GATEWAY_CLIENT },
-            scopes: ["operator.admin"],
-            device: null,
-          });
-          expect(res).toMatchObject({
-            ok: false,
-            error: {
-              message: expect.stringContaining("device identity required"),
-              details: { code: ConnectErrorDetailCodes.DEVICE_IDENTITY_REQUIRED },
-            },
-          });
-        },
-        originForPort(gateway.port),
-      );
+      await withSocket(gateway.port, originForPort(gateway.port), async (ws) => {
+        const res = await connectReq(ws, {
+          skipDefaultAuth: true,
+          client: { ...BACKEND_GATEWAY_CLIENT },
+          scopes: ["operator.admin"],
+          device: null,
+        });
+        expect(res).toMatchObject({
+          ok: false,
+          error: {
+            message: expect.stringContaining("device identity required"),
+            details: { code: ConnectErrorDetailCodes.DEVICE_IDENTITY_REQUIRED },
+          },
+        });
+      });
     });
   });
 });

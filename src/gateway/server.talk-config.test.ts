@@ -54,12 +54,8 @@ async function writeTalkConfig(config: { apiKey?: string | typeof secretRef; voi
   await writeConfigFile({ talk: { provider: PROVIDER, providers: { [PROVIDER]: config } } });
 }
 
-async function fetchConfig(ws: GatewaySocket, params: Record<string, unknown> = {}) {
-  return rpcReq<TalkConfigResult>(ws, "talk.config", params, 60_000);
-}
-
 async function fetchOkConfig(ws: GatewaySocket, params: Record<string, unknown> = {}) {
-  const res = await fetchConfig(ws, params);
+  const res = await rpcReq<TalkConfigResult>(ws, "talk.config", params, 60_000);
   expect(res.ok, JSON.stringify(res.error)).toBe(true);
   return res.payload;
 }
@@ -73,8 +69,7 @@ function expectProvider(
   sourceKey: unknown,
   resolvedKey: unknown = sourceKey,
 ) {
-  expect(talk?.provider).toBe(PROVIDER);
-  expect(talk?.resolved?.provider).toBe(PROVIDER);
+  expect([talk?.provider, talk?.resolved?.provider]).toEqual([PROVIDER, PROVIDER]);
   for (const config of [talk?.providers?.[PROVIDER], talk?.resolved?.config]) {
     if (voiceId === undefined) {
       expect(config).not.toHaveProperty("voiceId");
@@ -129,13 +124,10 @@ it("returns redacted talk config for read scope", async () => {
 });
 
 it.each([
-  {
-    includeSecrets: "yes",
-    error: { message: expect.stringContaining("invalid talk.config params") },
-  },
-  {
-    includeSecrets: true,
-    error: {
+  ["yes", { message: expect.stringContaining("invalid talk.config params") }],
+  [
+    true,
+    {
       code: "FORBIDDEN",
       message: "missing scope: operator.talk.secrets",
       details: {
@@ -144,17 +136,14 @@ it.each([
         requiredScopes: ["operator.read", "operator.talk.secrets"],
       },
     },
-  },
-] as const)(
-  "rejects includeSecrets=$includeSecrets with only read scope",
-  async ({ includeSecrets, error }) => {
-    await writeTalkConfig({ apiKey: "secret-key-abc" });
-    const response = await withConnection(["operator.read"], (ws) =>
-      fetchConfig(ws, { includeSecrets }),
-    );
-    expect(response).toMatchObject({ ok: false, error });
-  },
-);
+  ],
+] as const)("rejects includeSecrets=%s with only read scope", async (includeSecrets, error) => {
+  await writeTalkConfig({ apiKey: "secret-key-abc" });
+  const response = await withConnection(["operator.read"], (ws) =>
+    rpcReq<TalkConfigResult>(ws, "talk.config", { includeSecrets }, 60_000),
+  );
+  expect(response).toMatchObject({ ok: false, error });
+});
 
 it("returns secrets for operator.admin scope", async () => {
   await writeTalkConfig({ apiKey: "secret-key-abc" });

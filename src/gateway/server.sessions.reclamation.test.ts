@@ -7,6 +7,7 @@ import { resolveSqliteTargetFromSessionStorePath } from "../config/sessions/sess
 import { createSessionTranscriptFtsInserter } from "../config/sessions/session-transcript-fts.js";
 import { listSessionsNeedingTranscriptIndexReconcile } from "../config/sessions/session-transcript-index.js";
 import { createTranscriptEventInserter } from "../config/sessions/transcript-payload.js";
+import { runSqliteImmediateTransactionSync } from "../infra/sqlite-transaction.js";
 import { openOpenClawAgentDatabase } from "../state/openclaw-agent-db.js";
 import { rpcReq, writeSessionStore } from "./test-helpers.js";
 import {
@@ -20,8 +21,6 @@ const CANONICAL_SESSION_KEY = `agent:main:${SESSION_KEY}`;
 const HISTORICAL_SESSION_ID = "phase3-reclamation-e2e-history";
 const UNRELATED_SESSION_ID = "phase3-reclamation-unrelated";
 const UNRELATED_SESSION_KEY = "discord:group:phase3-reclamation-unrelated";
-const ROWS = 200_000;
-
 const { createSessionStoreDir, openClient } = setupGatewaySessionsTestHarness();
 
 function countRows(
@@ -47,17 +46,15 @@ function openDatabase(storePath: string) {
 function seedTranscriptState(storePath: string): void {
   const database = openDatabase(storePath);
   const now = Date.now();
-  const eventJson = JSON.stringify({
-    type: "message",
-    message: { content: "phase3 e2e transcript message", role: "user" },
-  });
+  const message = { content: "phase3 e2e transcript message", role: "user" };
+  const eventJson = JSON.stringify({ type: "message", message });
   // The fixture is already projected; NULL eligibility would schedule an
   // unrelated background index rebuild during the deletion measurement.
   const insertActive = database.db.prepare(
     `INSERT INTO session_transcript_active_events
      (session_id, active_position, event_seq, message_position, context_eligible) VALUES (?, ?, ?, ?, 1)`,
   );
-  const ftsFields = { text: "phase3 e2e transcript message", role: "user", timestamp: now };
+  const ftsFields = { text: message.content, role: message.role, timestamp: now };
   const insertIndex = database.db.prepare(
     `INSERT INTO session_transcript_index_state
      (session_id, indexed_seq, needs_rebuild, active_event_count, active_message_count, updated_at)
@@ -66,9 +63,7 @@ function seedTranscriptState(storePath: string): void {
   const insertWatermark = database.db.prepare(
     `INSERT INTO transcript_rewrite_watermarks (session_id, generation, updated_at) VALUES (?, ?, ?)`,
   );
-  // sqlite-allow-raw -- bulk fixture setup stays outside the measured delete path.
-  database.db.exec("BEGIN IMMEDIATE");
-  try {
+  runSqliteImmediateTransactionSync(database.db, () => {
     database.db
       .prepare(
         `INSERT INTO session_windows (session_id, session_key, reason, session_scope, created_at, updated_at)
@@ -82,7 +77,7 @@ function seedTranscriptState(storePath: string): void {
       )
       .run(HISTORICAL_SESSION_ID, SESSION_ID);
     for (const [sessionId, rows, generation] of [
-      [SESSION_ID, ROWS, "phase3-e2e-generation"],
+      [SESSION_ID, 200_000, "phase3-e2e-generation"],
       [HISTORICAL_SESSION_ID, 1, "phase3-e2e-current-generation"],
       [UNRELATED_SESSION_ID, 1, "phase3-unrelated-generation"],
     ] as const) {
@@ -101,13 +96,7 @@ function seedTranscriptState(storePath: string): void {
       insertIndex.run(sessionId, rows - 1, rows, rows, now);
       insertWatermark.run(sessionId, generation, now);
     }
-    // sqlite-allow-raw -- commits the deterministic fixture before measurement.
-    database.db.exec("COMMIT");
-  } catch (error) {
-    // sqlite-allow-raw -- releases the failed fixture transaction.
-    database.db.exec("ROLLBACK");
-    throw error;
-  }
+  });
   expect(listSessionsNeedingTranscriptIndexReconcile(database.db)).toEqual([]);
 }
 

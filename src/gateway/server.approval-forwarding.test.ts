@@ -7,6 +7,7 @@ import type { ChannelPlugin } from "../channels/plugins/types.public.js";
 import { writeConfigFile } from "../config/config.js";
 import { resolveStateDir } from "../config/paths.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { waitForAbortSignal } from "../infra/abort-signal.js";
 import { getGatewayNativeApprovalRuntime } from "../infra/approval-gateway-runtime-context.js";
 import type { GatewayNativeApprovalRuntime } from "../infra/approval-gateway-runtime.types.js";
 import { waitForGatewayActiveWork } from "../infra/gateway-active-work.js";
@@ -56,9 +57,7 @@ async function checkApprovalForwarding() {
         capturedRuntime.resolve(
           expectDefined(getGatewayNativeApprovalRuntime(), "channel Gateway approval runtime"),
         );
-        await new Promise<void>((resolve) => {
-          abortSignal.addEventListener("abort", () => resolve(), { once: true });
-        });
+        await waitForAbortSignal(abortSignal);
       },
     },
   };
@@ -146,17 +145,11 @@ async function checkApprovalForwarding() {
       });
       expect(response.ok).toBe(true);
       const { id, status } = expectDefined(response.payload, "pending approval response");
+      const prompts = () => deliveries.filter((delivery) => delivery.text.includes(title));
       try {
         expect(status).toBe("accepted");
         if (forwarded) {
-          await vi.waitFor(
-            () => {
-              expect(deliveries, JSON.stringify(response.payload)).toContainEqual(
-                expect.objectContaining({ to: "123", text: expect.stringContaining(title) }),
-              );
-            },
-            { timeout: 5_000 },
-          );
+          await vi.waitFor(() => expect(prompts()).not.toHaveLength(0), { timeout: 5_000 });
         }
       } finally {
         const resolved = await rpcReq(ws, "plugin.approval.resolve", {
@@ -166,10 +159,9 @@ async function checkApprovalForwarding() {
         expect(resolved.ok).toBe(true);
         expect((await waitForGatewayActiveWork(5_000)).drained).toBe(true);
       }
-      const prompts = deliveries.filter((delivery) => delivery.text.includes(title));
-      expect(prompts).toHaveLength(forwarded ? 1 : 0);
+      expect(prompts()).toHaveLength(forwarded ? 1 : 0);
       if (forwarded) {
-        expect(prompts[0]).toMatchObject({
+        expect(prompts()[0]).toMatchObject({
           to: "123",
           text: expect.stringContaining(id),
           accountId: turnSourceChannel === "telegram" ? "default" : undefined,

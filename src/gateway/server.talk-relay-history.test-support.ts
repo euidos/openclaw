@@ -174,13 +174,11 @@ export async function runTalkRelayCloseHistory(input: {
     releaseModel.resolve();
     await waitForDispatchEnd();
     await input.drainPublications();
-    const expectedAnswers = input.spokenReplacement ? [spokenAnswer] : [];
-    if (input.disposition === "detach") {
-      expectedAnswers.push(answer);
-    }
-    if (input.pendingFollowUp) {
-      expectedAnswers.push(followUpAnswer);
-    }
+    const expectedAnswers = [
+      ...(input.spokenReplacement ? [spokenAnswer] : []),
+      ...(input.disposition === "detach" ? [answer] : []),
+      ...(input.pendingFollowUp ? [followUpAnswer] : []),
+    ];
     expect(
       (await input.historyMessages())
         .map(extractText)
@@ -201,9 +199,8 @@ export async function runTalkRelayCloseHistory(input: {
       expect(input.liveMessages().map(extractText)).toContain(answer);
       expect(stored.at(-1)?.display).toBeUndefined();
       if (input.afterFinal) {
-        expect(stored[0]?.display).toBe(false);
+        expect(stored[0]).toMatchObject({ display: false, usage: { input: 10, totalTokens: 10 } });
         expect(stored[1]?.excludeFromContext).toBe(true);
-        expect(stored[0]?.usage).toMatchObject({ input: 10, totalTokens: 10 });
         expect(stored[1]?.usage).toBeUndefined();
       }
     }

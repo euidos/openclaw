@@ -153,7 +153,8 @@ test.each(["write-error", "closed-before-callback"] as const)(
       let failNextHello = true;
       expect((await reader.connect()).ok).toBe(true);
       const originalSend = Reflect.get(WebSocket.prototype, "send");
-      const sendSpy = vi.spyOn(WebSocket.prototype, "send").mockImplementation(function (
+      using sendSpy = vi.spyOn(WebSocket.prototype, "send");
+      sendSpy.mockImplementation(function (
         this: WebSocket,
         ...args: Parameters<WebSocket["send"]>
       ) {
@@ -173,37 +174,26 @@ test.each(["write-error", "closed-before-callback"] as const)(
         }
         Reflect.apply(originalSend, this, args);
       });
-      try {
-        const closed = once(joining.socket, "close");
-        const disconnected = waitForPresence(
-          reader.socket,
-          (entry) => entry.instanceId === failedInstanceId && entry.reason === "disconnect",
-        );
-        await Promise.all([
-          expect(joining.connect()).rejects.toThrow(/closed/),
-          closed,
-          disconnected,
-          (async () => {
-            const failHello = await pendingHello.promise;
-            try {
-              const published = waitForPresence(
-                reader.socket,
-                (entry) => entry.instanceId === "presence-publisher",
-              );
-              const [result] = await Promise.all([publisher.connect(), published]);
-              expect(result.ok).toBe(true);
-            } finally {
-              failHello();
-            }
-          })(),
-        ]);
-        expect(failNextHello).toBe(false);
-        const reasons = presenceReasons(reader.frames, failedInstanceId);
-        expect(reasons).not.toContain("connect");
-        expect(reasons).toContain("disconnect");
-      } finally {
-        sendSpy.mockRestore();
-      }
+      const closed = once(joining.socket, "close");
+      const disconnected = waitForPresence(
+        reader.socket,
+        (entry) => entry.instanceId === failedInstanceId && entry.reason === "disconnect",
+      );
+      await Promise.all([
+        expect(joining.connect()).rejects.toThrow(/closed/),
+        closed,
+        disconnected,
+        pendingHello.promise.then((failHello) =>
+          Promise.all([
+            waitForPresence(reader.socket, (entry) => entry.instanceId === "presence-publisher"),
+            expect(publisher.connect()).resolves.toMatchObject({ ok: true }),
+          ]).finally(failHello),
+        ),
+      ]);
+      expect(failNextHello).toBe(false);
+      const reasons = presenceReasons(reader.frames, failedInstanceId);
+      expect(reasons).not.toContain("connect");
+      expect(reasons).toContain("disconnect");
     });
   },
 );
