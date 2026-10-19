@@ -2,6 +2,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import path from "node:path";
+import { readSessionMessageIdentity } from "@openclaw/gateway-client/browser";
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import type { Locator, Page } from "playwright";
 import { expect, it } from "vitest";
@@ -17,6 +18,7 @@ import {
 import { runQaGatewayFixture } from "../../../test/helpers/qa-gateway-cleanup.ts";
 import type { ChatPaneElement } from "../pages/chat/chat-pane.tsx";
 import type { ChatState } from "../pages/chat/chat-state-contract.ts";
+import type { ChatPageHost } from "../pages/chat/chat-state-host.ts";
 import { pairControlUiPage } from "../test-helpers/control-ui-browser-pairing.ts";
 import { createControlUiE2eArtifactDir } from "../test-helpers/control-ui-e2e-artifacts.ts";
 import { waitForControlUiGatewayReady } from "../test-helpers/control-ui-e2e-readiness.ts";
@@ -471,6 +473,120 @@ suite.define(() => {
                   )
                   .toEqual([true, true]);
               };
+              // Read persisted history through its real owner, never pre-seed ordered content.
+              const history = asOptionalRecord(
+                JSON.parse(
+                  await runCli([
+                    "gateway",
+                    "call",
+                    "chat.history",
+                    "--json",
+                    "--params",
+                    JSON.stringify({ sessionKey, limit: 20 }),
+                  ]),
+                ),
+              );
+              const messages = Array.isArray(history?.messages) ? history.messages : [];
+              const assistants = messages
+                .map(asOptionalRecord)
+                .filter((message) => message?.role === "assistant");
+              expect(assistants).toHaveLength(1);
+              const content = assistants[0]?.content;
+              const blocks = Array.isArray(content) ? content.map(asOptionalRecord) : [];
+              const persistedOrder = blocks.flatMap((block) => {
+                if (block?.type === "image") {
+                  return ["image"];
+                }
+                if (block?.type !== "text" || typeof block.text !== "string") {
+                  return [];
+                }
+                const text = block.text;
+                return [intro, firstHeading, secondHeading, closing]
+                  .filter((label) => text.includes(label))
+                  .toSorted((left, right) => text.indexOf(left) - text.indexOf(right));
+              });
+              expect(persistedOrder).toEqual([
+                intro,
+                firstHeading,
+                "image",
+                secondHeading,
+                "image",
+                closing,
+              ]);
+              const images = blocks.filter((block) => block?.type === "image");
+              expect(images).toHaveLength(2);
+              const artifactIds = images.map((image) => image?.artifactId);
+              for (const id of artifactIds) {
+                expect(id).toMatch(/^artifact_managed_image_/u);
+              }
+              expect(new Set(artifactIds).size).toBe(2);
+              expect(JSON.stringify(assistants)).not.toContain("MEDIA:");
+              expect(JSON.stringify(assistants)).not.toContain(instance.stateDir);
+
+              const assistantId = readSessionMessageIdentity(assistants[0])?.id ?? null;
+              const sessionId =
+                asOptionalRecord(history?.sessionInfo)?.sessionId ?? history?.sessionId;
+              const cursor = history?.deltaCursor;
+              expect(assistantId).toBeTypeOf("string");
+              expect(sessionId).toBeTypeOf("string");
+              expect(cursor).toBeTypeOf("string");
+              // Live previews may decode before history adopts their canonical sources.
+              await expect
+                .poll(async () => {
+                  const adopted = await page
+                    .locator(".chat-pane-cache__pane--active")
+                    .evaluate((element, expectedAssistantId) => {
+                      const state = (element as HTMLElement & { state: ChatPageHost }).state;
+                      const message = state.chatMessages.find((value) => {
+                        if (!value || typeof value !== "object" || !("__openclaw" in value)) {
+                          return false;
+                        }
+                        const identity = value["__openclaw"];
+                        return (
+                          identity &&
+                          typeof identity === "object" &&
+                          "id" in identity &&
+                          identity.id === expectedAssistantId
+                        );
+                      });
+                      return {
+                        sessionKey: state.sessionKey,
+                        sessionId: state.currentSessionId,
+                        loading: state.chatLoading,
+                        cursor: state.chatHistoryCursor,
+                        message,
+                        rendered: Array.from(
+                          element.querySelectorAll(".chat-group.assistant .chat-bubble"),
+                        ).some(
+                          (renderedBubble) =>
+                            renderedBubble.getAttribute("data-entry-id") === expectedAssistantId,
+                        ),
+                      };
+                    }, assistantId);
+                  const adoptedContent = asOptionalRecord(adopted.message)?.content;
+                  return {
+                    sessionKey: adopted.sessionKey,
+                    sessionId: adopted.sessionId,
+                    loading: adopted.loading,
+                    cursor: adopted.cursor?.cursor,
+                    cursorSessionId: adopted.cursor?.sessionId,
+                    rendered: adopted.rendered,
+                    images: Array.isArray(adoptedContent)
+                      ? adoptedContent
+                          .map(asOptionalRecord)
+                          .filter((block) => block?.type === "image")
+                      : [],
+                  };
+                })
+                .toEqual({
+                  sessionKey,
+                  sessionId,
+                  loading: false,
+                  cursor,
+                  cursorSessionId: sessionId,
+                  rendered: true,
+                  images,
+                });
               await assertDecoded();
               const liveNodes = await bubble.evaluateHandle((element) => {
                 const pane = element.closest<ChatPaneElement>("openclaw-chat-pane");
@@ -630,56 +746,6 @@ suite.define(() => {
               expect(sends).toEqual([prompt]);
               expect(provider.requests.filter((model) => model === "echo")).toHaveLength(1);
               expect(provider.failures).toEqual([]);
-
-              // Read persisted history through its real owner, never pre-seed ordered content.
-              const history = asOptionalRecord(
-                JSON.parse(
-                  await runCli([
-                    "gateway",
-                    "call",
-                    "chat.history",
-                    "--json",
-                    "--params",
-                    JSON.stringify({ sessionKey, limit: 20 }),
-                  ]),
-                ),
-              );
-              const messages = Array.isArray(history?.messages) ? history.messages : [];
-              const assistants = messages
-                .map(asOptionalRecord)
-                .filter((message) => message?.role === "assistant");
-              expect(assistants).toHaveLength(1);
-              const content = assistants[0]?.content;
-              const blocks = Array.isArray(content) ? content.map(asOptionalRecord) : [];
-              const persistedOrder = blocks.flatMap((block) => {
-                if (block?.type === "image") {
-                  return ["image"];
-                }
-                if (block?.type !== "text" || typeof block.text !== "string") {
-                  return [];
-                }
-                const text = block.text;
-                return [intro, firstHeading, secondHeading, closing]
-                  .filter((label) => text.includes(label))
-                  .toSorted((left, right) => text.indexOf(left) - text.indexOf(right));
-              });
-              expect(persistedOrder).toEqual([
-                intro,
-                firstHeading,
-                "image",
-                secondHeading,
-                "image",
-                closing,
-              ]);
-              const images = blocks.filter((block) => block?.type === "image");
-              expect(images).toHaveLength(2);
-              const artifactIds = images.map((image) => image?.artifactId);
-              for (const id of artifactIds) {
-                expect(id).toMatch(/^artifact_managed_image_/u);
-              }
-              expect(new Set(artifactIds).size).toBe(2);
-              expect(JSON.stringify(assistants)).not.toContain("MEDIA:");
-              expect(JSON.stringify(assistants)).not.toContain(instance.stateDir);
 
               await page.reload();
               await waitForControlUiGatewayReady(page);
