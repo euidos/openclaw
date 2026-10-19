@@ -1,7 +1,11 @@
 import { copyFileSync, existsSync, readFileSync, renameSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { createDeferred, withinTest } from "../../../../test/helpers/promise.js";
+import {
+  awaitGateBeforeSettlement,
+  createDeferred,
+  withinTest,
+} from "../../../../test/helpers/promise.js";
 import type { OpenClawConfig } from "../../../config/types.js";
 import * as operationAdmission from "../../../infra/sqlite-worker-operation-admission.js";
 import { trackSessionControllerSourceWork } from "../../../sessions/session-controller.mailbox.js";
@@ -18,7 +22,6 @@ import {
   captureClientVoiceSessionSettlement,
   prepareClientVoiceSessionClose,
 } from "../../../talk/client-voice-session-lifecycle.js";
-import type { ClientVoiceSessionSource } from "../../../talk/client-voice-session-source.js";
 import { readVoiceSessionRecord } from "../../../talk/client-voice-session-store.js";
 import {
   ensureClientVoiceAgentSessionEntry,
@@ -65,6 +68,17 @@ async function createRelay(connId: string, cfg: OpenClawConfig = {}, key = "agen
   });
   activeRelaySessions.set(created.relaySessionId, connId);
   return relaySessions.get(created.relaySessionId)!;
+}
+
+function afterResult<A extends unknown[], R>(
+  run: (...args: A) => Promise<R>,
+  wait: () => Promise<void>,
+) {
+  return async (...args: A) => {
+    const result = await run(...args);
+    await wait();
+    return result;
+  };
 }
 
 function expectRegistrations(relay: RelaySession, runs: number, calls: number) {
@@ -183,12 +197,12 @@ describe("relay consult registration authority", () => {
       const register = voiceSessions.registerClientVoiceConsultRun;
       const registering = vi
         .spyOn(voiceSessions, "registerClientVoiceConsultRun")
-        .mockImplementationOnce(async (params) => {
-          const release = await register(params);
-          held.resolve();
-          await resume.promise;
-          return release;
-        });
+        .mockImplementationOnce(
+          afterResult(register, async () => {
+            held.resolve();
+            await resume.promise;
+          }),
+        );
       const pending = registerRun({ ...target, callId });
       const settled = pending.catch((error: unknown) => error);
       try {
@@ -296,22 +310,14 @@ describe("relay consult registration authority", () => {
         phase === "creation"
           ? vi
               .spyOn(voiceSessions, "createOrResumeClientVoiceSession")
-              .mockImplementationOnce(async (...args) => {
-                const result = await create(...args);
-                await waitForReplacement();
-                return result;
-              })
+              .mockImplementationOnce(afterResult(create, waitForReplacement))
           : undefined;
       const register = voiceSessions.registerClientVoiceConsultRun;
       const registering =
         phase === "registration" || phase === "aborted" || phase === "cleanup"
           ? vi
               .spyOn(voiceSessions, "registerClientVoiceConsultRun")
-              .mockImplementationOnce(async (...args) => {
-                const release = await register(...args);
-                await waitForReplacement();
-                return release;
-              })
+              .mockImplementationOnce(afterResult(register, waitForReplacement))
           : undefined;
       const pending = registerRun({
         ...target,
@@ -385,7 +391,7 @@ describe("relay consult registration authority", () => {
   );
 
   it.for(["provider", "close", "close-without-controller"] as const)(
-    "keeps a later controller alive after settled registration (%s)",
+    "retires completion custody without cancelling a later controller (%s)",
     async (operation) => {
       const { relay, target, chat } = await createRegistrationFixture();
       if (operation === "close-without-controller") {
@@ -396,10 +402,20 @@ describe("relay consult registration authority", () => {
           ? undefined
           : adoptRelayProviderToolCallId(relay, "settled-controller-call");
       const registration = await registerRun({ ...target, callId });
+      if (operation === "provider") {
+        expect(registration.isCurrent()).toBe(true);
+      }
       await chat.cleanup();
+      if (operation === "provider") {
+        expect(getRpcSource(target.runId)).toBeUndefined();
+        expect(registration.isCurrent()).toBe(false);
+        expect(registration.isCurrent("completion")).toBe(true);
+      }
       const replacement = await createControllerSource(relay, target.runId, "replacement-chat");
       try {
         if (operation === "provider") {
+          expect(registration.isCurrent()).toBe(false);
+          expect(registration.isCurrent("completion")).toBe(false);
           cancelTalkRealtimeRelayProviderToolCall(relay, "settled-controller-call");
         } else {
           await closeRelaySession(relay, "completed", { disposition: "abort" });
@@ -425,33 +441,6 @@ describe("relay consult registration authority", () => {
       }
     },
   );
-
-  it("retains only completion custody after clean source settlement", async () => {
-    const { relay, target, chat } = await createRegistrationFixture();
-    const callId = adoptRelayProviderToolCallId(relay, "completed-call")!;
-    const registration = await registerRun({
-      ...target,
-      callId,
-    });
-    let replacement: typeof chat | undefined;
-    try {
-      expect(registration.isCurrent()).toBe(true);
-      await chat.cleanup();
-      expect(getRpcSource(target.runId)).toBeUndefined();
-      expect(registration.isCurrent()).toBe(false);
-      expect(registration.isCurrent("completion")).toBe(true);
-
-      replacement = await createControllerSource(relay, target.runId, "replacement-chat");
-      expect(registration.isCurrent()).toBe(false);
-      expect(registration.isCurrent("completion")).toBe(false);
-      cancelTalkRealtimeRelayProviderToolCall(relay, "completed-call");
-      expect(replacement.source.input.abortSignal.aborted).toBe(false);
-    } finally {
-      registration.release();
-      await replacement?.cleanup();
-      await chat.cleanup();
-    }
-  });
 
   it("retries a known refused voice write in the database admitted by its creator", async () => {
     const originalEnv = { ...process.env };
@@ -630,12 +619,8 @@ describe("relay consult registration authority", () => {
       let callerCurrent = true;
       let blocker: Promise<void> | undefined;
       let release: (() => void) | undefined;
-      const registerVoice = vi.fn(
-        async (
-          assertCurrent: () => void,
-          physicalSource: ClientVoiceSessionSource,
-          onRegistered: (release: () => void) => void,
-        ) => {
+      const registerVoice = vi.fn<NonNullable<Parameters<typeof registerRun>[0]["registerVoice"]>>(
+        async (assertCurrent, physicalSource, onRegistered) => {
           blocker = runOpenClawAgentWriteAdmission({ agentId: "main" }, async () => {
             entered.resolve();
             await releaseQueue.promise;
@@ -676,12 +661,11 @@ describe("relay consult registration authority", () => {
       );
       try {
         await withinTest(
-          Promise.race([
+          awaitGateBeforeSettlement(
             queued.promise,
-            settled.then(() => {
-              throw new Error("Relay completed before registration queued");
-            }),
-          ]),
+            settled,
+            "Relay completed before registration queued",
+          ),
           signal,
         );
         if (revoked === "caller") {
