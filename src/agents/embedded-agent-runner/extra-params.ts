@@ -4,6 +4,7 @@ import {
   detectOpenAICompletionsCompat,
   resolveOpenAICompletionsCompat,
 } from "@openclaw/ai/transports";
+import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import {
   type NativeWebSearchToolPolicyParams,
   isNativeWebSearchAllowedByToolPolicy,
@@ -432,6 +433,33 @@ function canonicalizeOpenRouterResponseCacheParams(
   }
 }
 
+/** Forwards a request's required client tool as Anthropic `tool_choice` on each model call. */
+export function createAnthropicToolChoiceWrapper(
+  baseStreamFn: StreamFn | undefined,
+  toolChoice: unknown,
+): StreamFn | undefined {
+  const choice = asOptionalRecord(toolChoice);
+  const anthropicToolChoice =
+    choice?.type === "required"
+      ? ("any" as const)
+      : choice?.type === "function" && typeof choice.name === "string"
+        ? { type: "tool" as const, name: choice.name }
+        : undefined;
+  if (!anthropicToolChoice) {
+    return undefined;
+  }
+  const underlying = requireBaseStreamFn(baseStreamFn);
+  return (model, context, options) =>
+    // Other APIs keep the gateway's emulation. The Anthropic transport downgrades a forced
+    // choice to auto when thinking is on for the call, which Anthropic would reject.
+    model.api === "anthropic-messages"
+      ? underlying(model, context, {
+          ...options,
+          toolChoice: anthropicToolChoice,
+        } as SimpleStreamOptions)
+      : underlying(model, context, options);
+}
+
 function createParallelToolCallsWrapper(
   baseStreamFn: StreamFn | undefined,
   enabled: boolean,
@@ -477,6 +505,10 @@ function applyPrePluginStreamWrappers(ctx: ApplyExtraParamsContext): void {
     log.debug(`applying extraParams to agent streamFn for ${ctx.provider}/${ctx.modelId}`);
     ctx.agent.streamFn = wrappedStreamFn;
   }
+  // Request-only: a configured toolChoice would force every turn without the gateway's check.
+  ctx.agent.streamFn =
+    createAnthropicToolChoiceWrapper(ctx.agent.streamFn, ctx.override?.toolChoice) ??
+    ctx.agent.streamFn;
 
   if (
     shouldApplySiliconFlowThinkingOffCompat({
