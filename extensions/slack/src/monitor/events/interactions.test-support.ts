@@ -59,11 +59,15 @@ export function approvalContextOptions(pluginApprover: string, execApprover: str
   };
 }
 
-type RegisteredHandler = (args: {
+type ListenerArgs<Body> = {
   ack: () => Promise<void>;
   client?: TestSlackClient;
   context?: TestBoltContext;
-  body: {
+  body: Body;
+};
+
+type RegisteredHandler = (
+  args: ListenerArgs<{
     user: { id: string; team_id?: string };
     team?: { id?: string };
     trigger_id?: string;
@@ -71,16 +75,14 @@ type RegisteredHandler = (args: {
     channel?: { id?: string };
     container?: { channel_id?: string; message_ts?: string; thread_ts?: string };
     message?: { ts?: string; thread_ts?: string; text?: string; blocks?: unknown[] };
-  };
-  action: Record<string, unknown>;
-  respond?: (payload: { text: string; response_type: string }) => Promise<void>;
-}) => Promise<void>;
+  }> & {
+    action: Record<string, unknown>;
+    respond?: (payload: { text: string; response_type: string }) => Promise<void>;
+  },
+) => Promise<void>;
 
-type RegisteredViewHandler = (args: {
-  ack: () => Promise<void>;
-  client?: TestSlackClient;
-  context?: TestBoltContext;
-  body: {
+type RegisteredViewHandler = (
+  args: ListenerArgs<{
     user?: { id?: string; team_id?: string };
     team?: { id?: string };
     trigger_id?: string;
@@ -96,8 +98,8 @@ type RegisteredViewHandler = (args: {
       state?: { values?: Record<string, Record<string, Record<string, unknown>>> };
     };
     is_cleared?: boolean;
-  };
-}) => Promise<void>;
+  }>,
+) => Promise<void>;
 
 type RegisteredShortcutHandler = (
   args: Pick<SlackShortcutMiddlewareArgs, "ack" | "body"> & {
@@ -116,7 +118,7 @@ type TestSlackClient = {
   chat: { update: (...args: unknown[]) => unknown };
 };
 
-export function createContext(overrides?: {
+type ContextOverrides = {
   dmEnabled?: boolean;
   dmPolicy?: "open" | "allowlist" | "pairing" | "disabled";
   allowFrom?: string[];
@@ -138,7 +140,16 @@ export function createContext(overrides?: {
     name?: string;
     type?: "im" | "mpim" | "channel" | "group";
   }>;
-}) {
+};
+
+function requireHandler<T>(handler: T | null, kind: string): T {
+  if (!handler) {
+    throw new Error(`Expected Slack ${kind} handler to be registered`);
+  }
+  return handler;
+}
+
+export function createContext(overrides?: ContextOverrides) {
   installSlackTestRuntime();
   let handler: RegisteredHandler | null = null;
   let viewHandler: RegisteredViewHandler | null = null;
@@ -206,24 +217,13 @@ export function createContext(overrides?: {
     sessionKey: "agent:ops:slack:channel:C1",
   });
   const isChannelAllowed = vi
-    .fn<
-      (params: {
-        channelId?: string;
-        channelName?: string;
-        channelType?: "im" | "mpim" | "channel" | "group";
-      }) => boolean
-    >()
+    .fn<NonNullable<ContextOverrides["isChannelAllowed"]>>()
     .mockImplementation((params) => overrides?.isChannelAllowed?.(params) ?? true);
   const resolveUserName = vi
-    .fn<(userId: string) => Promise<{ name?: string }>>()
+    .fn<NonNullable<ContextOverrides["resolveUserName"]>>()
     .mockImplementation((userId) => overrides?.resolveUserName?.(userId) ?? Promise.resolve({}));
   const resolveChannelName = vi
-    .fn<
-      (channelId: string) => Promise<{
-        name?: string;
-        type?: "im" | "mpim" | "channel" | "group";
-      }>
-    >()
+    .fn<NonNullable<ContextOverrides["resolveChannelName"]>>()
     .mockImplementation(
       (channelId) => overrides?.resolveChannelName?.(channelId) ?? Promise.resolve({}),
     );
@@ -267,29 +267,9 @@ export function createContext(overrides?: {
     isChannelAllowed,
     resolveUserName,
     resolveChannelName,
-    getHandler: () => {
-      if (!handler) {
-        throw new Error("Expected Slack action handler to be registered");
-      }
-      return handler;
-    },
-    getViewHandler: () => {
-      if (!viewHandler) {
-        throw new Error("Expected Slack view handler to be registered");
-      }
-      return viewHandler;
-    },
-    getViewClosedHandler: () => {
-      if (!viewClosedHandler) {
-        throw new Error("Expected Slack view-closed handler to be registered");
-      }
-      return viewClosedHandler;
-    },
-    getShortcutHandler: () => {
-      if (!shortcutHandler) {
-        throw new Error("Expected Slack shortcut handler to be registered");
-      }
-      return shortcutHandler;
-    },
+    getHandler: () => requireHandler(handler, "action"),
+    getViewHandler: () => requireHandler(viewHandler, "view"),
+    getViewClosedHandler: () => requireHandler(viewClosedHandler, "view-closed"),
+    getShortcutHandler: () => requireHandler(shortcutHandler, "shortcut"),
   };
 }

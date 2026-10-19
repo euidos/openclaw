@@ -4,7 +4,6 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { registerSlackMemberEvents } from "./members.js";
 import {
   createSlackSystemEventTestHarness as initSlackHarness,
-  type SlackSystemEventHandler as MemberHandler,
   type SlackSystemEventTestOverrides as MemberOverrides,
 } from "./system-event-test-harness.js";
 
@@ -25,17 +24,6 @@ vi.mock("openclaw/plugin-sdk/system-event-runtime", () => ({
   ) => memberMocks.enqueue(text, { ...options, sessionKey: route.sessionKey }),
 }));
 
-type MemberCaseArgs = {
-  event?: Record<string, unknown>;
-  body?: unknown;
-  context?: AllMiddlewareArgs["context"];
-  client?: AllMiddlewareArgs["client"];
-  overrides?: MemberOverrides;
-  handler?: "joined" | "left";
-  trackEvent?: () => void;
-  shouldDropMismatchedSlackEvent?: (body: unknown) => boolean;
-};
-
 function makeMemberEvent(overrides?: { channel?: string; user?: string }) {
   return {
     type: "member_joined_channel",
@@ -45,41 +33,21 @@ function makeMemberEvent(overrides?: { channel?: string; user?: string }) {
   };
 }
 
-function getMemberHandlers(params: {
-  overrides?: MemberOverrides;
-  trackEvent?: () => void;
-  shouldDropMismatchedSlackEvent?: (body: unknown) => boolean;
-}) {
-  const harness = initSlackHarness(params.overrides);
-  if (params.shouldDropMismatchedSlackEvent) {
-    harness.ctx.shouldDropMismatchedSlackEvent = params.shouldDropMismatchedSlackEvent;
+function createMemberHarness(overrides?: MemberOverrides) {
+  const harness = initSlackHarness(overrides);
+  const trackEvent = vi.fn();
+  registerSlackMemberEvents({ ctx: harness.ctx, trackEvent });
+  const handler = harness.getHandler("member_joined_channel");
+  if (!handler) {
+    throw new Error("expected Slack member joined handler");
   }
-  registerSlackMemberEvents({ ctx: harness.ctx, trackEvent: params.trackEvent });
-  return {
-    joined: harness.getHandler("member_joined_channel") as MemberHandler | null,
-    left: harness.getHandler("member_left_channel") as MemberHandler | null,
-  };
+  return { ...harness, handler, trackEvent };
 }
 
-async function runMemberCase(args: MemberCaseArgs = {}): Promise<void> {
-  memberMocks.enqueue.mockClear();
-  const handlers = getMemberHandlers({
-    overrides: args.overrides,
-    trackEvent: args.trackEvent,
-    shouldDropMismatchedSlackEvent: args.shouldDropMismatchedSlackEvent,
-  });
-  const key = args.handler ?? "joined";
-  const handler = handlers[key];
-  if (!handler) {
-    throw new Error(`expected Slack member ${key} handler`);
-  }
-  await handler({
-    event: (args.event ?? makeMemberEvent()) as Record<string, unknown>,
-    body: args.body ?? { event_id: "Ev-member-default" },
-    context: args.context,
-    client: args.client,
-  });
-}
+type JoinRequest = Parameters<
+  typeof import("openclaw/plugin-sdk/channel-join-intro-runtime").reportChannelRoomJoin
+>[0];
+const joinRequest = () => memberMocks.reportJoin.mock.calls[0]?.[0] as JoinRequest;
 
 describe("registerSlackMemberEvents", () => {
   beforeEach(() => {
@@ -87,51 +55,36 @@ describe("registerSlackMemberEvents", () => {
     memberMocks.reportJoin.mockReset().mockResolvedValue({ kind: "posted" });
   });
 
-  const cases: Array<{ name: string; args: MemberCaseArgs; calls: number }> = [
-    {
-      name: "blocks channel member events for users outside channel users allowlist",
-      args: {
-        overrides: {
-          dmPolicy: "open",
-          channelType: "channel",
-          channelUsers: ["U_OWNER"],
-        },
-        event: makeMemberEvent({ channel: "C1", user: "U_ATTACKER" }),
-      },
-      calls: 0,
-    },
-  ];
-  it.each(cases)("$name", async ({ args, calls }) => {
-    await runMemberCase(args);
-    expect(memberMocks.enqueue).toHaveBeenCalledTimes(calls);
+  it("blocks channel member events for users outside channel users allowlist", async () => {
+    const { handler } = createMemberHarness({ channelType: "channel", channelUsers: ["U_OWNER"] });
+    await handler({
+      event: makeMemberEvent({ channel: "C1", user: "U_ATTACKER" }),
+      body: { event_id: "Ev-member-default" },
+    });
+    expect(memberMocks.enqueue).not.toHaveBeenCalled();
   });
 
   it("introduces the joined bot in an allowed room despite sender and mention requirements", async () => {
-    const harness = initSlackHarness({ channelType: "channel", channelUsers: ["U_OWNER"] });
-    harness.ctx.cfg = { channels: { slack: { groupPolicy: "open" } } };
-    harness.ctx.accountId = "default";
-    harness.ctx.resolveChannelName = vi.fn(async () => ({
+    const { ctx, handler } = createMemberHarness({
+      channelType: "channel",
+      channelUsers: ["U_OWNER"],
+    });
+    ctx.cfg = { channels: { slack: { groupPolicy: "open" } } };
+    ctx.resolveChannelName = vi.fn(async () => ({
       name: "deploys",
       type: "channel" as const,
       purpose: "Coordinate production deployments",
       topic: "Current release: 42",
     }));
-    harness.ctx.resolveUserName = vi.fn(async () => ({ name: "Morgan" }));
-    harness.ctx.app.client = new WebClient("xoxb-test");
-    const readHistory = vi
-      .spyOn(harness.ctx.app.client.conversations, "history")
-      .mockResolvedValue({
-        ok: true,
-        messages: [
-          { user: "U_NEW", text: "Release 42 is ready" },
-          { user: "U_OLD", text: "Watch the rollback checklist" },
-        ],
-      });
-    registerSlackMemberEvents({ ctx: harness.ctx });
-    const handler = harness.getHandler("member_joined_channel");
-    if (!handler) {
-      throw new Error("expected Slack member joined handler");
-    }
+    ctx.resolveUserName = vi.fn(async () => ({ name: "Morgan" }));
+    ctx.app.client = new WebClient("xoxb-test");
+    const readHistory = vi.spyOn(ctx.app.client.conversations, "history").mockResolvedValue({
+      ok: true,
+      messages: [
+        { user: "U_NEW", text: "Release 42 is ready" },
+        { user: "U_OLD", text: "Watch the rollback checklist" },
+      ],
+    });
 
     await handler({
       event: { ...makeMemberEvent({ channel: "C1", user: "U_BOT" }), inviter: "U_OWNER" },
@@ -149,10 +102,7 @@ describe("registerSlackMemberEvents", () => {
         route: { agentId: "main", sessionKey: "agent:main:main" },
       }),
     );
-    const request = memberMocks.reportJoin.mock.calls[0]?.[0] as Parameters<
-      typeof import("openclaw/plugin-sdk/channel-join-intro-runtime").reportChannelRoomJoin
-    >[0];
-    await expect(request.resolveRoomContext({ messageLimit: 30 })).resolves.toEqual({
+    await expect(joinRequest().resolveRoomContext({ messageLimit: 30 })).resolves.toEqual({
       title: "#deploys",
       purpose: "Coordinate production deployments\nCurrent release: 42",
       recentMessages: [
@@ -170,22 +120,19 @@ describe("registerSlackMemberEvents", () => {
   });
 
   it("reports a denied bot self-join using conversation policy without applying sender policy", async () => {
-    const harness = initSlackHarness({ channelType: "channel", channelUsers: ["U_OWNER"] });
-    harness.ctx.cfg = { channels: { slack: { groupPolicy: "allowlist" } } };
-    harness.ctx.accountId = "default";
-    harness.ctx.isChannelAllowed = vi.fn(() => false);
-    registerSlackMemberEvents({ ctx: harness.ctx });
-    const handler = harness.getHandler("member_joined_channel");
-    if (!handler) {
-      throw new Error("expected Slack member joined handler");
-    }
+    const { ctx, handler } = createMemberHarness({
+      channelType: "channel",
+      channelUsers: ["U_OWNER"],
+    });
+    ctx.cfg = { channels: { slack: { groupPolicy: "allowlist" } } };
+    ctx.isChannelAllowed = vi.fn(() => false);
 
     await handler({
       event: makeMemberEvent({ channel: "C1", user: "U_BOT" }),
       body: { event_id: "Ev-self-denied" },
     });
 
-    expect(harness.ctx.isChannelAllowed).toHaveBeenCalledWith({
+    expect(ctx.isChannelAllowed).toHaveBeenCalledWith({
       teamId: "T_TEST",
       channelId: "C1",
       channelName: "general",
@@ -198,47 +145,36 @@ describe("registerSlackMemberEvents", () => {
   });
 
   it("keeps room metadata when Slack denies the joined room's message history", async () => {
-    const harness = initSlackHarness({ channelType: "group" });
-    harness.ctx.cfg = { channels: { slack: { groupPolicy: "open" } } };
-    harness.ctx.accountId = "default";
-    harness.ctx.app.client = new WebClient("xoxb-test");
-    vi.spyOn(harness.ctx.app.client.conversations, "history").mockRejectedValue(
-      new Error("missing_scope"),
-    );
-    registerSlackMemberEvents({ ctx: harness.ctx });
-    const handler = harness.getHandler("member_joined_channel");
-    if (!handler) {
-      throw new Error("expected Slack member joined handler");
-    }
+    const { ctx, handler } = createMemberHarness({ channelType: "group" });
+    ctx.cfg = { channels: { slack: { groupPolicy: "open" } } };
+    ctx.app.client = new WebClient("xoxb-test");
+    vi.spyOn(ctx.app.client.conversations, "history").mockRejectedValue(new Error("missing_scope"));
 
     await handler({
       event: makeMemberEvent({ channel: "G1", user: "U_BOT" }),
       body: { event_id: "Ev-self-private" },
     });
 
-    const request = memberMocks.reportJoin.mock.calls[0]?.[0] as Parameters<
-      typeof import("openclaw/plugin-sdk/channel-join-intro-runtime").reportChannelRoomJoin
-    >[0];
-    await expect(request.resolveRoomContext({ messageLimit: 30 })).resolves.toEqual({
+    await expect(joinRequest().resolveRoomContext({ messageLimit: 30 })).resolves.toEqual({
       title: "#general",
       purpose: undefined,
     });
   });
 
   it("never introduces the bot into a direct-message conversation", async () => {
-    await runMemberCase({
-      overrides: { dmPolicy: "open" },
+    await createMemberHarness().handler({
       event: makeMemberEvent({ channel: "D1", user: "U_BOT" }),
+      body: { event_id: "Ev-member-default" },
     });
 
     expect(memberMocks.reportJoin).not.toHaveBeenCalled();
   });
 
   it("does not track mismatched events", async () => {
-    const trackEvent = vi.fn();
-    await runMemberCase({
-      trackEvent,
-      shouldDropMismatchedSlackEvent: () => true,
+    const { ctx, handler, trackEvent } = createMemberHarness();
+    ctx.shouldDropMismatchedSlackEvent = () => true;
+    await handler({
+      event: makeMemberEvent(),
       body: { api_app_id: "A_OTHER" },
     });
 
@@ -246,17 +182,12 @@ describe("registerSlackMemberEvents", () => {
   });
 
   it("uses the stable user ID when the post-auth name lookup fails", async () => {
-    const harness = initSlackHarness({
+    const { ctx, handler } = createMemberHarness({
       channelType: "channel",
       channelUsers: ["U1"],
     });
     const resolveUserName = vi.fn(async () => ({ error: new Error("users.info failed") }));
-    harness.ctx.resolveUserName = resolveUserName;
-    registerSlackMemberEvents({ ctx: harness.ctx });
-    const handler = harness.getHandler("member_joined_channel");
-    if (!handler) {
-      throw new Error("expected Slack member joined handler");
-    }
+    ctx.resolveUserName = resolveUserName;
 
     await handler({
       event: makeMemberEvent({ channel: "C1", user: "U1" }),
@@ -273,29 +204,18 @@ describe("registerSlackMemberEvents", () => {
   });
 
   it("keeps enterprise member events isolated by listener workspace", async () => {
-    const trackEvent = vi.fn();
-    const harness = initSlackHarness();
-    harness.ctx.installationIdentity = {
+    const { ctx, handler, trackEvent } = createMemberHarness();
+    ctx.installationIdentity = {
       kind: "enterprise",
       apiAppId: "A_GRID",
       enterpriseId: "E_GRID",
     };
-    const resolveChannelName = vi.fn(harness.ctx.resolveChannelName);
-    const resolveUserName = vi.fn(harness.ctx.resolveUserName);
-    const resolveSessionKey = vi.fn(
-      async (input: Parameters<typeof harness.ctx.resolveSlackSystemEventRoute>[0]) => ({
-        agentId: "main",
-        sessionKey: `session:${input.eventScope?.teamId ?? "workspace"}`,
-      }),
-    );
-    harness.ctx.resolveChannelName = resolveChannelName;
-    harness.ctx.resolveUserName = resolveUserName;
-    harness.ctx.resolveSlackSystemEventRoute = resolveSessionKey;
-    registerSlackMemberEvents({ ctx: harness.ctx, trackEvent });
-    const handler = harness.getHandler("member_joined_channel");
-    if (!handler) {
-      throw new Error("expected Slack member joined handler");
-    }
+    const resolveChannelName = vi.spyOn(ctx, "resolveChannelName");
+    const resolveUserName = vi.spyOn(ctx, "resolveUserName");
+    vi.spyOn(ctx, "resolveSlackSystemEventRoute").mockImplementation(async (input) => ({
+      agentId: "main",
+      sessionKey: `session:${input.eventScope?.teamId ?? "workspace"}`,
+    }));
 
     for (const teamId of ["T111", "T222"]) {
       await handler({
@@ -327,18 +247,12 @@ describe("registerSlackMemberEvents", () => {
   });
 
   it("rejects enterprise member events without validated listener scope", async () => {
-    const trackEvent = vi.fn();
-    const harness = initSlackHarness();
-    harness.ctx.installationIdentity = {
+    const { ctx, handler, trackEvent } = createMemberHarness();
+    ctx.installationIdentity = {
       kind: "enterprise",
       apiAppId: "A_GRID",
       enterpriseId: "E_GRID",
     };
-    registerSlackMemberEvents({ ctx: harness.ctx, trackEvent });
-    const handler = harness.getHandler("member_joined_channel");
-    if (!handler) {
-      throw new Error("expected Slack member joined handler");
-    }
 
     await handler({
       event: makeMemberEvent(),
