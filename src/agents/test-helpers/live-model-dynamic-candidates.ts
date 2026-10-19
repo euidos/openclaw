@@ -295,7 +295,6 @@ export function resolveHighSignalLiveModelLimit(params: {
       : (params.defaultLimit ?? DEFAULT_HIGH_SIGNAL_LIVE_MODEL_LIMIT);
 }
 
-type ProviderRuntimeModule = typeof import("../../plugins/provider-runtime.js");
 type DynamicModelResolver = typeof runProviderDynamicModel;
 type DynamicModelPreparer = typeof prepareProviderDynamicModel;
 type DynamicModelNormalizer = (model: Model, agentDir: string) => Model | Promise<Model>;
@@ -307,32 +306,9 @@ const modelResolutionLoader = createLazyImportLoader(
   () => import("../embedded-agent-runner/model.js"),
 );
 
-const providerRuntimeLoader = createLazyImportLoader<ProviderRuntimeModule>(
+const providerRuntimeLoader = createLazyImportLoader(
   () => import("../../plugins/provider-runtime.js"),
 );
-
-async function prepareProviderDynamicModelDefault(
-  params: Parameters<DynamicModelPreparer>[0],
-): ReturnType<DynamicModelPreparer> {
-  const { prepareProviderDynamicModel } = await providerRuntimeLoader.load();
-  return await prepareProviderDynamicModel(params);
-}
-
-async function runProviderDynamicModelDefault(
-  params: Parameters<DynamicModelResolver>[0],
-): Promise<ReturnType<DynamicModelResolver>> {
-  const { runProviderDynamicModel } = await providerRuntimeLoader.load();
-  return runProviderDynamicModel(params);
-}
-
-async function normalizeDynamicModelDefault(
-  model: Model,
-  agentDir: string,
-  options: { config?: OpenClawConfig; workspaceDir?: string },
-): Promise<Model> {
-  const { normalizeDiscoveredAgentModel } = await import("../model-discovery-normalize.js");
-  return normalizeDiscoveredAgentModel(model, agentDir, options);
-}
 
 export function resolveLiveProviderDiscoveryProviderIds(params: {
   providerFilter: ReadonlySet<string> | null;
@@ -421,8 +397,15 @@ export async function appendLiveModelCandidates(params: {
   normalizeModel?: DynamicModelNormalizer;
   refs?: Array<{ provider: string; id: string }>;
 }): Promise<{ models: Model[]; added: Model[] }> {
-  const resolveDynamicModel = params.resolveDynamicModel ?? runProviderDynamicModelDefault;
-  const prepareDynamicModel = params.prepareDynamicModel ?? prepareProviderDynamicModelDefault;
+  const { config, agentDir, workspaceDir, env, modelRegistry } = params;
+  const resolveDynamicModel =
+    params.resolveDynamicModel ??
+    (async (request: Parameters<DynamicModelResolver>[0]) =>
+      (await providerRuntimeLoader.load()).runProviderDynamicModel(request));
+  const prepareDynamicModel =
+    params.prepareDynamicModel ??
+    (async (request: Parameters<DynamicModelPreparer>[0]) =>
+      (await providerRuntimeLoader.load()).prepareProviderDynamicModel(request));
   const refs = params.refs ?? listPrioritizedHighSignalLiveModelRefs();
   const seen = new Set<string>();
   for (const model of params.models) {
@@ -444,45 +427,44 @@ export async function appendLiveModelCandidates(params: {
     if (params.resolution?.kind === "explicit") {
       const stores = await (discoveryStores ??= params.resolution.getDiscoveryStores());
       const { resolveModelAsync } = await modelResolutionLoader.load();
-      const result = await resolveModelAsync(ref.provider, ref.id, params.agentDir, params.config, {
+      const result = await resolveModelAsync(ref.provider, ref.id, agentDir, config, {
         ...stores,
-        workspaceDir: params.workspaceDir,
+        workspaceDir,
         allowBundledStaticCatalogFallback: true,
       });
       model = result.model;
     } else {
-      const providerConfig = findNormalizedProviderValue(
-        params.config?.models?.providers,
-        ref.provider,
-      );
       // Dynamic model hooks receive the originally requested provider/id so they
       // can map aliases or live service identifiers before returning a catalog row.
       const context = {
-        config: params.config,
-        agentDir: params.agentDir,
-        workspaceDir: params.workspaceDir,
+        config,
+        agentDir,
+        workspaceDir,
         provider: ref.provider,
         modelId: ref.id,
-        modelRegistry: params.modelRegistry,
-        providerConfig,
+        modelRegistry,
+        providerConfig: findNormalizedProviderValue(config?.models?.providers, ref.provider),
       };
       const request = {
         provider: ref.provider,
-        config: params.config,
-        workspaceDir: params.workspaceDir,
-        env: params.env,
+        config,
+        workspaceDir,
+        env,
         context,
       };
       const resolved = (await prepareDynamicModel(request)) ?? (await resolveDynamicModel(request));
       if (!resolved) {
         continue;
       }
-      model = params.normalizeModel
-        ? await params.normalizeModel(resolved as Model, params.agentDir)
-        : await normalizeDynamicModelDefault(resolved as Model, params.agentDir, {
-            config: params.config,
-            workspaceDir: params.workspaceDir,
-          });
+      const normalizeModel =
+        params.normalizeModel ??
+        (async (entry: Model) =>
+          (await import("../model-discovery-normalize.js")).normalizeDiscoveredAgentModel(
+            entry,
+            agentDir,
+            { config, workspaceDir },
+          ));
+      model = await normalizeModel(resolved as Model, agentDir);
     }
     if (!model) {
       continue;

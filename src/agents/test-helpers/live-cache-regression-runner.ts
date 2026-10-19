@@ -1,9 +1,3 @@
-/**
- * Live prompt-cache regression runner.
- *
- * This orchestrates provider cache lanes, baseline comparisons, and live drift
- * handling for expensive provider-backed cache validation.
- */
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
@@ -52,6 +46,24 @@ type LiveCacheRegressionResult = {
   regressions: string[];
   summary: Record<string, Record<string, unknown>>;
   warnings: string[];
+};
+type CacheTurn = {
+  apiKey: string;
+  cacheRetention: "none" | "short" | "long";
+  model: LiveResolvedModel["model"];
+  providerTag: "anthropic" | "openai";
+  sessionId: string;
+  systemPrompt: string;
+  messages: Message[];
+  tools?: Tool[];
+  maxTokens: number;
+};
+type CacheLaneContext = {
+  lane: CacheLane;
+  providerTag: CacheTurn["providerTag"];
+  fixture: LiveResolvedModel;
+  runToken: string;
+  pngBase64: string;
 };
 class CacheProbeTextMismatchError extends Error {
   constructor(
@@ -122,34 +134,39 @@ function assert(condition: unknown, message: string): asserts condition {
   }
 }
 
-async function runToolOnlyTurn(params: {
-  apiKey: string;
-  cacheRetention: "none" | "short" | "long";
-  model: LiveResolvedModel["model"];
-  providerTag: "anthropic" | "openai";
-  sessionId: string;
-  systemPrompt: string;
-  tool: Tool;
-}) {
-  const options = {
-    apiKey: params.apiKey,
-    cacheRetention: params.cacheRetention,
-    sessionId: params.sessionId,
-    maxTokens: 128,
-    temperature: 0,
-    ...(params.providerTag === "openai" ? { reasoning: OPENAI_CACHE_REASONING } : {}),
-  };
+function completeCacheTurn(params: CacheTurn, label: string) {
+  return completeSimpleWithLiveTimeout(
+    params.model,
+    {
+      systemPrompt: params.systemPrompt,
+      messages: params.messages,
+      ...(params.tools ? { tools: params.tools } : {}),
+    },
+    {
+      apiKey: params.apiKey,
+      cacheRetention: params.cacheRetention,
+      sessionId: params.sessionId,
+      maxTokens: params.maxTokens,
+      temperature: 0,
+      ...(params.providerTag === "openai" ? { reasoning: OPENAI_CACHE_REASONING } : {}),
+    },
+    label,
+    CACHE_TIMEOUT_MS,
+  );
+}
+
+async function runToolOnlyTurn(
+  params: Omit<CacheTurn, "messages" | "tools" | "maxTokens"> & { tool: Tool },
+) {
   const complete = (prompt: string, label: string) =>
-    completeSimpleWithLiveTimeout(
-      params.model,
+    completeCacheTurn(
       {
-        systemPrompt: params.systemPrompt,
+        ...params,
         messages: [makeUserTurn(prompt)],
         tools: [params.tool],
+        maxTokens: 128,
       },
-      options,
       `${params.providerTag} ${params.tool.name} tool-only ${label}`,
-      CACHE_TIMEOUT_MS,
     );
   let prompt = `Call the tool \`${params.tool.name}\` with {}. IMPORTANT: respond ONLY with the tool call and no other text.`;
   let response = await complete(prompt, "turn");
@@ -173,39 +190,19 @@ async function runToolOnlyTurn(params: {
   return { prompt, response, toolCall };
 }
 
-async function completeCacheProbe(params: {
-  apiKey: string;
-  cacheRetention: "none" | "short" | "long";
-  messages: Message[];
-  model: LiveResolvedModel["model"];
-  providerTag: "anthropic" | "openai";
-  sessionId: string;
-  suffix: string;
-  systemPrompt: string;
-  tools?: Tool[];
-  maxTokens?: number;
-}): Promise<CacheRun> {
+async function completeCacheProbe(
+  params: Omit<CacheTurn, "maxTokens"> & { suffix: string; maxTokens?: number },
+): Promise<CacheRun> {
   for (let attempt = 1; attempt <= 1 + LIVE_CACHE_RESPONSE_RETRIES; attempt += 1) {
-    const response = await completeSimpleWithLiveTimeout(
-      params.model,
+    const response = await completeCacheTurn(
       {
-        systemPrompt: params.systemPrompt,
-        messages: params.messages,
-        ...(params.tools ? { tools: params.tools } : {}),
-      },
-      {
-        apiKey: params.apiKey,
-        cacheRetention: params.cacheRetention,
-        sessionId: params.sessionId,
+        ...params,
         maxTokens: resolveCacheProbeMaxTokens({
           maxTokens: params.maxTokens,
           providerTag: params.providerTag,
         }),
-        temperature: 0,
-        ...(params.providerTag === "openai" ? { reasoning: OPENAI_CACHE_REASONING } : {}),
       },
       `${params.providerTag} cache lane ${params.suffix}`,
-      CACHE_TIMEOUT_MS,
     );
     const text = extractEmbeddedAssistantText(response);
     const usage = normalizeCacheUsage(response.usage);
@@ -235,14 +232,9 @@ async function completeCacheProbe(params: {
   throw new Error(`expected response to contain CACHE-OK ${params.suffix}`);
 }
 
-async function runRepeatedLane(params: {
-  lane: CacheLane;
-  providerTag: "anthropic" | "openai";
-  fixture: LiveResolvedModel;
-  runToken: string;
-  sessionId: string;
-  pngBase64: string;
-}): Promise<LaneResult> {
+async function runRepeatedLane(
+  params: CacheLaneContext & { sessionId: string },
+): Promise<LaneResult> {
   const suffixBase = `${params.providerTag}-${params.lane}`;
   const systemPromptBase =
     params.providerTag === "openai"
@@ -309,36 +301,13 @@ async function runRepeatedLane(params: {
   return { best, warmup };
 }
 
-async function runAnthropicDisabledLane(params: {
-  fixture: LiveResolvedModel;
-  runToken: string;
-  sessionId: string;
-}): Promise<LaneResult> {
-  const disabled = await completeCacheProbe({
-    apiKey: params.fixture.apiKey,
-    cacheRetention: "none",
-    messages: [makeUserTurn("Reply with exactly CACHE-OK anthropic-disabled.")],
-    model: params.fixture.model,
-    providerTag: "anthropic",
-    sessionId: params.sessionId,
-    suffix: "anthropic-disabled",
-    systemPrompt: `${ANTHROPIC_PREFIX}\nRun token: ${params.runToken}\nLane: anthropic-disabled\n`,
-    maxTokens: 32,
-  });
-  return { disabled };
-}
-
 function formatUsage(usage: CacheUsage | undefined) {
   return `cacheRead=${usage?.cacheRead ?? 0} cacheWrite=${usage?.cacheWrite ?? 0} input=${usage?.input ?? 0} output=${usage?.output ?? 0}`;
 }
 
-async function runRepeatedLaneWithBaselineRetry(params: {
-  lane: CacheLane;
-  providerTag: "anthropic" | "openai";
-  fixture: LiveResolvedModel;
-  runToken: string;
-  pngBase64: string;
-}): Promise<{ result: LaneResult; findings: BaselineFindings; attempts: number }> {
+async function runRepeatedLaneWithBaselineRetry(
+  params: CacheLaneContext,
+): Promise<{ result: LaneResult; findings: BaselineFindings; attempts: number }> {
   let result: LaneResult | undefined;
   let findings: BaselineFindings = { regressions: [], warnings: [] };
   let attempts = 0;
@@ -399,14 +368,12 @@ function shouldSkipAnthropicCacheProviderDrift(error: unknown): boolean {
   );
 }
 
-async function runAnthropicCacheLane(params: {
-  apiKeys: readonly string[];
-  fixture: LiveResolvedModel;
-  lane: CacheLane;
-  pngBase64: string;
-  runToken: string;
-  warnings: string[];
-}): Promise<{ attempt?: Awaited<ReturnType<typeof runRepeatedLaneWithBaselineRetry>> }> {
+async function runAnthropicCacheLane(
+  params: Omit<CacheLaneContext, "providerTag"> & {
+    apiKeys: readonly string[];
+    warnings: string[];
+  },
+): Promise<{ attempt?: Awaited<ReturnType<typeof runRepeatedLaneWithBaselineRetry>> }> {
   const keys = params.apiKeys.length > 0 ? params.apiKeys : [params.fixture.apiKey];
   let lastError: unknown;
   for (const [index, apiKey] of keys.entries()) {
@@ -455,11 +422,19 @@ async function runAnthropicDisabledCacheLane(params: {
   warnings: string[];
 }): Promise<LaneResult | undefined> {
   try {
-    return await runAnthropicDisabledLane({
-      fixture: params.fixture,
-      runToken: params.runToken,
-      sessionId: `live-cache-regression-${params.runToken}-anthropic-disabled`,
-    });
+    return {
+      disabled: await completeCacheProbe({
+        apiKey: params.fixture.apiKey,
+        cacheRetention: "none",
+        messages: [makeUserTurn("Reply with exactly CACHE-OK anthropic-disabled.")],
+        model: params.fixture.model,
+        providerTag: "anthropic",
+        sessionId: `live-cache-regression-${params.runToken}-anthropic-disabled`,
+        suffix: "anthropic-disabled",
+        systemPrompt: `${ANTHROPIC_PREFIX}\nRun token: ${params.runToken}\nLane: anthropic-disabled\n`,
+        maxTokens: 32,
+      }),
+    };
   } catch (error) {
     if (shouldSkipAnthropicCacheProviderDrift(error) || isAnthropicEmptyCacheProbe(error)) {
       const warning = "anthropic disabled skipped: account drift";
@@ -477,21 +452,16 @@ export async function runLiveCacheRegression(): Promise<LiveCacheRegressionResul
   const runToken = randomUUID().slice(0, 13);
   const regressions: string[] = [];
   const warnings: string[] = [];
-  const summary: Record<string, Record<string, unknown>> = {
+  const summary: Record<CacheTurn["providerTag"], Record<string, unknown>> = {
     anthropic: {},
     openai: {},
   };
-  const openaiSummary = summary.openai;
-  const anthropicSummary = summary.anthropic;
-  if (!openaiSummary || !anthropicSummary) {
-    throw new Error("Live cache summary providers were not initialized");
-  }
   const recordLane = (
     provider: "openai" | "anthropic",
     lane: CacheLane,
     attempt?: Awaited<ReturnType<typeof runRepeatedLaneWithBaselineRetry>>,
   ) => {
-    const target = provider === "openai" ? openaiSummary : anthropicSummary;
+    const target = summary[provider];
     if (!attempt) {
       target[lane] = { skipped: true };
       return;
@@ -534,32 +504,21 @@ export async function runLiveCacheRegression(): Promise<LiveCacheRegressionResul
   });
 
   for (const lane of ["stable", "tool", "image", "mcp"] as const) {
-    if (openai) {
-      const openaiAttempt = await runRepeatedLaneWithBaselineRetry({
-        lane,
-        providerTag: "openai",
-        fixture: openai.fixture,
-        runToken,
-        pngBase64,
-      });
-      recordLane("openai", lane, openaiAttempt);
-    } else {
-      recordLane("openai", lane);
+    for (const [provider, pool] of [
+      ["openai", openai],
+      ["anthropic", anthropic],
+    ] as const) {
+      let attempt: Awaited<ReturnType<typeof runRepeatedLaneWithBaselineRetry>> | undefined;
+      if (pool) {
+        const context = { lane, fixture: pool.fixture, runToken, pngBase64 };
+        attempt =
+          provider === "openai"
+            ? await runRepeatedLaneWithBaselineRetry({ ...context, providerTag: provider })
+            : (await runAnthropicCacheLane({ ...context, apiKeys: pool.apiKeys, warnings }))
+                .attempt;
+      }
+      recordLane(provider, lane, attempt);
     }
-
-    if (!anthropic) {
-      recordLane("anthropic", lane);
-      continue;
-    }
-    const { attempt: anthropicAttempt } = await runAnthropicCacheLane({
-      apiKeys: anthropic.apiKeys,
-      lane,
-      fixture: anthropic.fixture,
-      runToken,
-      pngBase64,
-      warnings,
-    });
-    recordLane("anthropic", lane, anthropicAttempt);
   }
 
   const disabled = anthropic
@@ -571,7 +530,7 @@ export async function runLiveCacheRegression(): Promise<LiveCacheRegressionResul
     : undefined;
   if (disabled) {
     logLiveCache(`anthropic disabled ${formatUsage(disabled.disabled?.usage ?? {})}`);
-    anthropicSummary.disabled = {
+    summary.anthropic.disabled = {
       disabled: disabled.disabled?.usage,
     };
     assertAgainstBaseline({
@@ -582,7 +541,7 @@ export async function runLiveCacheRegression(): Promise<LiveCacheRegressionResul
       warnings,
     });
   } else {
-    anthropicSummary.disabled = { skipped: true };
+    summary.anthropic.disabled = { skipped: true };
   }
 
   logLiveCache(`cache regression summary ${JSON.stringify(summary)}`);
