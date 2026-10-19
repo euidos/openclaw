@@ -19,6 +19,8 @@ import {
   closeOpenClawStateDatabaseForTest,
   openOpenClawStateDatabase,
 } from "../state/openclaw-state-db.js";
+import { observe } from "../state/openclaw-state-lease-async.test-support.js";
+import { createCommandResult } from "../test-utils/npm-spec-install-test-helpers.js";
 import {
   cloneProjectCheckout,
   ensureProjectCheckoutCommit,
@@ -41,29 +43,25 @@ import { registerClonedProjectRegistry } from "./project-registry.test-support.j
 
 const execFileAsync = promisify(execFile);
 const tempDirs = createTempDirTracker();
-it("rejects a repository URL from a host other than the configured GitHub host", () => {
-  expect(
-    parseProjectGitUrl("https://github.com/openclaw/openclaw.git", "ghe.example.test"),
-  ).toBeNull();
-});
-
 it.each([
-  "file:///tmp/openclaw.git",
-  "ssh://git@github.com:2222/openclaw/openclaw.git",
-  "/tmp/openclaw",
-  "--upload-pack=touch-pwned",
-  "https://token@github.com/openclaw/openclaw.git",
-  "https://github.com/openclaw/openclaw.git?config=evil",
-  "https://github.com/openclaw/openclaw/extra",
-  "git@github.com:../../tmp/openclaw.git",
-  "https://github.com/openclaw/openclaw.git --config=evil",
-])("rejects unsafe project clone URL %s", (input) => {
-  expect(parseProjectGitUrl(input)).toBeNull();
+  ["https://github.com/openclaw/openclaw.git", "ghe.example.test"],
+  ["file:///tmp/openclaw.git"],
+  ["ssh://git@github.com:2222/openclaw/openclaw.git"],
+  ["/tmp/openclaw"],
+  ["--upload-pack=touch-pwned"],
+  ["https://token@github.com/openclaw/openclaw.git"],
+  ["https://github.com/openclaw/openclaw.git?config=evil"],
+  ["https://github.com/openclaw/openclaw/extra"],
+  ["git@github.com:../../tmp/openclaw.git"],
+  ["https://github.com/openclaw/openclaw.git --config=evil"],
+])("rejects unsafe project clone URL %s", (input, host) => {
+  expect(parseProjectGitUrl(input, host)).toBeNull();
 });
 
 describe("project registry persistence", () => {
   let root: string;
   let options: { path: string };
+  const list = (cfg: OpenClawConfig = {}) => listProjectRegistry(cfg, options);
 
   beforeEach(() => {
     root = tempDirs.make("openclaw-project-");
@@ -172,14 +170,14 @@ describe("project registry persistence", () => {
     );
     expect(table.get()).toBeUndefined();
 
-    expect(await listProjectRegistry({} as OpenClawConfig, options)).toEqual([
+    expect(await list()).toEqual([
       expect.objectContaining({ id: "workspace:main", source: "workspace" }),
     ]);
 
     expect(table.get()).toBeUndefined();
     const repo = await initializeRepository(root, "registered");
     const registered = await registerProjectRegistry({ path: repo }, options);
-    expect(await listProjectRegistry({}, options)).toContainEqual(registered);
+    expect(await list()).toContainEqual(registered);
 
     expect(table.all()).toEqual([{ name: "projects" }]);
   });
@@ -200,18 +198,20 @@ describe("project registry persistence", () => {
     expect(second).toEqual(first);
 
     const cfg = workspaceConfig({ main: "/workspace/zeta", work: "/workspace/alpha" });
-    expect((await listProjectRegistry(cfg, options)).map((project) => project.displayName)).toEqual(
-      ["alpha", "OpenClaw", "zeta"],
-    );
+    expect((await list(cfg)).map((project) => project.displayName)).toEqual([
+      "alpha",
+      "OpenClaw",
+      "zeta",
+    ]);
     const sharedWorkspaceCfg = workspaceConfig({ main: repo, work: repo });
-    expect(
-      (await listProjectRegistry(sharedWorkspaceCfg, options)).map((project) => project.id),
-    ).toEqual(["openclaw", "workspace:main", "workspace:work"]);
+    expect((await list(sharedWorkspaceCfg)).map((project) => project.id)).toEqual([
+      "openclaw",
+      "workspace:main",
+      "workspace:work",
+    ]);
     expect(await removeProjectRegistry(first, options)).toBe(true);
     expect(await removeProjectRegistry(first, options)).toBe(false);
-    expect((await listProjectRegistry(cfg, options)).map((project) => project.id)).not.toContain(
-      first.id,
-    );
+    expect((await list(cfg)).map((project) => project.id)).not.toContain(first.id);
   });
 
   it("bounds canonical roster reads while observing workspace edits on the next listing", async () => {
@@ -228,7 +228,7 @@ describe("project registry persistence", () => {
       });
     }
     const cfg: OpenClawConfig = { agents: { entries } };
-    const before = await listProjectRegistry(cfg, options);
+    const before = await list(cfg);
     // Listing every workspace must not re-read each preceding agent for every point lookup.
     expect(reads).toBeLessThanOrEqual(ids.length * 4);
     expect(before.map((project) => project.id)).toEqual(ids.map((id) => `workspace:${id}`));
@@ -236,7 +236,7 @@ describe("project registry persistence", () => {
     const edited = entries[editedId]!;
     const previousWorkspace = edited.workspace;
     edited.workspace = path.join(root, "changed");
-    const after = await listProjectRegistry(cfg, options);
+    const after = await list(cfg);
     expect(after.find((project) => project.id === `workspace:${editedId}`)?.repoRoot).toBe(
       edited.workspace,
     );
@@ -249,92 +249,79 @@ describe("project registry persistence", () => {
     );
   });
 
-  it("scopes private clone and refresh credentials to the repository origin", async () => {
+  it("scopes private clone and refresh credentials to the repository origin", async ({
+    onTestFinished,
+  }) => {
     const checkout = await initializeRepository(root, "checkout");
     const token = "synthetic-project-token";
     const runCommand = processExec.runCommandWithTimeout;
     const commandSpy = vi.spyOn(processExec, "runCommandWithTimeout");
     commandSpy.mockImplementation(async (argv, commandOptions) => {
       if (argv.includes("clone") || argv.includes("fetch")) {
-        return {
-          code: 0,
-          stdout: "",
-          stderr: "",
-          signal: null,
-          killed: false,
-          termination: "exit",
-        };
+        return createCommandResult();
       }
       return await runCommand(argv, commandOptions);
     });
-    try {
-      for (const host of ["ghe.example.test", "github.com"]) {
-        await cloneProjectCheckout(
-          { url: `https://${host}/acme/repository.git`, target: path.join(root, host) },
-          { token },
-        );
-      }
-      await refreshProjectCheckout(
-        { target: checkout, url: "https://ghe.example.test/acme/enterprise.git" },
+    onTestFinished(() => commandSpy.mockRestore());
+    for (const host of ["ghe.example.test", "github.com"]) {
+      await cloneProjectCheckout(
+        { url: `https://${host}/acme/repository.git`, target: path.join(root, host) },
         { token },
       );
-
-      const networkCalls = commandSpy.mock.calls.filter(
-        ([argv]) => argv.includes("clone") || argv.includes("fetch"),
-      );
-      const networkEnvs = networkCalls.map(([, commandOptions]) =>
-        typeof commandOptions === "object" ? commandOptions?.env : undefined,
-      );
-      expect(networkEnvs.map((env) => env?.GIT_CONFIG_KEY_0)).toEqual([
-        "http.https://ghe.example.test/.extraHeader",
-        "http.https://github.com/.extraHeader",
-        "http.https://ghe.example.test/.extraHeader",
-      ]);
-      expect(networkEnvs.map((env) => env?.GIT_CONFIG_COUNT)).toEqual(["1", "1", "1"]);
-      expect(networkCalls.flatMap(([argv]) => argv)).not.toContain(token);
-      const unrelatedOrigin = await runCommand(
-        [
-          "git",
-          "config",
-          "--get-urlmatch",
-          "http.extraHeader",
-          "https://unrelated.example/acme/repository.git",
-        ],
-        { env: networkEnvs[0] },
-      );
-      expect(unrelatedOrigin).toMatchObject({ code: 1, stdout: "" });
-    } finally {
-      commandSpy.mockRestore();
     }
+    await refreshProjectCheckout(
+      { target: checkout, url: "https://ghe.example.test/acme/enterprise.git" },
+      { token },
+    );
+
+    const networkCalls = commandSpy.mock.calls.filter(
+      ([argv]) => argv.includes("clone") || argv.includes("fetch"),
+    );
+    const networkEnvs = networkCalls.map(([, commandOptions]) =>
+      typeof commandOptions === "object" ? commandOptions?.env : undefined,
+    );
+    expect(networkEnvs.map((env) => env?.GIT_CONFIG_KEY_0)).toEqual([
+      "http.https://ghe.example.test/.extraHeader",
+      "http.https://github.com/.extraHeader",
+      "http.https://ghe.example.test/.extraHeader",
+    ]);
+    expect(networkEnvs.map((env) => env?.GIT_CONFIG_COUNT)).toEqual(["1", "1", "1"]);
+    expect(networkCalls.flatMap(([argv]) => argv)).not.toContain(token);
+    const unrelatedOrigin = await runCommand(
+      [
+        "git",
+        "config",
+        "--get-urlmatch",
+        "http.extraHeader",
+        "https://unrelated.example/acme/repository.git",
+      ],
+      { env: networkEnvs[0] },
+    );
+    expect(unrelatedOrigin).toMatchObject({ code: 1, stdout: "" });
   });
 
-  it.runIf(process.platform !== "win32")(
-    "does not run checkout hooks while refreshing managed refs",
-    async () => {
-      const { source, target } = await cloneFixture();
+  it.each(["sha256", ...(process.platform !== "win32" ? (["sha1"] as const) : [])] as const)(
+    "refreshes managed %s refs (SHA-1 with a forbidden checkout hook)",
+    async (format) => {
+      const { source, target } = await cloneFixture(format);
       const marker = path.join(root, "hook-ran");
-      const hooks = path.join(target, "git-hooks");
-      await fs.mkdir(hooks);
-      const hook = path.join(hooks, "reference-transaction");
-      await fs.writeFile(hook, `#!/bin/sh\ntouch '${marker}'\n`);
-      await fs.chmod(hook, 0o755);
-      await git(target, "config", "core.hooksPath", hooks);
+      if (format === "sha1") {
+        const hooks = path.join(target, "git-hooks");
+        await fs.mkdir(hooks);
+        const hook = path.join(hooks, "reference-transaction");
+        await fs.writeFile(hook, `#!/bin/sh\ntouch '${marker}'\n`);
+        await fs.chmod(hook, 0o755);
+        await git(target, "config", "core.hooksPath", hooks);
+      }
       const sourceHead = await commitFile(source, "later.txt", "later\n");
       await refreshProjectCheckout({ url: source, target });
 
-      await expect(fs.stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
+      if (format === "sha1") {
+        await expect(fs.stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
+      }
       expect(await gitText(target, "rev-parse", "origin/main")).toBe(sourceHead);
     },
   );
-
-  it("refreshes a managed SHA-256 checkout with its native object format", async () => {
-    const { source, target } = await cloneFixture("sha256");
-    const sourceHead = await commitFile(source, "later.txt", "later\n");
-
-    await refreshProjectCheckout({ url: source, target });
-
-    expect(await gitText(target, "rev-parse", "origin/main")).toBe(sourceHead);
-  });
 
   it("negotiates pinned partial-clone commits and preserves filtering during refresh", async () => {
     const source = await initializeRepository(root, "source");
@@ -444,32 +431,24 @@ describe("project registry persistence", () => {
         stateOptions,
       );
       await ready.promise;
-      let settled = false;
-      const pending = (
+      const pending = observe(
         existing
           ? materializeProjectClone({ cfg: {}, gitUrl: originUrl }, stateOptions)
-          : registerProjectRegistry({ path: checkout, name: "Raced registration" }, stateOptions)
-      ).then(
-        (value) => {
-          settled = true;
-          return { value };
-        },
-        (error: unknown) => {
-          settled = true;
-          return { error };
-        },
+          : registerProjectRegistry({ path: checkout, name: "Raced registration" }, stateOptions),
       );
       await Promise.resolve();
-      expect(settled).toBe(false);
+      expect(pending.settled()).toBe(false);
       release.resolve();
       if (existing) {
         await expect(deletion).rejects.toBe(deletionError);
-        await expect(pending).resolves.toEqual({ value: project });
+        await expect(pending.outcome).resolves.toEqual({ ok: true, value: project });
         await expect(fs.stat(checkout)).resolves.toBeDefined();
         return;
       }
       await expect(deletion).resolves.toBe(true);
-      await expect(pending).resolves.toMatchObject({ error: expect.any(ProjectCheckoutError) });
+      await expect(pending.outcome).resolves.toMatchObject({
+        error: expect.any(ProjectCheckoutError),
+      });
       expect(await listProjectRegistry({} as OpenClawConfig, stateOptions)).toEqual([
         expect.objectContaining({ source: "workspace" }),
       ]);
@@ -571,26 +550,25 @@ describe("project registry persistence", () => {
     },
   );
 
-  it("classifies authentication failures without returning credential material", async () => {
+  it("classifies authentication failures without returning credential material", async ({
+    onTestFinished,
+  }) => {
     const token = "github_pat_secret-fixture-value";
     const server = http.createServer((_request, response) => {
       response.writeHead(401, { "WWW-Authenticate": 'Basic realm="Git"' });
       response.end("authentication required");
     });
+    onTestFinished(() => closeServer(server));
     const url = `${await listen(server)}/private.git`;
-    try {
-      const error = await cloneProjectCheckout(
-        { url, target: path.join(root, "private") },
-        { token },
-      ).catch((caught: unknown) => caught);
+    const error = await cloneProjectCheckout(
+      { url, target: path.join(root, "private") },
+      { token },
+    ).catch((caught: unknown) => caught);
 
-      expect(error).toBeInstanceOf(ProjectCloneError);
-      expect(error).toMatchObject({ failure: "auth_required" });
-      expect((error as Error).message).not.toContain(token);
-      expect((error as Error).message).toContain("gateway.controlUi.github.token");
-      expect((error as Error).message).toContain("shared Gateway process environment");
-    } finally {
-      await closeServer(server);
-    }
+    expect(error).toBeInstanceOf(ProjectCloneError);
+    expect(error).toMatchObject({ failure: "auth_required" });
+    expect((error as Error).message).not.toContain(token);
+    expect((error as Error).message).toContain("gateway.controlUi.github.token");
+    expect((error as Error).message).toContain("shared Gateway process environment");
   });
 });

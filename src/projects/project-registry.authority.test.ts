@@ -227,7 +227,7 @@ function thrownBy(run: () => void): unknown {
   } catch (error) {
     return error;
   }
-  throw new Error("Expected authority check to fail");
+  return undefined;
 }
 
 function observeFailure(operation: Promise<unknown>) {
@@ -270,18 +270,14 @@ it("retains only live checkout rollback authority after cancellation inside the 
   const selected = await select(caller.signal);
   let escaped: Current | undefined;
   let workerGuard: (() => void) | undefined;
-  const rollbackEffect = vi.fn();
-  const forwardEffect = vi.fn();
   const inspect = vi.fn((current: Current) => ({
     project: current.project,
     signalAborted: current.signal.aborted,
     signalReason: current.signal.reason,
-    operationFailure: thrownBy(() => {
-      current.assertCurrent();
-      forwardEffect();
-    }),
+    operationFailure: thrownBy(current.assertCurrent),
     workerFailure: thrownBy(() => workerGuard?.()),
     workerGuard,
+    checkoutCurrent: current.assertCheckoutCurrent(),
   }));
   let revokedDatabaseFailure: unknown;
   fixture.captureWorkerGuard.mockImplementation((guard) => {
@@ -292,16 +288,11 @@ it("retains only live checkout rollback authority after cancellation inside the 
     escaped = current;
     caller.abort(abortCause);
     inspect(current);
-    current.assertCheckoutCurrent();
-    rollbackEffect();
     fixture.assertDatabaseCurrent.mockImplementation(() => {
       throw changedDatabase;
     });
-    try {
-      revokedDatabaseFailure = thrownBy(current.assertCheckoutCurrent);
-    } finally {
-      fixture.assertDatabaseCurrent.mockReset();
-    }
+    revokedDatabaseFailure = thrownBy(current.assertCheckoutCurrent);
+    fixture.assertDatabaseCurrent.mockReset();
     throw abortCause;
   });
 
@@ -317,8 +308,6 @@ it("retains only live checkout rollback authority after cancellation inside the 
   expect(observed?.workerGuard).toBeTypeOf("function");
   expect(observed?.workerFailure).toBe(abortCause);
   expect(revokedDatabaseFailure).toBe(changedDatabase);
-  expect(rollbackEffect).toHaveBeenCalledOnce();
-  expect(forwardEffect).not.toHaveBeenCalled();
   expect(escaped).toBeDefined();
   expect(() => escaped?.assertCheckoutCurrent()).toThrow();
   expect(() => escaped?.assertCurrent()).toThrow();

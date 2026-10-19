@@ -70,11 +70,12 @@ import { selectStoredProjectRegistry } from "./project-registry.js";
 import type { ProjectRegistryRecord } from "./project-registry.types.js";
 
 const root = path.resolve("/synthetic-project-state");
+const repository = path.resolve("/synthetic-repository");
 const project: ProjectRegistryRecord = {
   id: "registered-project",
   displayName: "Project",
   source: "registered",
-  repoRoot: path.resolve("/synthetic-repository/project"),
+  repoRoot: path.join(repository, "project"),
 };
 
 it.each(["selector", "migration"] as const)(
@@ -88,13 +89,10 @@ it.each(["selector", "migration"] as const)(
         OpenClaw_State_Dir: root,
         OpenClaw_Supervisor_Mode: "external",
       };
-      const entered = createDeferredCore();
+      const entered = createDeferredCore<OpenClawStateWorkerContext>();
       const projectRead = createDeferredCore<ProjectRegistryRecord>();
-      let captured: OpenClawStateWorkerContext | undefined;
-      let patchEnv: NodeJS.ProcessEnv | undefined;
       mocks.execute.mockImplementation(async (context: OpenClawStateWorkerContext) => {
-        captured = context;
-        entered.resolve();
+        entered.resolve(context);
         return await projectRead.promise;
       });
       const databasePath = path.resolve("/synthetic-agent/openclaw.sqlite");
@@ -102,11 +100,7 @@ it.each(["selector", "migration"] as const)(
         sessionId: "env-migration",
         updatedAt: 1,
         projectId: project.id,
-        worktree: {
-          id: "worktree",
-          branch: "task",
-          repoRoot: path.dirname(project.repoRoot),
-        },
+        worktree: { id: "worktree", branch: "task", repoRoot: repository },
       };
       mocks.readAgent.mockReturnValue({
         found: true,
@@ -114,12 +108,9 @@ it.each(["selector", "migration"] as const)(
       });
       mocks.patch.mockImplementation(
         async (
-          scope: { env?: NodeJS.ProcessEnv },
+          _scope: { env?: NodeJS.ProcessEnv },
           update: (current: SessionEntry) => Partial<SessionEntry> | null,
-        ) => {
-          patchEnv = scope.env;
-          return { ...entry, ...update(entry) };
-        },
+        ) => ({ ...entry, ...update(entry) }),
       );
       const pending =
         operation === "selector"
@@ -144,11 +135,11 @@ it.each(["selector", "migration"] as const)(
               expect(mocks.listWorktrees.mock.calls[0]?.[0].OPENCLAW_STATE_DIR).toBe(root);
               expect(env.OpenClaw_State_Dir).toBe(path.resolve("/changed-project-state"));
               expect(Object.hasOwn(env, "OPENCLAW_STATE_DIR")).toBe(false);
-              return patchEnv;
+              return mocks.patch.mock.calls[0]?.[0].env;
             });
       const joined = pending.catch(() => {});
       try {
-        await awaitGateBeforeSettlement(entered.promise, pending, "Project read was bypassed");
+        const context = await awaitGateBeforeSettlement(entered.promise, pending, "Read bypassed");
         env.OpenClaw_State_Dir = path.resolve("/changed-project-state");
         env.OpenClaw_Supervisor_Mode = "other";
         projectRead.resolve(project);
@@ -157,11 +148,11 @@ it.each(["selector", "migration"] as const)(
         expect(snapshot).not.toBe(env);
         expect(Object.keys(snapshot ?? {})).toContain("OpenClaw_State_Dir");
         expect(Object.keys(snapshot ?? {})).not.toContain("OPENCLAW_STATE_DIR");
-        expect(captured?.environment).toEqual({
+        expect(context.environment).toEqual({
           OPENCLAW_STATE_DIR: root,
           OPENCLAW_SUPERVISOR_MODE: "external",
         });
-        expect(captured?.admission.databasePath).toBe(path.join(root, "state", "openclaw.sqlite"));
+        expect(context.admission.databasePath).toBe(path.join(root, "state", "openclaw.sqlite"));
         expect(mocks.forbiddenSqlite).not.toHaveBeenCalled();
       } finally {
         projectRead.resolve(project);
