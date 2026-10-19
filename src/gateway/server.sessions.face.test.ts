@@ -15,6 +15,29 @@ import {
 } from "./test/server-sessions.test-helpers.js";
 
 const { createSessionStoreDir, openClient } = setupGatewaySessionsTestHarness();
+type BoardSession = {
+  key: string;
+  boardFace?: string;
+  boardPresentation?: string;
+  hasBoard?: boolean;
+};
+type BoardList = { sessions: BoardSession[]; totalCount: number };
+type Client = Awaited<ReturnType<typeof openClient>>["ws"];
+
+async function request<T>(ws: Client, method: string, params: Record<string, unknown>) {
+  const result = await rpcReq<T>(ws, method, params);
+  expect(result.ok, JSON.stringify(result.error)).toBe(true);
+  return result.payload!;
+}
+
+async function withClient(scopes: string[], run: (ws: Client) => Promise<void>) {
+  const { ws } = await openClient({ scopes });
+  try {
+    await run(ws);
+  } finally {
+    ws.close();
+  }
+}
 
 test("dashboard defaults persist for another client and clear without changing the board face", async () => {
   const { storePath } = await createSessionStoreDir();
@@ -24,90 +47,58 @@ test("dashboard defaults persist for another client and clear without changing t
       [key]: { sessionId: "dashboard-default", updatedAt: 1, boardFace: "dashboard" },
     },
   });
-  const writer = await openClient({ scopes: ["operator.read", "operator.write"] });
-  try {
-    const patched = await rpcReq<{ entry: { boardPresentation?: string } }>(
-      writer.ws,
-      "sessions.patch",
-      { key, boardPresentation: "expanded" },
-    );
-    expect(patched.ok).toBe(true);
-    expect(patched.payload?.entry.boardPresentation).toBe("expanded");
-    const invalid = await rpcReq(writer.ws, "sessions.patch", {
+  await withClient(["operator.read", "operator.write"], async (ws) => {
+    const patched = await request<{ entry: BoardSession }>(ws, "sessions.patch", {
+      key,
+      boardPresentation: "expanded",
+    });
+    expect(patched.entry.boardPresentation).toBe("expanded");
+    const invalid = await rpcReq(ws, "sessions.patch", {
       key,
       boardPresentation: "fullscreen",
     });
-    expect(invalid.ok).toBe(false);
-    expect(invalid.error?.code).toBe("INVALID_REQUEST");
-  } finally {
-    writer.ws.close();
-  }
+    expect(invalid).toMatchObject({ ok: false, error: { code: "INVALID_REQUEST" } });
+  });
 
   // Drop the cached handle before the next client reads the durable session row.
   const target = resolveSqliteTargetFromSessionStorePath(storePath, { agentId: "main" });
   await closeOpenClawAgentDatabaseByPathAsync(target.path);
-  const reader = await openClient({ scopes: ["operator.read"] });
-  try {
-    const described = await rpcReq<{ session: { boardPresentation?: string } }>(
-      reader.ws,
-      "sessions.describe",
-      { key },
-    );
-    expect(described.ok).toBe(true);
-    expect(described.payload?.session.boardPresentation).toBe("expanded");
-    const listed = await rpcReq<{ sessions: Array<{ key: string; boardPresentation?: string }> }>(
-      reader.ws,
-      "sessions.list",
-      {},
-    );
+  await withClient(["operator.read"], async (ws) => {
+    const described = await request<{ session: BoardSession }>(ws, "sessions.describe", { key });
+    expect(described.session.boardPresentation).toBe("expanded");
+    const listed = await rpcReq<BoardList>(ws, "sessions.list", {});
     expect(listed.payload?.sessions).toContainEqual(
       expect.objectContaining({ key, boardPresentation: "expanded" }),
     );
-    const resolved = await rpcReq<{ boardPresentation?: string }>(reader.ws, "sessions.resolve", {
+    const resolved = await request<BoardSession>(ws, "sessions.resolve", {
       reference: { key },
     });
-    expect(resolved.ok).toBe(true);
-    expect(resolved.payload?.boardPresentation).toBe("expanded");
-    const denied = await rpcReq(reader.ws, "sessions.patch", { key, boardPresentation: "split" });
-    expect(denied.ok).toBe(false);
-    expect(denied.error?.message).toContain("missing scope: operator.write");
-  } finally {
-    reader.ws.close();
-  }
+    expect(resolved.boardPresentation).toBe("expanded");
+    const denied = await rpcReq(ws, "sessions.patch", { key, boardPresentation: "split" });
+    expect(denied).toMatchObject({
+      ok: false,
+      error: { message: expect.stringContaining("missing scope: operator.write") },
+    });
+  });
 
-  const clearer = await openClient({ scopes: ["operator.read", "operator.write"] });
-  try {
-    const cleared = await rpcReq<{ entry: { boardFace?: string; boardPresentation?: string } }>(
-      clearer.ws,
-      "sessions.patch",
-      { key, boardPresentation: null },
-    );
-    expect(cleared.ok).toBe(true);
-    expect(cleared.payload?.entry.boardPresentation).toBeUndefined();
-    expect(cleared.payload?.entry.boardFace).toBe("dashboard");
+  await withClient(["operator.read", "operator.write"], async (ws) => {
+    const cleared = await request<{ entry: BoardSession }>(ws, "sessions.patch", {
+      key,
+      boardPresentation: null,
+    });
+    expect(cleared.entry.boardFace).toBe("dashboard");
+    expect(cleared.entry.boardPresentation).toBeUndefined();
     await closeOpenClawAgentDatabaseByPathAsync(target.path);
     const entry = loadSessionEntry({ agentId: "main", sessionKey: key, storePath });
     expect(entry?.boardFace).toBe("dashboard");
     expect(entry).not.toHaveProperty("boardPresentation");
-    const described = await rpcReq<{ session: { boardPresentation?: string } }>(
-      clearer.ws,
-      "sessions.describe",
-      { key },
-    );
-    expect(described.ok).toBe(true);
-    expect(described.payload?.session).not.toHaveProperty("boardPresentation");
-    const listed = await rpcReq<{ sessions: Array<{ key: string; boardPresentation?: string }> }>(
-      clearer.ws,
-      "sessions.list",
-      {},
-    );
-    expect(listed.ok).toBe(true);
-    expect(listed.payload?.sessions.find((session) => session.key === key)).not.toHaveProperty(
+    const described = await request<{ session: BoardSession }>(ws, "sessions.describe", { key });
+    expect(described.session).not.toHaveProperty("boardPresentation");
+    const listed = await request<BoardList>(ws, "sessions.list", {});
+    expect(listed.sessions.find((session) => session.key === key)).not.toHaveProperty(
       "boardPresentation",
     );
-  } finally {
-    clearer.ws.close();
-  }
+  });
 });
 
 test("sessions.list filters dashboard sessions by board existence instead of saved face", async () => {
@@ -115,46 +106,36 @@ test("sessions.list filters dashboard sessions by board existence instead of sav
   const now = Date.now();
   await writeSessionStore({
     entries: {
-      board: {
-        sessionId: "sess-board",
-        updatedAt: now,
-        boardFace: "chat",
-      },
-      faceOnly: {
-        sessionId: "sess-face-only",
-        updatedAt: now - 1,
-        boardFace: "dashboard",
-      },
+      board: { sessionId: "sess-board", updatedAt: now, boardFace: "chat" },
+      faceOnly: { sessionId: "sess-face-only", updatedAt: now - 1, boardFace: "dashboard" },
     },
   });
   await boardStore.applyOps({ sessionKey: "agent:main:board" }, [
     { kind: "tab_create", tabId: "main", title: "Dashboard" },
   ]);
 
-  const { ws } = await openClient({ scopes: ["operator.read", "operator.write"] });
-  try {
-    const listed = await rpcReq<{
-      sessions: Array<{ key: string; boardFace?: string; hasBoard?: boolean }>;
-      totalCount: number;
-    }>(ws, "sessions.list", { hasBoard: true, rowMode: "compact", limit: 50 });
+  await withClient(["operator.read", "operator.write"], async (ws) => {
+    const listed = await request<BoardList>(ws, "sessions.list", {
+      hasBoard: true,
+      rowMode: "compact",
+      limit: 50,
+    });
 
-    expect(listed.ok).toBe(true);
-    expect(listed.payload?.totalCount).toBe(1);
-    expect(listed.payload?.sessions).toEqual([
+    expect(listed.totalCount).toBe(1);
+    expect(listed.sessions).toEqual([
       expect.objectContaining({ key: "agent:main:board", boardFace: "chat", hasBoard: true }),
     ]);
 
-    const withoutBoards = await rpcReq<{
-      sessions: Array<{ key: string; hasBoard?: boolean }>;
-      totalCount: number;
-    }>(ws, "sessions.list", { hasBoard: false, limit: 50 });
-    expect(withoutBoards.ok).toBe(true);
-    expect(withoutBoards.payload?.totalCount).toBe(1);
-    expect(withoutBoards.payload?.sessions).toEqual([
+    const withoutBoards = await request<BoardList>(ws, "sessions.list", {
+      hasBoard: false,
+      limit: 50,
+    });
+    expect(withoutBoards.totalCount).toBe(1);
+    expect(withoutBoards.sessions).toEqual([
       expect.objectContaining({ key: "agent:main:faceonly", hasBoard: false }),
     ]);
 
-    expect((await rpcReq(ws, "sessions.subscribe", {})).ok).toBe(true);
+    await request(ws, "sessions.subscribe", {});
     const changed = onceMessage(
       ws,
       (event) =>
@@ -163,21 +144,15 @@ test("sessions.list filters dashboard sessions by board existence instead of sav
         event.payload?.sessionKey === "agent:main:board" &&
         event.payload?.reason === "board",
     );
-    expect(
-      (
-        await rpcReq(ws, "board.update", {
-          sessionKey: "agent:main:board",
-          ops: [{ kind: "tab_delete", tabId: "main" }],
-        })
-      ).ok,
-    ).toBe(true);
+    await request(ws, "board.update", {
+      sessionKey: "agent:main:board",
+      ops: [{ kind: "tab_delete", tabId: "main" }],
+    });
     expect((await changed).payload?.session).toMatchObject({
       key: "agent:main:board",
       hasBoard: false,
     });
-  } finally {
-    ws.close();
-  }
+  });
 });
 
 test("sessions.list ignores a same-owner sentinel board in an unselected store", async () => {

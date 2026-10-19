@@ -44,10 +44,7 @@ const { createSessionStoreDir } = setupGatewaySessionsHandlerTestHarness();
 
 test.each(
   (["clone", "refresh"] as const).flatMap((operation) =>
-    (["allowed", "retired", "rotated"] as const).map((identity) => ({
-      operation,
-      identity,
-    })),
+    (["allowed", "retired", "rotated"] as const).map((identity) => ({ operation, identity })),
   ),
 )(
   "sessions.create fences $operation Git effects when its identity is $identity",
@@ -58,10 +55,12 @@ test.each(
     vi.stubEnv("GITHUB_TOKEN", "");
     const { storePath } = await createSessionStoreDir();
     const profileId = "ghp_11111111111111111111111111111111";
-    await writeManagedGitHubProfileFiles(
-      resolveManagedGitHubProfileDir({ agentId: "main", scope: "system", profileId }),
-      { login: "fixture", token: TOKEN },
-    );
+    const profileDir = resolveManagedGitHubProfileDir({
+      agentId: "main",
+      scope: "system",
+      profileId,
+    });
+    await writeManagedGitHubProfileFiles(profileDir, { login: "fixture", token: TOKEN });
     const selected = {
       ...getRuntimeConfig(),
       gateway: { projects: { nativeGitHubSearch: true } },
@@ -129,23 +128,8 @@ test.each(
       await released;
       expect(getRpcSource(runId)).toBeUndefined();
       const entry = (await loadGatewaySessionEntryReadOnlyAsync(key, { agentId: "main" })).entry;
-      expect(
-        entry,
-        JSON.stringify({
-          key,
-          storePath,
-          events: broadcast.mock.calls.map(([event, data]) => ({
-            event,
-            state: data?.state,
-            error: data?.errorMessage,
-          })),
-        }),
-      ).toBeDefined();
-      return {
-        key,
-        runId,
-        entry,
-      };
+      expect(entry, JSON.stringify({ key, storePath, errors: errors() })).toBeDefined();
+      return { key, runId, entry };
     };
     if (operation === "refresh") {
       const warm = await create();
@@ -160,10 +144,10 @@ test.each(
       if (identity === "retired") {
         setRuntimeConfigSnapshot({ ...selected, tools: {} });
       } else if (identity === "rotated") {
-        await writeManagedGitHubProfileFiles(
-          resolveManagedGitHubProfileDir({ agentId: "main", scope: "system", profileId }),
-          { login: "fixture", token: `${TOKEN}-rotated` },
-        );
+        await writeManagedGitHubProfileFiles(profileDir, {
+          login: "fixture",
+          token: `${TOKEN}-rotated`,
+        });
       }
     };
     if (operation === "clone") {

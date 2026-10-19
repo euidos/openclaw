@@ -1,6 +1,4 @@
-/**
- * Gateway health endpoint integration tests.
- */
+/** Gateway health endpoint integration tests. */
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { asOptionalRecord, expectDefined } from "@openclaw/normalization-core";
@@ -51,7 +49,6 @@ describe("gateway server health/presence", () => {
     async () => {
       const { ws } = await harness.openClient();
 
-      const healthP = onceMessage(ws, (o) => o.type === "res" && o.id === "health1");
       let statusPayload: Record<string, unknown> | undefined;
       const statusP = readGatewayMemory(
         async <T>(method: string, params: unknown, timeoutMs?: number) => {
@@ -63,16 +60,11 @@ describe("gateway server health/presence", () => {
         },
         performance.now(),
       );
-      const presenceP = onceMessage(ws, (o) => o.type === "res" && o.id === "presence1");
-
-      const sendReq = (id: string, method: string) =>
-        ws.send(JSON.stringify({ type: "req", id, method }));
-      sendReq("health1", "health");
-      sendReq("presence1", "system-presence");
-
-      const health = await healthP;
-      const sample = await statusP;
-      const presence = await presenceP;
+      const [health, sample, presence] = await Promise.all([
+        rpcReq(ws, "health", {}),
+        statusP,
+        rpcReq(ws, "system-presence", {}),
+      ]);
       expect(health.ok).toBe(true);
       expect(presence.ok).toBe(true);
       expect(Array.isArray(presence.payload)).toBe(true);
@@ -110,20 +102,13 @@ describe("gateway server health/presence", () => {
         ws,
         (o) => o.type === "event" && o.event === "presence",
       );
-      ws.send(
-        JSON.stringify({
-          type: "req",
-          id: "evt-1",
-          method: "system-event",
-          params: { text: "note from test" },
-        }),
-      );
-
-      const evt = await presenceEventP;
+      const [, evt] = await Promise.all([
+        rpcReq(ws, "system-event", { text: "note from test" }),
+        presenceEventP,
+      ]);
       expect(typeof evt.seq).toBe("number");
       expect(evt.stateVersion?.presence).toBeGreaterThan(0);
-      const evtPayload = evt.payload as { presence?: unknown } | undefined;
-      expect(Array.isArray(evtPayload?.presence)).toBe(true);
+      expect(Array.isArray(evt.payload?.presence)).toBe(true);
 
       const instanceId = `presence-beacon-${randomUUID()}`;
       const sessionKey = `agent:main:presence-${randomUUID()}`;
@@ -214,11 +199,7 @@ describe("gateway server health/presence", () => {
     );
     emitAgentEvent({ runId, stream: "lifecycle", data: { msg: "hi" } });
     const evt = await evtPromise;
-    const payload = evt.payload as Record<string, unknown> | undefined;
-    expect(payload?.runId).toBe(runId);
-    expect(typeof evt.seq).toBe("number");
-    const data = payload?.data as Record<string, unknown> | undefined;
-    expect(data?.msg).toBe("hi");
+    expect(evt).toMatchObject({ seq: expect.any(Number), payload: { runId, data: { msg: "hi" } } });
 
     ws.close();
   });

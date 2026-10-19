@@ -121,15 +121,24 @@ test.each(["mobile", "node"] as const)("trusted-proxy %s pairing", async (profil
       if (profile === "node") {
         delete nodeHeaders["x-forwarded-user"];
       }
-      const node = await openTrackedWs(started.port, nodeHeaders);
-      sockets.push(node);
-      const connected = await connectReq(node, {
-        skipDefaultAuth: true,
+      const connectDevice = async (
+        overrides: Parameters<typeof connectReq>[1],
+        headers = nodeHeaders,
+      ) => {
+        const deviceWs = await openTrackedWs(started.port, headers);
+        sockets.push(deviceWs);
+        const response = await connectReq(deviceWs, {
+          skipDefaultAuth: true,
+          role: "node",
+          scopes: [],
+          client: nodeClient,
+          deviceIdentityPath: phone.identityPath,
+          ...overrides,
+        });
+        return { ws: deviceWs, response };
+      };
+      const { ws: node, response: connected } = await connectDevice({
         bootstrapToken: payload.bootstrapToken,
-        role: "node",
-        scopes: [],
-        client: nodeClient,
-        deviceIdentityPath: phone.identityPath,
       });
       expect(connected.ok, JSON.stringify(connected.error)).toBe(true);
       const handoff = connected.payload?.auth;
@@ -158,15 +167,10 @@ test.each(["mobile", "node"] as const)("trusted-proxy %s pairing", async (profil
         expect(await rpcReq(node, "config.get", {})).toMatchObject({ ok: false });
         // Reconnect with the issued node token, without proxy identity or setup code.
         for (const role of ["node", "operator"] as const) {
-          const reconnect = await openTrackedWs(started.port, nodeHeaders);
-          sockets.push(reconnect);
-          const reconnected = await connectReq(reconnect, {
-            skipDefaultAuth: true,
+          const { response: reconnected } = await connectDevice({
             deviceToken: String(handoff.deviceToken),
             role,
             scopes: role === "node" ? [] : ["operator.admin"],
-            client: nodeClient,
-            deviceIdentityPath: phone.identityPath,
           });
           expect(reconnected.ok, JSON.stringify(reconnected.error)).toBe(role === "node");
         }
@@ -181,16 +185,10 @@ test.each(["mobile", "node"] as const)("trusted-proxy %s pairing", async (profil
         if (!authenticatedProxy) {
           delete headers["x-forwarded-user"];
         }
-        const replay = await openTrackedWs(started.port, headers);
-        sockets.push(replay);
-        const reconnected = await connectReq(replay, {
-          skipDefaultAuth: true,
-          bootstrapToken: payload.bootstrapToken,
-          role: "node",
-          scopes: [],
-          client: nodeClient,
-          deviceIdentityPath: phone.identityPath,
-        });
+        const { response: reconnected } = await connectDevice(
+          { bootstrapToken: payload.bootstrapToken },
+          headers,
+        );
         expect(reconnected.ok).toBe(authenticatedProxy);
         if (!authenticatedProxy) {
           expect(reconnected.error?.details).toMatchObject({

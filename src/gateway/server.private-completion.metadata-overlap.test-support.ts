@@ -7,7 +7,6 @@ import { runWithGatewayIndependentRootWorkAdmission } from "../process/gateway-w
 import { runOutsideAsyncWorkScope } from "../shared/async-work-scope.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import * as writerQueue from "../shared/store-writer-queue.js";
-import type { AgentDatabaseExecutionScope } from "../state/openclaw-agent-execution-contract.js";
 import * as executionOwner from "../state/openclaw-agent-execution.js";
 import { SQLITE_SESSION_WRITER_QUEUES } from "../state/openclaw-agent-write-admission-state.js";
 
@@ -41,6 +40,25 @@ export function holdMetadataThroughSubagentStop(target: {
   };
   const onAbort = () => release("test-abort");
   target.signal.addEventListener("abort", onAbort, { once: true });
+  const writeMetadata = () =>
+    applySessionEntryExactReplacements({
+      agentId: "main",
+      storePath: target.storePath,
+      sessionKeys: [target.sessionKey],
+      activeSessionKey: target.sessionKey,
+      skipMaintenance: true,
+      requireWriteSuccess: true,
+      update(entries) {
+        const row = entries.find((entry) => entry.sessionKey === target.sessionKey);
+        if (!row || row.entry.sessionId !== target.sessionId || row.entry.label === label) {
+          throw new Error("Concurrent metadata writer lost its original child");
+        }
+        return {
+          result: undefined,
+          replacements: [{ sessionKey: row.sessionKey, entry: { ...row.entry, label } }],
+        };
+      },
+    });
 
   const runQueued = writerQueue.runQueuedStoreWrite;
   const queueSpy = vi.spyOn(writerQueue, "runQueuedStoreWrite").mockImplementation((params) => {
@@ -83,8 +101,8 @@ export function holdMetadataThroughSubagentStop(target: {
       const runExisting: typeof execution.runExisting = (source, operation, options) =>
         execution.runExisting(
           source,
-          (scope) => {
-            const wrapped: AgentDatabaseExecutionScope = {
+          (scope) =>
+            operation({
               execute(command, commandOptions) {
                 const pending = scope.execute(command, commandOptions);
                 if (command.type !== "session.entries.replace" || resultHeld) {
@@ -97,9 +115,7 @@ export function holdMetadataThroughSubagentStop(target: {
                   return value;
                 });
               },
-            };
-            return operation(wrapped);
-          },
+            }),
           options,
         );
       return new Proxy(execution, {
@@ -142,31 +158,7 @@ export function holdMetadataThroughSubagentStop(target: {
       // that scope while waiting for the mandatory marker which the RPC has yet to enqueue.
       producer = runOutsideAsyncWorkScope(() =>
         runWithGatewayIndependentRootWorkAdmission(
-          () =>
-            producerScope.run(true, () =>
-              applySessionEntryExactReplacements({
-                agentId: "main",
-                storePath: target.storePath,
-                sessionKeys: [target.sessionKey],
-                activeSessionKey: target.sessionKey,
-                skipMaintenance: true,
-                requireWriteSuccess: true,
-                update(entries) {
-                  const row = entries.find((entry) => entry.sessionKey === target.sessionKey);
-                  if (
-                    !row ||
-                    row.entry.sessionId !== target.sessionId ||
-                    row.entry.label === label
-                  ) {
-                    throw new Error("Concurrent metadata writer lost its original child");
-                  }
-                  return {
-                    result: undefined,
-                    replacements: [{ sessionKey: row.sessionKey, entry: { ...row.entry, label } }],
-                  };
-                },
-              }),
-            ),
+          () => producerScope.run(true, writeMetadata),
           "test:private-completion-metadata",
           target.signal,
         ),

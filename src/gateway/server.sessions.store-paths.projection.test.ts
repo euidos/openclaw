@@ -18,6 +18,29 @@ import {
 } from "./test/server-sessions.test-helpers.js";
 
 const { createSessionStoreDir } = setupGatewaySessionsHandlerTestHarness();
+const agentIds = Array.from({ length: 29 }, (_, index) => `agent-${index}`);
+
+function configureStores(stateDir: string) {
+  const storeTemplate = path.join(stateDir, "agents", "{agentId}", "sessions", "sessions.json");
+  testState.sessionConfig = { store: storeTemplate };
+  testState.agentsConfig = { entries: Object.fromEntries(agentIds.map((id) => [id, {}])) };
+  return storeTemplate;
+}
+
+async function seedStores(storeTemplate: string, agentRuntimeOverride?: "openclaw") {
+  for (const agentId of agentIds) {
+    const storePath = storeTemplate.replace("{agentId}", agentId);
+    // Seed metadata without unrelated lifecycle deletion workers.
+    await withOpenClawAgentDatabaseWrite(
+      { agentId, path: resolveSqliteTargetFromSessionStorePath(storePath, { agentId }).path },
+      () =>
+        replaceSessionEntrySync(
+          { agentId, sessionKey: `agent:${agentId}:main`, storePath },
+          { sessionId: `session-${agentId}`, updatedAt: 10, agentRuntimeOverride },
+        ),
+    );
+  }
+}
 
 test("automatic list and search projection reuse conventional state-directory preparation", async () => {
   const { dir: home } = await createSessionStoreDir();
@@ -30,18 +53,7 @@ test("automatic list and search projection reuse conventional state-directory pr
       { OPENCLAW_HOME: home, OPENCLAW_STATE_DIR: undefined, OPENCLAW_TEST_FAST: "0" },
       async () => {
         runtimePaths.pinRuntimePaths();
-        const agentIds = Array.from({ length: 29 }, (_, index) => `agent-${index}`);
-        const storeTemplate = path.join(
-          stateDir,
-          "agents",
-          "{agentId}",
-          "sessions",
-          "sessions.json",
-        );
-        testState.sessionConfig = { store: storeTemplate };
-        testState.agentsConfig = {
-          entries: Object.fromEntries(agentIds.map((id) => [id, {}])),
-        };
+        const storeTemplate = configureStores(stateDir);
         const { setRuntimeConfigSnapshot } = await getGatewayConfigModule();
         const { resolvePluginMetadataSnapshot } =
           await import("../plugins/plugin-metadata-snapshot.js");
@@ -54,32 +66,10 @@ test("automatic list and search projection reuse conventional state-directory pr
         await withPluginMetadataSnapshotScope(
           metadata,
           async () => {
-            const stateDirectoryProbes: Array<{
-              search: string;
-              runtime: string;
-              stack: string | undefined;
-            }> = [];
-            for (const agentRuntimeOverride of ["openclaw", undefined]) {
+            const stateDirectoryProbes: Error[] = [];
+            for (const agentRuntimeOverride of ["openclaw", undefined] as const) {
               // Search changes only the request; reuse each runtime's admitted stores.
-              for (const agentId of agentIds) {
-                const storePath = storeTemplate.replace("{agentId}", agentId);
-                // Seed list metadata without running unrelated lifecycle deletion workers.
-                await withOpenClawAgentDatabaseWrite(
-                  {
-                    agentId,
-                    path: resolveSqliteTargetFromSessionStorePath(storePath, { agentId }).path,
-                  },
-                  () =>
-                    replaceSessionEntrySync(
-                      { agentId, sessionKey: `agent:${agentId}:main`, storePath },
-                      {
-                        sessionId: `session-${agentId}`,
-                        updatedAt: 10,
-                        agentRuntimeOverride,
-                      },
-                    ),
-                );
-              }
+              await seedStores(storeTemplate, agentRuntimeOverride);
               for (const search of [undefined, "unmatched-runtime-search", "openclaw"]) {
                 const request = { configuredAgentsOnly: true, includeGlobal: false, search };
                 const warm = await directSessionReq("sessions.list", request);
@@ -92,11 +82,7 @@ test("automatic list and search projection reuse conventional state-directory pr
                     stateDirectoryProbes.length < 3 &&
                     (pathname === stateDir || pathname === legacyStateDir)
                   ) {
-                    stateDirectoryProbes.push({
-                      search: search ?? "list",
-                      runtime: agentRuntimeOverride ?? "auto",
-                      stack: new Error("Unexpected state-directory probe").stack,
-                    });
+                    stateDirectoryProbes.push(new Error("Unexpected state-directory probe"));
                   }
                   return existsSync(pathname);
                 });
@@ -140,26 +126,9 @@ test("configured-only multi-store target preparation is reused across distinct l
   const { dir: stateDir } = await createSessionStoreDir();
   testState.sessionStorePath = undefined;
   await withEnvAsync({ OPENCLAW_STATE_DIR: stateDir }, async () => {
-    const agentIds = Array.from({ length: 29 }, (_, index) => `agent-${index}`);
-    const storeTemplate = path.join(stateDir, "agents", "{agentId}", "sessions", "sessions.json");
-    testState.sessionConfig = { store: storeTemplate };
-    testState.agentsConfig = { entries: Object.fromEntries(agentIds.map((id) => [id, {}])) };
+    const storeTemplate = configureStores(stateDir);
     (await getGatewayConfigModule()).setRuntimeConfigSnapshot(loadGatewayTestConfig());
-    for (const agentId of agentIds) {
-      const storePath = storeTemplate.replace("{agentId}", agentId);
-      // Seed list metadata without running unrelated lifecycle deletion workers.
-      await withOpenClawAgentDatabaseWrite(
-        {
-          agentId,
-          path: resolveSqliteTargetFromSessionStorePath(storePath, { agentId }).path,
-        },
-        () =>
-          replaceSessionEntrySync(
-            { agentId, sessionKey: `agent:${agentId}:main`, storePath },
-            { sessionId: `session-${agentId}`, updatedAt: 10 },
-          ),
-      );
-    }
+    await seedStores(storeTemplate);
 
     expect((await directSessionReq("sessions.list", { configuredAgentsOnly: true })).ok).toBe(true);
     const matcher = vi.spyOn(agentDatabasePaths, "createOpenClawAgentDatabasePathMatcher");
@@ -197,11 +166,9 @@ test("configured-only multi-store target preparation is reused across distinct l
         stat: stat.mock.calls.length,
       }).toEqual({ lstat: 0, matcher: 0, readlink: 0, realpath: 0, stat: 0 });
     } finally {
-      matcher.mockRestore();
-      lstat.mockRestore();
-      readlink.mockRestore();
-      realpath.mockRestore();
-      stat.mockRestore();
+      for (const spy of [matcher, lstat, readlink, realpath, stat]) {
+        spy.mockRestore();
+      }
       syncBuiltinESMExports();
     }
   });
