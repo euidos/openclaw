@@ -16,7 +16,14 @@ import { openNodeSqliteDatabase } from "./node-sqlite.js";
 import { admitSqliteSchema } from "./sqlite-schema-facts.js";
 import { hasLegacyCronRunLogs } from "./state-migrations.cron-run-logs.js";
 
-const CRON_RUN_LOG_TASK_IMPORT_MIGRATION_ID = "state:cron-run-logs-to-task-runs:v1";
+const migrationId = "state:cron-run-logs-to-task-runs:v1";
+const publicFields = (entry: CronRunLogEntry) => ({
+  ts: entry.ts,
+  jobId: entry.jobId,
+  runId: entry.runId,
+  summary: entry.summary,
+  error: entry.error,
+});
 
 describe("cron run-log task import", () => {
   it("reuses admitted legacy-table presence and observes committed or rolled-back DDL", () => {
@@ -150,11 +157,9 @@ describe("cron run-log task import", () => {
             );
           }
           fixture
-            .prepare(
-              `INSERT INTO cron_run_logs
+            .prepare(`INSERT INTO cron_run_logs
                 (store_key, job_id, seq, ts, entry_json, created_at)
-               VALUES (?, ?, 8, 5100, '{', 5100)`,
-            )
+               VALUES (?, ?, 8, 5100, '{', 5100)`)
             .run(storeKey, jobId);
         } finally {
           fixture.close();
@@ -177,10 +182,10 @@ describe("cron run-log task import", () => {
           preserved.close();
         }
         expect(repairOpenClawStateDatabaseSchema().warnings).toEqual([]);
-        const reopened = openOpenClawStateDatabase();
-        const report = reopened.db
+        const { db } = openOpenClawStateDatabase();
+        const report = db
           .prepare("SELECT report_json FROM migration_runs WHERE id = ?")
-          .get(CRON_RUN_LOG_TASK_IMPORT_MIGRATION_ID) as { report_json: string };
+          .get(migrationId) as { report_json: string };
         expect(JSON.parse(report.report_json)).toEqual({
           imported: 4,
           alreadyMirrored: 3,
@@ -193,26 +198,13 @@ describe("cron run-log task import", () => {
           limit: 50,
           sortDir: "asc",
         }).entries;
-        const publicFields = ({
-          ts,
-          jobId: entryJobId,
-          runId,
-          summary,
-          error,
-        }: CronRunLogEntry) => ({
-          ts,
-          jobId: entryJobId,
-          runId,
-          summary,
-          error,
-        });
         expect(ledgerEntries.map(publicFields)).toEqual(entries.map(publicFields));
         expect(
-          reopened.db
+          db
             .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cron_run_logs'")
             .get(),
         ).toBeUndefined();
-        const imported = reopened.db
+        const imported = db
           .prepare(
             "SELECT task_id, cleanup_after FROM task_runs WHERE task_id LIKE 'cron-runlog-import:%' ORDER BY task_id",
           )
@@ -226,14 +218,12 @@ describe("cron run-log task import", () => {
         expect(imported.every((row) => row.cleanup_after === null)).toBe(true);
 
         closeOpenClawStateDatabaseForTest();
-        const secondOpen = openOpenClawStateDatabase();
-        expect(secondOpen.db.prepare("SELECT COUNT(*) AS count FROM task_runs").get()).toEqual({
+        const { db: reopened } = openOpenClawStateDatabase();
+        expect(reopened.prepare("SELECT COUNT(*) AS count FROM task_runs").get()).toEqual({
           count: 6,
         });
         expect(
-          secondOpen.db
-            .prepare("SELECT report_json FROM migration_runs WHERE id = ?")
-            .get(CRON_RUN_LOG_TASK_IMPORT_MIGRATION_ID),
+          reopened.prepare("SELECT report_json FROM migration_runs WHERE id = ?").get(migrationId),
         ).toEqual({ report_json: report.report_json });
       },
     );

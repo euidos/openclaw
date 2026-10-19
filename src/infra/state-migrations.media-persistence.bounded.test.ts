@@ -32,17 +32,18 @@ it("keeps unrelated legacy content and planner maintenance outside a version mig
   openOpenClawStateDatabase({ env });
   const pathname = resolveOpenClawAgentSqlitePath({ agentId: "main", env });
   fs.mkdirSync(path.dirname(pathname), { recursive: true });
-  const event = JSON.stringify({
-    type: "message",
-    id: "retained",
-    parentId: null,
-    timestamp: 1,
-    message: {
-      role: "assistant",
-      content: [{ type: "text", text: "[[reply_to_current]] retained" }],
-      MediaPath: "/media/retained.png",
-    },
+  const message = (text: string) => ({
+    role: "assistant",
+    content: [{ type: "text", text: `[[reply_to_current]] ${text}` }],
   });
+  const event = JSON.stringify(
+    createEvent({
+      id: "retained",
+      parentId: null,
+      timestamp: 1,
+      message: { ...message("retained"), MediaPath: "/media/retained.png" },
+    }),
+  );
   const trajectory = JSON.stringify({
     data: { messagesSnapshot: [{ role: "user", MediaPath: "/media/retained.png" }] },
   });
@@ -94,15 +95,7 @@ it("keeps unrelated legacy content and planner maintenance outside a version mig
     schemaVersion: OPENCLAW_AGENT_SCHEMA_VERSION,
     eventsBySession: {
       current: [
-        createEvent({
-          id: "current",
-          parentId: null,
-          timestamp: 1,
-          message: {
-            role: "assistant",
-            content: [{ type: "text", text: "[[reply_to_current]] current" }],
-          },
-        }),
+        createEvent({ id: "current", parentId: null, timestamp: 1, message: message("current") }),
       ],
     },
   });
@@ -162,36 +155,24 @@ it("keeps unrelated legacy content and planner maintenance outside a version mig
   expect(fs.readFileSync(archivePath)).toEqual(archive);
   {
     using migrated = openNodeSqliteDatabase(pathname, { readOnly: true });
-    expect(migrated.prepare("PRAGMA user_version").get()?.user_version).toBe(
-      OPENCLAW_AGENT_SCHEMA_VERSION,
+    const row = (sql: string) => migrated.prepare(sql).get();
+    expect(row("PRAGMA user_version")?.user_version).toBe(OPENCLAW_AGENT_SCHEMA_VERSION);
+    expect(row("SELECT event_json FROM transcript_events")?.event_json).toBe(event);
+    expect(row("SELECT event_json FROM trajectory_runtime_events")?.event_json).toBe(trajectory);
+    expect(row("SELECT stat FROM sqlite_stat1 WHERE idx = 'idx_agent_cache_updated'")?.stat).toBe(
+      "7 1 1 1",
     );
-    expect(migrated.prepare("SELECT event_json FROM transcript_events").get()?.event_json).toBe(
-      event,
-    );
-    expect(
-      migrated.prepare("SELECT event_json FROM trajectory_runtime_events").get()?.event_json,
-    ).toBe(trajectory);
-    expect(
-      migrated.prepare("SELECT stat FROM sqlite_stat1 WHERE idx = 'idx_agent_cache_updated'").get()
-        ?.stat,
-    ).toBe("7 1 1 1");
-    expect(
-      migrated.prepare("SELECT archive_blob, published_at FROM session_transcript_archives").get(),
-    ).toEqual({
+    expect(row("SELECT archive_blob, published_at FROM session_transcript_archives")).toEqual({
       archive_blob: new Uint8Array(archive),
       published_at: null,
     });
     expect(
-      migrated
-        .prepare("SELECT 1 FROM schema_meta WHERE meta_key = 'media-persistence-rows-v1'")
-        .get(),
+      row("SELECT 1 FROM schema_meta WHERE meta_key = 'media-persistence-rows-v1'"),
     ).toBeUndefined();
     expect(
-      migrated
-        .prepare("SELECT 1 FROM schema_meta WHERE meta_key = 'historical-transcript-directives-v1'")
-        .get(),
+      row("SELECT 1 FROM schema_meta WHERE meta_key = 'historical-transcript-directives-v1'"),
     ).toBeUndefined();
-    expect(migrated.prepare("SELECT entry_json FROM session_nodes").get()?.entry_json).toBe(
+    expect(row("SELECT entry_json FROM session_nodes")?.entry_json).toBe(
       '{"sessionId":"retained","updatedAt":1,"memoryFlushCompactionCount":3}',
     );
   }
@@ -215,23 +196,18 @@ it("keeps unrelated legacy content and planner maintenance outside a version mig
   );
   {
     using sameVersion = openNodeSqliteDatabase(pathname, { readOnly: true });
-    expect(
-      sameVersion.prepare("SELECT archive_blob FROM session_transcript_archives").get()
-        ?.archive_blob,
-    ).toEqual(new Uint8Array(fs.readFileSync(archivePath)));
-    expect(
-      JSON.parse(
-        String(sameVersion.prepare("SELECT entry_json FROM session_nodes").get()?.entry_json),
-      ),
-    ).toEqual({
+    const row = (sql: string) => sameVersion.prepare(sql).get();
+    expect(row("SELECT archive_blob FROM session_transcript_archives")?.archive_blob).toEqual(
+      new Uint8Array(fs.readFileSync(archivePath)),
+    );
+    expect(JSON.parse(String(row("SELECT entry_json FROM session_nodes")?.entry_json))).toEqual({
       sessionId: "retained",
       updatedAt: 1,
       memoryFlush: { kind: "succeeded", compactionCount: 3 },
     });
     expect(
-      JSON.parse(
-        String(sameVersion.prepare("SELECT event_json FROM transcript_events").get()?.event_json),
-      ).message.content,
+      JSON.parse(String(row("SELECT event_json FROM transcript_events")?.event_json)).message
+        .content,
     ).toEqual([{ type: "text", text: "retained" }]);
   }
 });

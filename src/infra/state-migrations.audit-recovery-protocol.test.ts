@@ -14,6 +14,19 @@ import { storageProcessTestEntrypoints } from "./storage-process-runtime.test-su
 
 const sourceRaw = Buffer.from("legacy audit row\n");
 const scrubPattern = Buffer.from(" \t".repeat(16));
+const refused = {
+  restored: false,
+  warnings: [expect.stringContaining("no longer matches its restore journal target")],
+};
+const upgraded = (ino: string) => ({
+  restored: true,
+  warnings: [],
+  restoredRaw: sourceRaw.toString("utf8"),
+  nextJournal: expect.objectContaining({
+    schemaVersion: 7,
+    target: { dev: expect.any(String), ino, size: sourceRaw.length },
+  }),
+});
 
 describe("legacy audit recovery identity persistence", () => {
   const fixture = createFixtureLifetime();
@@ -114,44 +127,11 @@ describe("legacy audit recovery identity persistence", () => {
       expect(result.status, result.stderr).toBe(0);
       expect(JSON.parse(result.stdout)).toEqual([
         { restored: true, warnings: [] },
-        {
-          restored: false,
-          warnings: [expect.stringContaining("no longer matches its restore journal target")],
-        },
-        {
-          restored: true,
-          warnings: [],
-          restoredRaw: sourceRaw.toString("utf8"),
-          nextJournal: expect.objectContaining({
-            schemaVersion: 7,
-            target: {
-              dev: expect.any(String),
-              ino: "9007199254740993",
-              size: sourceRaw.length,
-            },
-          }),
-        },
-        {
-          restored: false,
-          warnings: [expect.stringContaining("no longer matches its restore journal target")],
-        },
-        {
-          restored: true,
-          warnings: [],
-          restoredRaw: sourceRaw.toString("utf8"),
-          nextJournal: expect.objectContaining({
-            schemaVersion: 7,
-            target: {
-              dev: expect.any(String),
-              ino: "-1",
-              size: sourceRaw.length,
-            },
-          }),
-        },
-        {
-          restored: false,
-          warnings: [expect.stringContaining("no longer matches its restore journal target")],
-        },
+        refused,
+        upgraded("9007199254740993"),
+        refused,
+        upgraded("-1"),
+        refused,
       ]);
       for (const {
         file,
@@ -194,12 +174,10 @@ describe("legacy audit recovery identity persistence", () => {
       scrubPatternBase64: scrubPattern.toString("base64"),
       target: { dev: 4, ino: 9_007_199_254_740_992, size: sourceRaw.length },
     };
-    expect(parseAuditRecoveryRestoreJournal(JSON.stringify(journal)).target).toEqual(
-      journal.target,
-    );
-    expect(() =>
-      parseAuditRecoveryRestoreJournal(JSON.stringify({ ...journal, schemaVersion: 7 })),
-    ).toThrow("invalid legacy audit recovery restore journal");
+    const parse = (schemaVersion: number) =>
+      parseAuditRecoveryRestoreJournal(JSON.stringify({ ...journal, schemaVersion }));
+    expect(parse(6).target).toEqual(journal.target);
+    expect(() => parse(7)).toThrow("invalid legacy audit recovery restore journal");
     expect(() =>
       serializeAuditRecoveryRestoreJournal({
         rawBytes: sourceRaw,

@@ -3,7 +3,10 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { EMPTY_LEGACY_SESSION_SURFACES } from "../plugins/legacy-session-surfaces.types.js";
 import { openOpenClawStateDatabase } from "../state/openclaw-state-db.js";
-import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
+import {
+  withOpenClawTestState,
+  type OpenClawTestState,
+} from "../test-utils/openclaw-test-state.js";
 import { openLegacyAuditRawCheckpointStore } from "./state-migrations.audit-checkpoints.js";
 import {
   AuditMigrationFixture,
@@ -18,16 +21,42 @@ import { throwIfDoctorStateMigrationRefused } from "./state-migrations.messages.
 
 afterEach(() => vi.restoreAllMocks());
 
+async function withDoctorAudit(
+  run: (
+    state: OpenClawTestState,
+    audit: AuditMigrationFixture,
+    migrate: () => ReturnType<typeof autoMigrateLegacyState>,
+  ) => Promise<void>,
+) {
+  await withOpenClawTestState({ label: "audit-skip" }, async (state) => {
+    const cfg = { plugins: { enabled: false } };
+    await state.writeConfig(cfg);
+    await run(state, new AuditMigrationFixture(state.stateDir), () =>
+      autoMigrateLegacyState({
+        cfg,
+        doctorOnlyStateMigrations: true,
+        env: state.env,
+        homedir: () => state.home,
+        legacySessionSurfaces: EMPTY_LEGACY_SESSION_SURFACES,
+      }),
+    );
+  });
+}
+
+const seedApprovals = (state: OpenClawTestState) =>
+  state.writeJson("exec-approvals.json", {
+    version: 1,
+    defaults: { security: "allowlist", ask: "on-miss" },
+    agents: {},
+  });
+
 describe("Doctor legacy audit skips", () => {
   it.each([
     ["checkpointless whitespace", "checkpointless raw archive begins with ambiguous whitespace"],
     ["checkpoint capacity", "durable raw-archive checkpoint capacity is exhausted"],
     ["hard links unavailable", "filesystem rejects native no-replace rename and hard links"],
   ])("continues later repairs after %s and preserves recovery inputs", async (shape, warning) => {
-    await withOpenClawTestState({ label: "audit-skip" }, async (state) => {
-      const cfg = { plugins: { enabled: false } };
-      await state.writeConfig(cfg);
-      const audit = new AuditMigrationFixture(state.stateDir);
+    await withDoctorAudit(async (state, audit, migrate) => {
       const record = configAuditRecord("***");
       let preservedPath = audit.config.raw;
       if (shape === "checkpointless whitespace") {
@@ -58,19 +87,7 @@ describe("Doctor legacy audit skips", () => {
       const sourceBytes = await fs.readFile(preservedPath);
       const sanitizedBytes =
         shape === "hard links unavailable" ? undefined : await fs.readFile(audit.config.sanitized);
-      const execPath = await state.writeJson("exec-approvals.json", {
-        version: 1,
-        defaults: { security: "allowlist", ask: "on-miss" },
-        agents: {},
-      });
-      const migrate = () =>
-        autoMigrateLegacyState({
-          cfg,
-          doctorOnlyStateMigrations: true,
-          env: state.env,
-          homedir: () => state.home,
-          legacySessionSurfaces: EMPTY_LEGACY_SESSION_SURFACES,
-        });
+      const execPath = await seedApprovals(state);
 
       const result = await migrate();
 
@@ -80,16 +97,15 @@ describe("Doctor legacy audit skips", () => {
         warnings: [expect.stringContaining(warning)],
       });
       expect(() => throwIfDoctorStateMigrationRefused(result.stepReceipts)).not.toThrow();
-      expect(result.warnings.join("\n")).toContain(warning);
+      const warnings = result.warnings.join("\n");
+      expect(warnings).toContain(warning);
       if (shape === "hard links unavailable") {
-        expect(result.warnings.join("\n")).toContain(audit.config.source);
-        expect(result.warnings.join("\n")).toContain("OPENCLAW_STATE_DIR=");
-        expect(result.warnings.join("\n")).toContain(state.stateDir);
-        expect(result.warnings.join("\n")).toContain("openclaw doctor --fix");
+        expect(warnings).toContain(audit.config.source);
+        expect(warnings).toContain("OPENCLAW_STATE_DIR=");
+        expect(warnings).toContain(state.stateDir);
+        expect(warnings).toContain("openclaw doctor --fix");
       } else {
-        expect(result.warnings.join("\n")).toContain(
-          "https://docs.openclaw.ai/cli/update/repair-and-recovery",
-        );
+        expect(warnings).toContain("https://docs.openclaw.ai/cli/update/repair-and-recovery");
       }
       expect(result.stepReceipts.find((receipt) => receipt.id === "exec-approvals")).toMatchObject({
         outcome: "completed",
@@ -125,10 +141,7 @@ describe("Doctor legacy audit skips", () => {
     "append-only",
     "missing",
   ])("preserves migrated history and continues Doctor after a %s raw archive", async (shape) => {
-    await withOpenClawTestState({ label: "audit-quarantine" }, async (state) => {
-      const cfg = { plugins: { enabled: false } };
-      await state.writeConfig(cfg);
-      const audit = new AuditMigrationFixture(state.stateDir);
+    await withDoctorAudit(async (state, audit, migrate) => {
       const records = [0, 1, 2].map((index) =>
         configAuditRecord("***", { ts: `2026-07-01T00:00:0${index}.000Z` }),
       );
@@ -156,19 +169,7 @@ describe("Doctor legacy audit skips", () => {
         await fs.rm(audit.config.raw);
       }
       const raw = shape === "missing" ? undefined : await fs.readFile(audit.config.raw);
-      const execPath = await state.writeJson("exec-approvals.json", {
-        version: 1,
-        defaults: { security: "allowlist", ask: "on-miss" },
-        agents: {},
-      });
-      const migrate = () =>
-        autoMigrateLegacyState({
-          cfg,
-          doctorOnlyStateMigrations: true,
-          env: state.env,
-          homedir: () => state.home,
-          legacySessionSurfaces: EMPTY_LEGACY_SESSION_SURFACES,
-        });
+      const execPath = await seedApprovals(state);
 
       const result = await migrate();
 
@@ -203,23 +204,14 @@ describe("Doctor legacy audit skips", () => {
   });
 
   it("keeps an unsafe interrupted recovery refusing alongside an independent skip", async () => {
-    await withOpenClawTestState({ label: "audit-skip-refusal" }, async (state) => {
-      const cfg = { plugins: { enabled: false } };
-      await state.writeConfig(cfg);
-      const audit = new AuditMigrationFixture(state.stateDir);
+    await withDoctorAudit(async (_state, audit, migrate) => {
       await audit.seedRawArchive(audit.config, buildAuditScrubbedContent(512));
       const original = `${JSON.stringify(systemAuditEvent("original archive"))}\n`;
       const changed = original.replace("original archive", " ".repeat(16));
       await audit.seedRawArchive(audit.system, changed);
       await writeAuditRestoreJournal(audit.system.raw, Buffer.from(original));
 
-      const result = await autoMigrateLegacyState({
-        cfg,
-        doctorOnlyStateMigrations: true,
-        env: state.env,
-        homedir: () => state.home,
-        legacySessionSurfaces: EMPTY_LEGACY_SESSION_SURFACES,
-      });
+      const result = await migrate();
 
       expect(result.warnings.join("\n")).toContain("ambiguous whitespace");
       expect(result.warnings.join("\n")).toContain("no longer matches its restore journal target");

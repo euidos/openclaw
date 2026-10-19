@@ -118,7 +118,7 @@ function repair() {
   });
 }
 
-function legacy(id: string): LegacyQueuedDelivery {
+function baseEntry(id: string) {
   return {
     id,
     enqueuedAt: Date.now(),
@@ -126,22 +126,30 @@ function legacy(id: string): LegacyQueuedDelivery {
     attemptCount: 0,
     channel: "matrix",
     to: "!synthetic:example",
+  };
+}
+
+function legacy(id: string): LegacyQueuedDelivery {
+  return {
+    ...baseEntry(id),
     payloads: [{ text: "original" }],
     replyPayloadSendingHook: { kind: "final", context: { channelId: "matrix" } },
   };
 }
+function seed(queueName: string, entry: QueuedDelivery | LegacyQueuedDelivery) {
+  seedDeliveryQueueEntry({ stateDir, queueName, entry });
+}
+const load = (queue: string, id: string) => loadDeliveryQueueEntry(queue, id, stateDir);
+const deliveryReceipt = (result: Awaited<ReturnType<typeof repair>>) =>
+  result.stepReceipts.find((receipt) => receipt.id === "delivery-queues");
 
 describe("Doctor outbound preparation", () => {
   it.each(["sqlite", "claimed"] as const)(
     "prepares %s custody with real plugin modifiers once without publishing a registry",
     async (kind) => {
-      seedDeliveryQueueEntry({
-        stateDir,
-        queueName: kind === "sqlite" ? "outbound" : "outbound-legacy-preparing-v1",
-        entry: {
-          ...legacy("from-sqlite"),
-          ...(kind === "claimed" ? { legacyPreparationState: "claimed" } : {}),
-        },
+      seed(kind === "sqlite" ? "outbound" : "outbound-legacy-preparing-v1", {
+        ...legacy("from-sqlite"),
+        ...(kind === "claimed" ? { legacyPreparationState: "claimed" } : {}),
       });
       await autoMigrateLegacyState({
         cfg,
@@ -152,16 +160,10 @@ describe("Doctor outbound preparation", () => {
       expect(getGlobalHookRunner()).toBeNull();
       const result = await repair();
       expect(result.warnings).toEqual([]);
-      expect(result.stepReceipts.find((receipt) => receipt.id === "delivery-queues")).toMatchObject(
-        {
-          outcome: "completed",
-        },
-      );
-      expect(loadDeliveryQueueEntry("outbound-prepared-v1", "from-sqlite", stateDir)).toMatchObject(
-        {
-          preparedBatch: { entries: [{ payload: { text: "original|reply|message" } }] },
-        },
-      );
+      expect(deliveryReceipt(result)).toMatchObject({ outcome: "completed" });
+      expect(load("outbound-prepared-v1", "from-sqlite")).toMatchObject({
+        preparedBatch: { entries: [{ payload: { text: "original|reply|message" } }] },
+      });
       expect(await fs.readFile(eventsFile, "utf8")).toBe("reply\nmessage\ndispose\n");
       expect(getActivePluginRegistry()).toBe(active);
       expect(getGlobalHookRunner()).toBeNull();
@@ -172,11 +174,11 @@ describe("Doctor outbound preparation", () => {
 
   it("records a refused delivery migration when its resource disposer fails", async () => {
     await writePluginFixture({ failDisposal: true });
-    seedDeliveryQueueEntry({ queueName: "outbound", entry: legacy("disposal-failure"), stateDir });
+    seed("outbound", legacy("disposal-failure"));
 
     const result = await repair();
 
-    expect(result.stepReceipts.find((receipt) => receipt.id === "delivery-queues")).toMatchObject({
+    expect(deliveryReceipt(result)).toMatchObject({
       outcome: "refused",
       refusal: { code: "step-threw" },
     });
@@ -185,33 +187,24 @@ describe("Doctor outbound preparation", () => {
 
   it("preserves an unclaimed SQLite legacy row when its plugin cannot load", async () => {
     const entry = legacy("sqlite-only");
-    seedDeliveryQueueEntry({ queueName: "outbound", entry, stateDir });
+    seed("outbound", entry);
     await fs.writeFile(pluginFile, 'throw new Error("synthetic plugin unavailable");');
     const result = await repair();
     expect(result.warnings.join("\n")).toContain("synthetic plugin unavailable");
-    expect(loadDeliveryQueueEntry("outbound", entry.id, stateDir)).toEqual(entry);
-    expect(loadDeliveryQueueEntry("outbound-legacy-preparing-v1", entry.id, stateDir)).toBeNull();
+    expect(load("outbound", entry.id)).toEqual(entry);
+    expect(load("outbound-legacy-preparing-v1", entry.id)).toBeNull();
   });
 
   it("finishes prepared checkpoints without loading an unavailable plugin", async () => {
     const entry: QueuedDelivery = {
-      id: "checkpoint",
-      enqueuedAt: Date.now(),
-      retryCount: 0,
-      attemptCount: 0,
-      channel: "matrix",
-      to: "!synthetic:example",
+      ...baseEntry("checkpoint"),
       preparedBatch: createUnmodifiedPreparedOutboundBatch([{ text: "already prepared" }]),
     };
-    seedDeliveryQueueEntry({
-      queueName: "outbound-prepared-migration-v1",
-      stateDir,
-      entry,
-    });
+    seed("outbound-prepared-migration-v1", entry);
     await fs.writeFile(pluginFile, 'throw new Error("synthetic plugin unavailable");');
     const result = await repair();
     expect(result.warnings).toEqual([]);
-    expect(loadDeliveryQueueEntry("outbound-prepared-v1", "checkpoint", stateDir)).toMatchObject({
+    expect(load("outbound-prepared-v1", "checkpoint")).toMatchObject({
       preparedBatch: { entries: [{ payload: { text: "already prepared" } }] },
     });
     await expect(fs.stat(eventsFile)).rejects.toMatchObject({ code: "ENOENT" });

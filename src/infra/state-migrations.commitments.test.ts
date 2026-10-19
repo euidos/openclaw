@@ -1,4 +1,3 @@
-// Covers Doctor-only retirement of commitments/commitments.json.
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
@@ -38,7 +37,8 @@ describe("retired commitments Doctor cleanup", () => {
     return migrateLegacyCommitments({ detected: await detect(), stateDir, env, ...overrides });
   }
 
-  async function writeLegacy(value: unknown): Promise<string> {
+  const rows = (...ids: string[]) => ({ version: 1, commitments: ids.map((id) => ({ id })) });
+  async function writeLegacy(value: unknown = rows()): Promise<string> {
     const sourcePath = path.join(stateDir, "commitments", "commitments.json");
     await fsp.mkdir(path.dirname(sourcePath), { recursive: true });
     await fsp.writeFile(
@@ -47,6 +47,21 @@ describe("retired commitments Doctor cleanup", () => {
       "utf8",
     );
     return sourcePath;
+  }
+
+  function expectPaths(sourcePath: string, source: boolean, claim: boolean) {
+    expect([sourcePath, `${sourcePath}${CLAIM_SUFFIX}`].map((file) => fs.existsSync(file))).toEqual(
+      [source, claim],
+    );
+  }
+
+  function discarded(rowLabel: "1 row" | "2 rows", recreated = false) {
+    return {
+      changes: [
+        `Discarded ${recreated ? "recreated " : ""}retired commitments JSON with ${rowLabel}; no data was imported, archived, or exported.`,
+      ],
+      warnings: [],
+    };
   }
 
   function readReceipt() {
@@ -68,7 +83,7 @@ describe("retired commitments Doctor cleanup", () => {
   }
 
   it("detects the exact source or deterministic claim only for explicit Doctor repair", async () => {
-    const sourcePath = await writeLegacy({ version: 1, commitments: [] });
+    const sourcePath = await writeLegacy();
 
     expect((await detect(false)).hasLegacy).toBe(false);
     expect((await detect()).hasLegacy).toBe(true);
@@ -85,21 +100,12 @@ describe("retired commitments Doctor cleanup", () => {
   });
 
   it("records the destructive decision before deleting recognized rows", async () => {
-    const sourcePath = await writeLegacy({
-      version: 1,
-      commitments: [{ id: "retired-1" }, { id: "retired-2" }],
-    });
+    const sourcePath = await writeLegacy(rows("retired-1", "retired-2"));
 
     const result = await migrate();
 
-    expect(result).toEqual({
-      changes: [
-        "Discarded retired commitments JSON with 2 rows; no data was imported, archived, or exported.",
-      ],
-      warnings: [],
-    });
-    expect(fs.existsSync(sourcePath)).toBe(false);
-    expect(fs.existsSync(`${sourcePath}${CLAIM_SUFFIX}`)).toBe(false);
+    expect(result).toEqual(discarded("2 rows"));
+    expectPaths(sourcePath, false, false);
     expect(await fsp.readdir(path.dirname(sourcePath))).toEqual([]);
     expect(
       openOpenClawStateDatabase({ env })
@@ -120,16 +126,8 @@ describe("retired commitments Doctor cleanup", () => {
       exportedRecordCount: 0,
     });
 
-    await writeLegacy({
-      version: 1,
-      commitments: [{ id: "recreated" }],
-    });
-    await expect(migrate()).resolves.toEqual({
-      changes: [
-        "Discarded recreated retired commitments JSON with 1 row; no data was imported, archived, or exported.",
-      ],
-      warnings: [],
-    });
+    await writeLegacy(rows("recreated"));
+    await expect(migrate()).resolves.toEqual(discarded("1 row", true));
   });
 
   it.each([
@@ -152,7 +150,7 @@ describe("retired commitments Doctor cleanup", () => {
   it.each(["beforeVerify", "beforeClaim"] as const)(
     "leaves a source changed %s unchanged",
     async (hook) => {
-      const sourcePath = await writeLegacy({ version: 1, commitments: [] });
+      const sourcePath = await writeLegacy();
 
       const result = await migrate({
         [hook]: () => fs.appendFileSync(sourcePath, "\n"),
@@ -160,17 +158,13 @@ describe("retired commitments Doctor cleanup", () => {
 
       expect(result.changes).toEqual([]);
       expect(result.warnings[0]).toContain("changed");
-      expect(fs.existsSync(sourcePath)).toBe(true);
-      expect(fs.existsSync(`${sourcePath}${CLAIM_SUFFIX}`)).toBe(false);
+      expectPaths(sourcePath, true, false);
       expect(readReceipt()).toBeUndefined();
     },
   );
 
   it("recovers an interrupted deterministic claim and retries idempotently", async () => {
-    const sourcePath = await writeLegacy({
-      version: 1,
-      commitments: [{ id: "retired" }],
-    });
+    const sourcePath = await writeLegacy(rows("retired"));
     const first = await migrate({
       removeSource: () => {
         throw new Error("simulated cleanup failure");
@@ -179,19 +173,12 @@ describe("retired commitments Doctor cleanup", () => {
 
     expect(first.changes).toEqual([]);
     expect(first.warnings[0]).toContain("discard was recorded, but cleanup failed");
-    expect(fs.existsSync(sourcePath)).toBe(false);
-    expect(fs.existsSync(`${sourcePath}${CLAIM_SUFFIX}`)).toBe(true);
+    expectPaths(sourcePath, false, true);
     expect(readReceipt()?.removed_source).toBe(0);
 
     const retry = await migrate();
-    expect(retry).toEqual({
-      changes: [
-        "Discarded retired commitments JSON with 1 row; no data was imported, archived, or exported.",
-      ],
-      warnings: [],
-    });
-    expect(fs.existsSync(sourcePath)).toBe(false);
-    expect(fs.existsSync(`${sourcePath}${CLAIM_SUFFIX}`)).toBe(false);
+    expect(retry).toEqual(discarded("1 row"));
+    expectPaths(sourcePath, false, false);
     expect(readReceipt()?.removed_source).toBe(1);
 
     const idempotent = await migrate();
@@ -199,10 +186,7 @@ describe("retired commitments Doctor cleanup", () => {
   });
 
   it("finalizes a pending receipt when cleanup removed the claim before throwing", async () => {
-    const sourcePath = await writeLegacy({
-      version: 1,
-      commitments: [{ id: "retired" }],
-    });
+    const sourcePath = await writeLegacy(rows("retired"));
     const first = await migrate({
       removeSource: async (claimPath) => {
         await fsp.unlink(claimPath);
@@ -212,8 +196,7 @@ describe("retired commitments Doctor cleanup", () => {
 
     expect(first.changes).toEqual([]);
     expect(first.warnings[0]).toContain("discard was recorded, but cleanup failed");
-    expect(fs.existsSync(sourcePath)).toBe(false);
-    expect(fs.existsSync(`${sourcePath}${CLAIM_SUFFIX}`)).toBe(false);
+    expectPaths(sourcePath, false, false);
     expect(readReceipt()?.removed_source).toBe(0);
 
     const detected = await detect();
@@ -227,23 +210,16 @@ describe("retired commitments Doctor cleanup", () => {
   });
 
   it("leaves conflicting source and interrupted claim bytes unchanged", async () => {
-    const sourcePath = await writeLegacy({
-      version: 1,
-      commitments: [{ id: "claim" }],
-    });
+    const sourcePath = await writeLegacy(rows("claim"));
     const claimPath = `${sourcePath}${CLAIM_SUFFIX}`;
     await fsp.rename(sourcePath, claimPath);
-    await writeLegacy({
-      version: 1,
-      commitments: [{ id: "replacement" }],
-    });
+    await writeLegacy(rows("replacement"));
 
     const result = await migrate();
 
     expect(result.changes).toEqual([]);
     expect(result.warnings[0]).toContain("conflicts with its interrupted Doctor claim");
-    expect(fs.existsSync(sourcePath)).toBe(true);
-    expect(fs.existsSync(claimPath)).toBe(true);
+    expectPaths(sourcePath, true, true);
     expect(readReceipt()).toBeUndefined();
   });
 });

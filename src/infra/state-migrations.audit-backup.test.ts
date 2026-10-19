@@ -15,6 +15,15 @@ import {
   writeAuditRestoreJournal,
 } from "./state-migrations.audit.test-support.js";
 
+const auditLine = (marker: string) => `${JSON.stringify(configAuditRecord(marker))}\n`;
+const redacted = { argv: ["openclaw", "config", "set", "token", "***"] };
+async function captureOne(stateDir: string, tempDir: string) {
+  const { snapshots } = await createLegacyAuditBackupCapture({ stateDir, tempDir });
+  expect(snapshots).toHaveLength(1);
+  const asset = expectDefined(snapshots[0], "snapshot");
+  return { asset, text: await fs.readFile(asset.sourcePath, "utf8") };
+}
+
 async function withBackupFixture(
   run: (fixture: {
     stateDir: string;
@@ -91,16 +100,13 @@ describe("legacy audit raw backup snapshots", () => {
       await fs.writeFile(
         sourcePath,
         Buffer.concat([
-          Buffer.from(`${JSON.stringify(configAuditRecord("initial-value-7f3c"))}\n`),
+          Buffer.from(auditLine("initial-value-7f3c")),
           Buffer.alloc(4 * 1024 * 1024, 0x20),
         ]),
       );
       const snapshotPromise = createLegacyAuditBackupCapture({ stateDir, tempDir });
       for (let index = 0; index < 8; index += 1) {
-        await fs.appendFile(
-          sourcePath,
-          `${JSON.stringify(configAuditRecord(`late-value-${index}-9a21`))}\n`,
-        );
+        await fs.appendFile(sourcePath, auditLine(`late-value-${index}-9a21`));
       }
       const { snapshots } = await snapshotPromise;
       const snapshotAsset = expectDefined(snapshots[0], "snapshot");
@@ -114,7 +120,7 @@ describe("legacy audit raw backup snapshots", () => {
         .split("\n")
         .map((line) => JSON.parse(line));
       expect(rows).not.toHaveLength(0);
-      expect(rows[0]).toMatchObject({ argv: ["openclaw", "config", "set", "token", "***"] });
+      expect(rows[0]).toMatchObject(redacted);
     });
   });
 
@@ -128,23 +134,18 @@ describe("legacy audit raw backup snapshots", () => {
         );
         const removedPath = destination === "claim" ? sourcePath : claimPath;
         const retainedPath = destination === "claim" ? claimPath : rawPath;
-        const original = `${JSON.stringify(configAuditRecord("linked-value-7f3c"))}\n`;
+        const original = auditLine("linked-value-7f3c");
         await fs.writeFile(removedPath, original);
         await fs.link(removedPath, retainedPath);
         const before = await fs.stat(removedPath, { bigint: true });
 
         for (let capture = 0; capture < 2; capture += 1) {
-          const { snapshots } = await createLegacyAuditBackupCapture({ stateDir, tempDir });
-          expect(snapshots).toHaveLength(1);
-          const snapshot = expectDefined(snapshots[0], "snapshot");
+          const { asset: snapshot, text: sanitized } = await captureOne(stateDir, tempDir);
           expect(snapshot.archiveSourcePath).toBe(retainedPath);
           expect(snapshot.skippedSourcePaths).toContain(removedPath);
-          const sanitized = await fs.readFile(snapshot.sourcePath, "utf8");
           expect(sanitized).not.toContain("linked-value-7f3c");
           expect(sanitized.trim().split("\n")).toHaveLength(1);
-          expect(JSON.parse(sanitized)).toMatchObject({
-            argv: ["openclaw", "config", "set", "token", "***"],
-          });
+          expect(JSON.parse(sanitized)).toMatchObject(redacted);
         }
 
         for (const livePath of [removedPath, retainedPath]) {
@@ -161,7 +162,7 @@ describe("legacy audit raw backup snapshots", () => {
 
   it("rejects an audit source linked to an unrelated path", async () => {
     await withBackupFixture(async ({ stateDir, tempDir, sourcePath }) => {
-      const original = `${JSON.stringify(configAuditRecord("unrelated-value-7f3c"))}\n`;
+      const original = auditLine("unrelated-value-7f3c");
       const unrelatedPath = path.join(path.dirname(sourcePath), "unrelated.jsonl");
       await fs.writeFile(sourcePath, original);
       await fs.link(sourcePath, unrelatedPath);
@@ -178,10 +179,8 @@ describe("legacy audit raw backup snapshots", () => {
     "reconstructs a scrub-in-progress source and sanitizes its later append (linked journal: %s)",
     async (linkedJournal) => {
       await withBackupFixture(async ({ stateDir, tempDir, rawPath }) => {
-        const original = Buffer.from(
-          `${JSON.stringify(configAuditRecord("original-value-7f3c"))}\n`,
-        );
-        const later = `${JSON.stringify(configAuditRecord("later-value-9a21"))}\n`;
+        const original = Buffer.from(auditLine("original-value-7f3c"));
+        const later = auditLine("later-value-9a21");
         const partial = Buffer.from(original);
         const scrubbedBytes = Math.floor(partial.length / 2);
         buildAuditScrubbedContent(scrubbedBytes).copy(partial);
@@ -194,11 +193,7 @@ describe("legacy audit raw backup snapshots", () => {
           await fs.link(restorePath, stagingPath);
         }
 
-        const { snapshots } = await createLegacyAuditBackupCapture({ stateDir, tempDir });
-        const snapshotAsset = expectDefined(snapshots[0], "snapshot");
-        const snapshot = await fs.readFile(snapshotAsset.sourcePath, "utf8");
-
-        expect(snapshots).toHaveLength(1);
+        const { asset: snapshotAsset, text: snapshot } = await captureOne(stateDir, tempDir);
         expect(snapshotAsset.archiveSourcePath).toBe(rawPath);
         expect(snapshot).not.toContain("original-value-7f3c");
         expect(snapshot).not.toContain("later-value-9a21");
@@ -207,10 +202,7 @@ describe("legacy audit raw backup snapshots", () => {
             .trim()
             .split("\n")
             .map((line) => JSON.parse(line)),
-        ).toMatchObject([
-          { argv: ["openclaw", "config", "set", "token", "***"] },
-          { argv: ["openclaw", "config", "set", "token", "***"] },
-        ]);
+        ).toMatchObject([redacted, redacted]);
         if (linkedJournal) {
           for (const journalPath of [restorePath, stagingPath]) {
             expect(snapshotAsset.skippedSourcePaths).toContain(journalPath);
@@ -224,18 +216,13 @@ describe("legacy audit raw backup snapshots", () => {
 
   it("ignores a stale restore journal after the raw archive is replaced", async () => {
     await withBackupFixture(async ({ stateDir, tempDir, rawPath }) => {
-      const original = Buffer.from(`${JSON.stringify(configAuditRecord("old-value-7f3c"))}\n`);
+      const original = Buffer.from(auditLine("old-value-7f3c"));
       const replacement = configAuditRecord("replacement-value-9a21", { event: "config.delete" });
       await fs.writeFile(rawPath, `${JSON.stringify(replacement)}\n`);
       await writeAuditRestoreJournal(rawPath, original);
 
-      const { snapshots } = await createLegacyAuditBackupCapture({ stateDir, tempDir });
-      const snapshotAsset = expectDefined(snapshots[0], "snapshot");
-      const snapshot = JSON.parse(await fs.readFile(snapshotAsset.sourcePath, "utf8"));
-      expect(snapshot).toMatchObject({
-        event: "config.delete",
-        argv: ["openclaw", "config", "set", "token", "***"],
-      });
+      const { text } = await captureOne(stateDir, tempDir);
+      expect(JSON.parse(text)).toMatchObject({ event: "config.delete", ...redacted });
     });
   });
 });
