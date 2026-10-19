@@ -16,6 +16,7 @@ import {
   type OpenClawTestInstance,
 } from "../../../test/helpers/openclaw-test-instance.ts";
 import { runQaGatewayFixture } from "../../../test/helpers/qa-gateway-cleanup.ts";
+import type { SessionsListResult } from "../api/types.ts";
 import type { ChatPaneElement } from "../pages/chat/chat-pane.tsx";
 import type { ChatState } from "../pages/chat/chat-state-contract.ts";
 import type { ChatPageHost } from "../pages/chat/chat-state-host.ts";
@@ -587,22 +588,69 @@ suite.define(() => {
                   rendered: true,
                   images,
                 });
+              // The final roster can change media admission after history settles.
+              const sessions: SessionsListResult = JSON.parse(
+                await runCli([
+                  "gateway",
+                  "call",
+                  "sessions.list",
+                  "--json",
+                  "--params",
+                  JSON.stringify({ agentId: "main", limit: 50 }),
+                ]),
+              );
+              const authoritativeSession = sessions.sessions.find((row) => row.key === sessionKey);
+              expect(authoritativeSession?.sessionId).toBe(sessionId);
+              const policy = JSON.stringify([
+                authoritativeSession?.permissionMode,
+                authoritativeSession?.permissionModePending,
+                authoritativeSession?.execNode,
+                authoritativeSession?.execCwd,
+                authoritativeSession?.sessionRoot,
+                authoritativeSession?.spawnedWorkspaceDir,
+                authoritativeSession?.spawnedCwd,
+                authoritativeSession?.worktree?.id,
+              ]);
+              await expect
+                .poll(() =>
+                  page.locator(".chat-pane-cache__pane--active").evaluate(
+                    (element, expected) => {
+                      const state = (element as HTMLElement & { state: ChatPageHost }).state;
+                      const selected = state.sessionsResult?.sessions.find(
+                        (row) => row.key === state.sessionKey,
+                      );
+                      return (
+                        selected?.sessionId === expected.sessionId &&
+                        JSON.stringify([
+                          selected?.permissionMode,
+                          selected?.permissionModePending,
+                          selected?.execNode,
+                          selected?.execCwd,
+                          selected?.sessionRoot,
+                          selected?.spawnedWorkspaceDir,
+                          selected?.spawnedCwd,
+                          selected?.worktree?.id,
+                        ]) === expected.policy
+                      );
+                    },
+                    { sessionId, policy },
+                  ),
+                )
+                .toBe(true);
               await assertDecoded();
               const liveNodes = await bubble.evaluateHandle((element) => {
                 const pane = element.closest<ChatPaneElement>("openclaw-chat-pane");
+                const cachePane = element.closest(".chat-pane-cache__pane");
                 const readOwner = () => {
-                  const state = (
-                    element.closest(".chat-pane-cache__pane") as HTMLElement & {
-                      state: ChatPageHost;
-                    }
-                  ).state;
+                  const state = (cachePane as HTMLElement & { state: ChatPageHost }).state;
                   const selected = state.sessionsResult?.sessions.find(
                     (session) => session.key === state.sessionKey,
                   );
                   return {
                     connected: state.connected,
-                    paneConnected: pane?.isConnected ?? false,
-                    paneActive: pane?.classList.contains("chat-pane-cache__pane--active") ?? false,
+                    paneConnected: cachePane?.isConnected ?? false,
+                    paneActive:
+                      cachePane?.classList.contains("chat-pane-cache__pane--active") ?? false,
                     connectionEpoch: state.connectionEpoch,
                     mediaPolicyEpoch: state.mediaPolicyEpoch ?? 0,
                     scope: JSON.stringify([
@@ -658,6 +706,9 @@ suite.define(() => {
                   },
                   { signal: abort.signal },
                 );
+                const imageNodes = Array.from(
+                  element.querySelectorAll<HTMLImageElement>("img.chat-message-image"),
+                );
                 const galleries = Array.from(element.querySelectorAll(".chat-message-images"));
                 return {
                   bubble: element,
@@ -666,7 +717,7 @@ suite.define(() => {
                   galleries,
                   galleryParents: galleries.map((gallery) => gallery.parentElement),
                   frames: Array.from(element.querySelectorAll(".chat-image-frame")),
-                  images: Array.from(element.querySelectorAll("img.chat-message-image")),
+                  images: imageNodes,
                   pane,
                   presentation: readPresentation(pane),
                   readPresentation,
