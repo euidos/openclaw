@@ -1,12 +1,17 @@
 import { execFileSync } from "node:child_process";
-import fs, { type FileHandle } from "node:fs/promises";
+import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { createAgentToolExecutionBudget } from "./agent-tool-source-execution-guard.js";
-import { createHostWorkspaceEditTool, createHostWorkspaceWriteTool } from "./agent-tools.read.js";
+import {
+  afterFileRead,
+  asSource,
+  hostFileTools,
+  interceptOpen,
+} from "./agent-tools.mutation.test-support.js";
+import type { createHostWorkspaceWriteTool } from "./agent-tools.read.js";
 import { createApplyPatchTool } from "./apply-patch.js";
-import { withGatewayToolCallerIdentity } from "./tools/gateway-caller-context.js";
 
 describe("unrestricted host tool writes", () => {
   const tempDirs = useAutoCleanupTempDirTracker(afterEach);
@@ -21,7 +26,7 @@ describe("unrestricted host tool writes", () => {
   }
 
   function write(filePath: string, content: string) {
-    return createHostWorkspaceWriteTool(tempDir).execute("write", { path: filePath, content });
+    return hostFileTools(tempDir).write(filePath, content);
   }
 
   function mutate(
@@ -30,19 +35,10 @@ describe("unrestricted host tool writes", () => {
     content: string,
     options?: Parameters<typeof createHostWorkspaceWriteTool>[1],
   ) {
-    const tool = (kind === "write" ? createHostWorkspaceWriteTool : createHostWorkspaceEditTool)(
-      tempDir,
-      options,
-    );
-    return tool.execute(
-      "mutation",
-      kind === "write"
-        ? { path: filePath, content }
-        : {
-            path: filePath,
-            edits: [{ oldText: "original", newText: "replacement" }],
-          },
-    );
+    const tools = hostFileTools(tempDir, options);
+    return kind === "write"
+      ? tools.write(filePath, content)
+      : tools.edit(filePath, "original", "replacement");
   }
 
   it.each([
@@ -64,20 +60,15 @@ describe("unrestricted host tool writes", () => {
         isCurrent: () => budgetCurrent,
       });
       let prepared = false;
-      interceptUpdate(filePath, (handle) => {
-        const read = handle.read.bind(handle);
-        handle.read = (async (...args: Parameters<typeof read>) => {
-          const result = await read(...args);
-          prepared = true;
-          if (authority === "aborted") {
-            generation.abort(new Error("Permission change"));
-          } else if (authority === "revoked") {
-            currentClaim = undefined;
-          } else if (authority === "budget-revoked") {
-            budgetCurrent = false;
-          }
-          return result;
-        }) as typeof handle.read;
+      afterFileRead(filePath, () => {
+        prepared = true;
+        if (authority === "aborted") {
+          generation.abort(new Error("Permission change"));
+        } else if (authority === "revoked") {
+          currentClaim = undefined;
+        } else if (authority === "budget-revoked") {
+          budgetCurrent = false;
+        }
       });
       const options = { workspaceOnly: false, abortSignal: generation.signal };
       const execute = () => {
@@ -90,14 +81,7 @@ describe("unrestricted host tool writes", () => {
       };
 
       const pending = budget.run(() =>
-        withGatewayToolCallerIdentity(
-          {
-            agentId: "main",
-            sessionKey: "agent:main:source-file-authority",
-            receiptAuthority: () => currentClaim === originalClaim,
-          },
-          execute,
-        ),
+        asSource("source-file-authority", () => currentClaim === originalClaim, execute),
       );
       if (authority === "active") {
         await expect(pending).resolves.toBeDefined();
@@ -120,28 +104,15 @@ describe("unrestricted host tool writes", () => {
     },
   );
 
-  function interceptUpdate(filePath: string, intercept: (handle: FileHandle) => void) {
-    const realOpen = fs.open.bind(fs);
-    vi.spyOn(fs, "open").mockImplementation(async (...args) => {
-      const handle = await realOpen(...args);
-      if (String(args[0]) === filePath && args[1] === "r+") {
-        intercept(handle);
-      }
-      return handle;
-    });
-  }
-
   function failWrites(filePath: string, originalByteLength: number, prefix = false) {
-    interceptUpdate(filePath, (handle) => {
+    interceptOpen(filePath, (handle) => {
       const realWrite = handle.write.bind(handle);
       let failed = false;
       handle.write = (async (buffer: Buffer, offset: number, length: number, position: number) => {
-        if (!failed && position < originalByteLength) {
-          if (prefix) {
-            failed = true;
-            await realWrite(buffer, offset, Math.max(1, Math.floor(length / 2)), position);
-            throw Object.assign(new Error("disk full"), { code: "ENOSPC" });
-          }
+        if (prefix && !failed && position < originalByteLength) {
+          failed = true;
+          await realWrite(buffer, offset, Math.max(1, Math.floor(length / 2)), position);
+          throw Object.assign(new Error("disk full"), { code: "ENOSPC" });
         }
         const result = await realWrite(buffer, offset, length, position);
         if (!prefix && position >= originalByteLength) {
@@ -153,7 +124,7 @@ describe("unrestricted host tool writes", () => {
   }
 
   function failShrinkTruncate(filePath: string, originalByteLength: number) {
-    interceptUpdate(filePath, (handle) => {
+    interceptOpen(filePath, (handle) => {
       const realTruncate = handle.truncate.bind(handle);
       handle.truncate = (async (length: number) => {
         if (length < originalByteLength) {
@@ -243,18 +214,12 @@ describe("unrestricted host tool writes", () => {
     const content = "héllo crab 🦀 héllo\n";
     const aliasPath = path.join(tempDir, "alias.txt");
     await fs.link(filePath, aliasPath);
-    const before = await fs.stat(filePath);
+    const { ino, dev, uid, gid } = await fs.stat(filePath);
 
     await write(filePath, content);
 
     const after = await fs.stat(filePath);
-    expect(after).toMatchObject({
-      ino: before.ino,
-      nlink: 2,
-      dev: before.dev,
-      uid: before.uid,
-      gid: before.gid,
-    });
+    expect(after).toMatchObject({ ino, nlink: 2, dev, uid, gid });
     expect(after.mode & 0o777).toBe(0o640);
     await expect(fs.readFile(filePath, "utf8")).resolves.toBe(content);
     await expect(fs.readFile(aliasPath, "utf8")).resolves.toBe(content);

@@ -7,6 +7,7 @@ import { applyToolAvailabilityDescriptions } from "./agent-tools.deferred-follow
 import type { AnyAgentTool } from "./agent-tools.types.js";
 import { getChannelAgentToolMeta, setChannelAgentToolMeta } from "./channel-tool-metadata.js";
 import { buildAgentSystemPrompt } from "./system-prompt.js";
+import { createStubTool } from "./test-helpers/agent-tool-stubs.js";
 import {
   describeSessionsSearchTool,
   describeSessionsSendTool,
@@ -19,13 +20,7 @@ import { createSessionsSpawnTool } from "./tools/sessions-spawn-tool.js";
 import { createSessionsYieldTool } from "./tools/sessions-yield-tool.js";
 
 function tool(name: string, description = "available"): AnyAgentTool {
-  return {
-    name,
-    label: name,
-    description,
-    parameters: { type: "object", properties: {} },
-    execute: async () => ({ content: [], details: {} }),
-  };
+  return { ...createStubTool(name), description };
 }
 
 function describeTools(...tools: (AnyAgentTool | string)[]) {

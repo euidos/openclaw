@@ -1,4 +1,3 @@
-import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -6,32 +5,13 @@ import { __setFsSafeTestHooksForTest } from "@openclaw/fs-safe/test-hooks";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { withEnvAsync } from "../test-utils/env.js";
+import { afterFileRead, asSource, hostFileTools } from "./agent-tools.mutation.test-support.js";
 import {
-  createHostWorkspaceEditTool,
   createHostWorkspaceWriteTool,
   wrapToolMemoryFlushAppendOnlyWrite,
 } from "./agent-tools.read.js";
-import { withGatewayToolCallerIdentity } from "./tools/gateway-caller-context.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
-
-function writer(root: string, options?: Parameters<typeof createHostWorkspaceWriteTool>[1]) {
-  const tool = createHostWorkspaceWriteTool(root, options);
-  return (filePath: string, content: string) => tool.execute("write", { path: filePath, content });
-}
-
-function editor(root: string, options?: Parameters<typeof createHostWorkspaceEditTool>[1]) {
-  const tool = createHostWorkspaceEditTool(root, options);
-  return (filePath: string, oldText: string, newText: string) =>
-    tool.execute("edit", { path: filePath, edits: [{ oldText, newText }] });
-}
-
-function asSource<T>(session: string, receiptAuthority: () => boolean, run: () => T) {
-  return withGatewayToolCallerIdentity(
-    { agentId: "main", sessionKey: `agent:main:${session}`, receiptAuthority },
-    run,
-  );
-}
 
 describe("workspace mutation authority", () => {
   afterEach(() => {
@@ -63,24 +43,7 @@ describe("workspace mutation authority", () => {
         }
       };
       if (kind === "append") {
-        const realOpen = fs.open.bind(fs);
-        vi.spyOn(fs, "open").mockImplementation(async (...args) => {
-          const handle = await realOpen(...args);
-          const [target, flags] = args;
-          if (
-            String(target) === filePath &&
-            typeof flags === "number" &&
-            (flags & constants.O_APPEND) !== 0
-          ) {
-            const read = handle.read.bind(handle);
-            handle.read = (async (...readArgs: Parameters<typeof read>) => {
-              const result = await read(...readArgs);
-              finishPreparation();
-              return result;
-            }) as typeof handle.read;
-          }
-          return handle;
-        });
+        afterFileRead(filePath, finishPreparation, true);
       } else {
         const targetPath = await fs.realpath(filePath);
         __setFsSafeTestHooksForTest({
@@ -106,9 +69,9 @@ describe("workspace mutation authority", () => {
           );
         }
         if (kind === "edit") {
-          return editor(root, options)("memory.md", "original", "replacement");
+          return hostFileTools(root, options).edit("memory.md", "original", "replacement");
         }
-        return writer(root, options)("memory.md", "replacement\n");
+        return hostFileTools(root, options).write("memory.md", "replacement\n");
       };
 
       const pending = asSource("workspace-mutations", () => current, execute);
@@ -147,7 +110,7 @@ describe("workspace mutation authority", () => {
           }
         },
       });
-      const write = writer(root, { workspaceOnly: true });
+      const { write } = hostFileTools(root, { workspaceOnly: true });
       const pending = asSource(
         "workspace-mkdir",
         () => current,
@@ -166,8 +129,9 @@ describe("workspace mutation authority", () => {
     const filePath = path.join(root, "~", "file.txt");
     const options = { workspaceOnly: true };
 
-    await writer(root, options)(filePath, "original");
-    await editor(root, options)(filePath, "original", "replacement");
+    const tools = hostFileTools(root, options);
+    await tools.write(filePath, "original");
+    await tools.edit(filePath, "original", "replacement");
 
     await expect(fs.readFile(filePath, "utf8")).resolves.toBe("replacement");
   });
@@ -178,7 +142,7 @@ describe("workspace mutation authority", () => {
       const root = tempDirs.make("openclaw-workspace-root-link-");
       const alias = path.join(root, "self");
       await fs.symlink(root, alias, "dir");
-      await writer(root, { workspaceOnly: true })("self/file.txt", "new");
+      await hostFileTools(root, { workspaceOnly: true }).write("self/file.txt", "new");
 
       await expect(fs.readFile(path.join(root, "file.txt"), "utf8")).resolves.toBe("new");
       expect((await fs.lstat(alias)).isSymbolicLink()).toBe(true);
@@ -195,8 +159,9 @@ describe("host file paths", () => {
     const modelPath = path.join("~", path.relative(home, filePath));
 
     await withEnvAsync({ OPENCLAW_HOME: openclawHome }, async () => {
-      await writer(openclawHome)(modelPath, "original");
-      await editor(openclawHome)(modelPath, "original", "replacement");
+      const tools = hostFileTools(openclawHome);
+      await tools.write(modelPath, "original");
+      await tools.edit(modelPath, "original", "replacement");
       expect(await fs.readFile(filePath, "utf8")).toBe("replacement");
       expect(await fs.readdir(openclawHome)).toEqual([]);
     });
@@ -212,7 +177,7 @@ describe("host file paths", () => {
     await fs.symlink(outside, path.join(root, "escape"));
 
     await expect(
-      editor(root, { workspaceOnly: true })("escape/secret.txt", "secret", "changed"),
+      hostFileTools(root, { workspaceOnly: true }).edit("escape/secret.txt", "secret", "changed"),
     ).rejects.toThrow("Path escapes workspace root");
     expect(await fs.readFile(path.join(outside, "secret.txt"), "utf8")).toBe("secret");
   });

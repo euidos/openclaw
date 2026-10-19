@@ -45,26 +45,26 @@ import { resolveOpenClawPluginToolInputs } from "./openclaw-tools.plugin-context
 import { stubTool } from "./test-helpers/fast-tool-stubs.js";
 
 const MEMORY_PATH = "memory/2026-08-22.md";
+const savedResult = { content: [{ type: "text" as const, text: "saved" }], details: {} };
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
-// Concrete plugin metadata lets the production projection distinguish equal tool names.
-function persistenceTool(pluginId: string, name = "save_memory"): AnyAgentTool {
+function persistenceTool(pluginId = "memory-provider", name = "save_memory"): AnyAgentTool {
   const tool: AnyAgentTool = {
     ...stubTool(name),
     label: name,
-    execute: vi.fn<AnyAgentTool["execute"]>(async () => ({
-      content: [{ type: "text", text: "saved" }],
-      details: {},
-    })),
+    execute: vi.fn<AnyAgentTool["execute"]>(async () => savedResult),
   };
   setPluginToolMeta(tool, { pluginId, optional: false });
   return tool;
 }
 
-function flushContext(
+function assembleProviderFlush(
+  tools: AnyAgentTool[] = [persistenceTool()],
+  options: OpenClawCodingToolsOptions = {},
   overrides: Partial<NonNullable<OpenClawCodingToolsOptions["memoryFlushTools"]>> = {},
 ) {
-  return {
+  vi.mocked(createOpenClawTools).mockReturnValueOnce(tools);
+  const memoryFlushTools = {
     flushId: "same-compaction-cycle",
     ownerPluginId: "memory-provider",
     persistenceToolNames: ["save_memory"],
@@ -72,12 +72,6 @@ function flushContext(
     recordPersistenceToolSuccess: vi.fn(),
     ...overrides,
   };
-}
-
-// Exercise the full assembly and policy boundary with a lightweight plugin tool factory.
-function assembleProviderFlush(tools: AnyAgentTool[], options: OpenClawCodingToolsOptions = {}) {
-  vi.mocked(createOpenClawTools).mockReturnValueOnce(tools);
-  const memoryFlushTools = flushContext();
   const assembled = createOpenClawCodingTools({
     workspaceDir: tempDirs.make("openclaw-provider-flush-"),
     trigger: "memory",
@@ -86,7 +80,11 @@ function assembleProviderFlush(tools: AnyAgentTool[], options: OpenClawCodingToo
     memoryFlushTools,
     ...options,
   });
-  return { assembled, recordPersistenceToolSuccess: memoryFlushTools.recordPersistenceToolSuccess };
+  return {
+    assembled,
+    save: () => assembled.find((tool) => tool.name === "save_memory")!.execute("save-call", {}),
+    recordPersistenceToolSuccess: memoryFlushTools.recordPersistenceToolSuccess,
+  };
 }
 
 function assembleFileFlush(options: OpenClawCodingToolsOptions = {}) {
@@ -105,32 +103,28 @@ describe("memory flush writer availability", () => {
     vi.mocked(createOpenClawTools).mockClear();
   });
 
-  it("projects read and the declared owner's writer, excluding same-name foreign tools", async () => {
+  it("projects only read and the declared owner's writer", async () => {
     const foreign = persistenceTool("sidecar");
-    const owned = persistenceTool("memory-provider");
+    const owned = persistenceTool();
     const undeclared = persistenceTool("memory-provider", "delete_memory");
-    const { assembled } = assembleProviderFlush([foreign, owned, undeclared]);
+    const { assembled, save } = assembleProviderFlush([foreign, owned, undeclared]);
 
     expect(assembled.map((tool) => tool.name).toSorted()).toEqual(["read", "save_memory"]);
-    await assembled.find((tool) => tool.name === "save_memory")!.execute("save-call", {});
+    await save();
     expect(owned.execute).toHaveBeenCalledOnce();
     expect(foreign.execute).not.toHaveBeenCalled();
     expect(undeclared.execute).not.toHaveBeenCalled();
   });
 
-  it("warns once when policy removes declared lookup tools and keeps the flush runnable", () => {
+  it("warns once for denied lookup but keeps the writer", () => {
     const { assembled } = assembleProviderFlush(
       [
-        persistenceTool("memory-provider"),
+        persistenceTool(),
         persistenceTool("memory-provider", "find_memory"),
         persistenceTool("memory-provider", "get_memory"),
       ],
-      {
-        config: { tools: { deny: ["get_memory"] } },
-        memoryFlushTools: flushContext({
-          lookupToolNames: ["find_memory", "get_memory"],
-        }),
-      },
+      { config: { tools: { deny: ["get_memory"] } } },
+      { lookupToolNames: ["find_memory", "get_memory"] },
     );
 
     expect(assembled.map((tool) => tool.name).toSorted()).toEqual([
@@ -146,13 +140,13 @@ describe("memory flush writer availability", () => {
   });
 
   it.each(["provider", "file"] as const)(
-    "does not reintroduce harness execution tools outside the %s flush projection",
+    "excludes harness execution tools from %s flush",
     (arm) => {
       const tools = runWithAgentRingZeroTools(
         [persistenceTool("host", "openclaw"), persistenceTool("host", "dispatch_action")],
         () => {
           if (arm === "provider") {
-            return assembleProviderFlush([persistenceTool("memory-provider")]).assembled;
+            return assembleProviderFlush().assembled;
           }
           return assembleFileFlush({ includeToolSearchControls: true });
         },
@@ -164,7 +158,7 @@ describe("memory flush writer availability", () => {
     },
   );
 
-  it("carries the delegated audience and only the public flush identity into plugin context", async () => {
+  it("carries delegated audience and public flush identity", async () => {
     const sessionId = "3a17bcec-6331-4b0e-aac7-b7e1b9da2ad9";
     const sourceKey = "agent:main:direct:owner";
     const flushKey = "agent:main:memory-flush:detached";
@@ -184,7 +178,7 @@ describe("memory flush writer availability", () => {
       storePath,
       detached: true,
     });
-    assembleProviderFlush([persistenceTool("memory-provider")], {
+    assembleProviderFlush(undefined, {
       sessionKey: flushKey,
       memoryAudience: delegatedAudience,
     });
@@ -206,10 +200,9 @@ describe("memory flush writer availability", () => {
     const empty = reason === "empty declaration";
     expect(() =>
       assembleProviderFlush(
-        empty ? [] : [persistenceTool("memory-provider")],
-        empty
-          ? { memoryFlushTools: flushContext({ persistenceToolNames: [] }) }
-          : { messageProvider: "node" },
+        empty ? [] : undefined,
+        empty ? {} : { messageProvider: "node" },
+        empty ? { persistenceToolNames: [] } : {},
       ),
     ).toThrow(MemoryFlushToolsUnavailableError);
   });
@@ -221,16 +214,16 @@ describe("memory flush writer availability", () => {
   ] as const)(
     "records only completed successful persistence (%s)",
     async (_name, details, isError, expectedCalls) => {
-      const owned = persistenceTool("memory-provider");
+      const owned = persistenceTool();
       const result = {
-        content: [{ type: "text" as const, text: "saved" }],
+        ...savedResult,
         details,
         ...(isError ? { isError } : {}),
       };
       const completion = createDeferred<typeof result>();
       vi.mocked(owned.execute).mockReturnValue(completion.promise);
-      const { assembled, recordPersistenceToolSuccess } = assembleProviderFlush([owned]);
-      const call = assembled.find((tool) => tool.name === "save_memory")!.execute("save-call", {});
+      const { save, recordPersistenceToolSuccess } = assembleProviderFlush([owned]);
+      const call = save();
       expect(recordPersistenceToolSuccess).not.toHaveBeenCalled();
       completion.resolve(result);
       await expect(call).resolves.toEqual(result);

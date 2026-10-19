@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
 import { replaceSessionEntry } from "../config/sessions/session-accessor.js";
 import type { SessionEntry } from "../config/sessions/types.js";
+import type { WhatsAppConfig } from "../config/types.whatsapp.js";
 import { createWarnLogCapture } from "../logging/test-helpers/warn-log-capture.js";
 import {
   resolveEffectiveToolPolicy,
@@ -57,8 +58,8 @@ async function storedPolicy(
 
 function expectAllowed(
   policy: Awaited<ReturnType<typeof storedPolicy>>,
-  allowed: string[],
-  denied: string[] = [],
+  allowed: readonly string[],
+  denied: readonly string[] = [],
 ) {
   for (const [names, expected] of [
     [allowed, true],
@@ -73,19 +74,14 @@ function expectAllowed(
 describe("resolveGroupToolPolicy group context validation", () => {
   const main = "agent:main:main";
   const groupKey = (id: string) => `agent:main:whatsapp:group:${id}`;
-  const config: OpenClawConfig = {
-    channels: {
-      whatsapp: {
-        groups: {
-          "safe-room": { tools: { allow: ["read"] } },
-          "trusted-group": { tools: { allow: ["exec", "read", "write", "edit"] } },
-          room: { tools: { allow: ["exec", "read"] } },
-          "room:sender:alice": { tools: { allow: ["read"] } },
-        },
-      },
-    },
-    tools: { allow: ["read"] },
-  };
+  const whatsapp = (groups: WhatsAppConfig["groups"], accounts?: WhatsAppConfig["accounts"]) => ({
+    channels: { whatsapp: { groups, accounts } },
+  });
+  const config = whatsapp({
+    "trusted-group": { tools: { allow: ["exec", "read", "write", "edit"] } },
+    room: { tools: { allow: ["exec", "read"] } },
+    "room:sender:alice": { tools: { allow: ["read"] } },
+  });
   function groupPolicy(params: Omit<Parameters<typeof resolveGroupToolPolicy>[0], "config">) {
     return resolveGroupToolPolicy({ config, messageProvider: "whatsapp", ...params });
   }
@@ -124,7 +120,7 @@ describe("resolveGroupToolPolicy group context validation", () => {
     ).toEqual({ allow: ["read"] });
   });
 
-  it("prefers the session-derived channel over caller-supplied messageProvider", () => {
+  it("trusts the session channel, not the caller", () => {
     const channelCfg = {
       channels: {
         discord: { groups: { C123: { tools: { allow: ["exec"] } } } },
@@ -142,7 +138,7 @@ describe("resolveGroupToolPolicy group context validation", () => {
   });
 
   it.each(["agent:main:whatsapp:group:safe-room", "agent:main:main"])(
-    "reports unavailable scheduled authority for %s before tool construction",
+    "rejects unavailable scheduled authority (%s)",
     (sessionKey) => {
       const params = { config, sessionKey, accountId: "removed", requireConfiguredAccount: true };
       expect(() => resolveGroupToolPolicy(params)).toThrow(
@@ -151,17 +147,10 @@ describe("resolveGroupToolPolicy group context validation", () => {
     },
   );
 
-  it("preserves intentional deny-all policy for a configured scheduled account", () => {
+  it("preserves scheduled deny-all", () => {
     expect(
       resolveGroupToolPolicy({
-        config: {
-          channels: {
-            whatsapp: {
-              accounts: { work: {} },
-              groups: { "safe-room": { tools: { deny: ["*"] } } },
-            },
-          },
-        },
+        config: whatsapp({ "safe-room": { tools: { deny: ["*"] } } }, { work: {} }),
         sessionKey: "agent:main:whatsapp:group:safe-room",
         accountId: "work",
         requireConfiguredAccount: true,
@@ -171,28 +160,27 @@ describe("resolveGroupToolPolicy group context validation", () => {
 });
 
 describe("stored subagent tool policies", () => {
-  it.each([undefined, 1])(
+  it.each([
+    [undefined, ["sessions_spawn", "subagents"], []],
+    [
+      1,
+      ["memory_search", "memory_get"],
+      ["gateway", "sessions_spawn", "subagents", "sessions_search"],
+    ],
+  ] as const)(
     "recomputes a persisted leaf with depth cap %s",
-    async (maxSpawnDepth) => {
+    async (maxSpawnDepth, allowed, denied) => {
       const policy = await storedPolicy(
         { spawnDepth: 1, subagentRole: "leaf", subagentControlScope: "none" },
         maxSpawnDepth === undefined
           ? {}
           : { agents: { defaults: { subagents: { maxSpawnDepth } } } },
       );
-      if (maxSpawnDepth === undefined) {
-        expectAllowed(policy, ["sessions_spawn", "subagents"]);
-      } else {
-        expectAllowed(
-          policy,
-          ["memory_search", "memory_get"],
-          ["gateway", "sessions_spawn", "subagents", "sessions_search"],
-        );
-      }
+      expectAllowed(policy, allowed, denied);
     },
   );
 
-  it("does not let configured allow entries re-enable hard-denied tools", async () => {
+  it("never re-enables hard-denied tools", async () => {
     const denied = [
       "gateway",
       "agents_list",
@@ -214,7 +202,7 @@ describe("stored subagent tool policies", () => {
     expectAllowed(policy, ["memory_search"], denied);
   });
 
-  it("applies inherited tool policy from stored ACP sessions without subagent metadata", async () => {
+  it("inherits ACP policy without subagent metadata", async () => {
     const policy = await storedPolicy(
       { inheritedToolAllow: ["custom_plugin_tool"], inheritedToolDeny: ["custom_denied_tool"] },
       {},
@@ -226,7 +214,7 @@ describe("stored subagent tool policies", () => {
 });
 
 describe("resolveEffectiveToolPolicy", () => {
-  it("applies implicit-main defaults tool restrictions to a pre-roster config", () => {
+  it("applies pre-roster implicit-main defaults", () => {
     const config = {
       agents: { defaults: { tools: { deny: ["exec"] } } },
     } as unknown as OpenClawConfig;
