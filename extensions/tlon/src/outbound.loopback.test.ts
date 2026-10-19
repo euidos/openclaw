@@ -34,6 +34,15 @@ function finishLogin(response: http.ServerResponse) {
   response.end("ok");
 }
 
+function readBody(request: http.IncomingMessage, accept: (body: string) => void) {
+  let body = "";
+  request.setEncoding("utf8");
+  request.on("data", (chunk: string) => {
+    body += chunk;
+  });
+  request.on("end", () => accept(body));
+}
+
 type TlonPoke = {
   app?: string;
   mark?: string;
@@ -51,23 +60,14 @@ type TlonPoke = {
 
 /** Join the plain-string run of a Tlon story the same way a reader reconstructs text. */
 function extractStoryText(content: unknown): string {
-  const verses = Array.isArray(content) ? (content as unknown[]) : [];
-  const parts: string[] = [];
-  for (const verse of verses) {
-    if (
-      verse &&
-      typeof verse === "object" &&
-      "inline" in verse &&
-      Array.isArray((verse as { inline?: unknown }).inline)
-    ) {
-      for (const item of (verse as { inline: unknown[] }).inline) {
-        if (typeof item === "string") {
-          parts.push(item);
-        }
-      }
-    }
-  }
-  return parts.join("");
+  const verses: unknown[] = Array.isArray(content) ? content : [];
+  return verses
+    .flatMap((verse) =>
+      verse && typeof verse === "object" && "inline" in verse && Array.isArray(verse.inline)
+        ? verse.inline.filter((item: unknown) => typeof item === "string")
+        : [],
+    )
+    .join("");
 }
 
 describe("tlon outbound loopback", () => {
@@ -156,12 +156,7 @@ describe("tlon outbound loopback", () => {
           finishLogin(res);
           return;
         }
-        let body = "";
-        req.setEncoding("utf8");
-        req.on("data", (chunk: string) => {
-          body += chunk;
-        });
-        req.on("end", () => accepted.resolve({ response: res, payload: JSON.parse(body) }));
+        readBody(req, (body) => accepted.resolve({ response: res, payload: JSON.parse(body) }));
       });
       const controller = new AbortController();
       const onPlatformSendDispatch = vi.fn(async () => {});
@@ -217,20 +212,12 @@ describe("tlon outbound loopback", () => {
       const url = new URL(req.url ?? "/", "http://127.0.0.1");
       if (req.method === "POST" && url.pathname === "/~/login") {
         loginCount += 1;
-        res.writeHead(200, {
-          "Content-Type": "text/plain",
-          "set-cookie": "urbauth-~zod=mock-cookie",
-        });
-        res.end("ok");
+        res.setHeader("Content-Type", "text/plain");
+        finishLogin(res);
         return;
       }
       if (req.method === "PUT" && url.pathname.startsWith("/~/channel/")) {
-        let body = "";
-        req.setEncoding("utf8");
-        req.on("data", (chunk: string) => {
-          body += chunk;
-        });
-        req.on("end", () => {
+        readBody(req, (body) => {
           const received = JSON.parse(body) as TlonPoke[];
           pokes.push(...received);
           const oversized = received.some(

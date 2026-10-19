@@ -10,15 +10,14 @@ const IMAGE = Buffer.from(
 );
 const RECIPIENT = "~sampel-palnet";
 type Storage = "memex" | "s3";
-type Phase =
-  | "source"
-  | "login"
-  | "storage"
-  | "credentials"
-  | "secret"
-  | "allocation"
-  | "upload"
-  | "poke";
+const scries = {
+  "/~/login": "login",
+  "/~/scry/storage/configuration.json": "storage",
+  "/~/scry/storage/credentials.json": "credentials",
+  "/~/scry/genuine/secret.json": "secret",
+} as const;
+const scryPhases = new Map(Object.entries(scries));
+type Phase = (typeof scries)[keyof typeof scries] | "source" | "allocation" | "upload" | "poke";
 type RequestRecord = { phase: Phase; url: string; dispatchCount: number };
 const fixtureCleanups: Array<() => Promise<void>> = [];
 
@@ -67,18 +66,15 @@ function createFixture(
     channels: {
       tlon: {
         accounts: Object.fromEntries(
-          accounts.map(
-            (account) =>
-              [
-                account.ship,
-                {
-                  ship: `~${account.ship}`,
-                  url: account.shipUrl,
-                  code: account.code,
-                  mediaMaxMb: 1,
-                },
-              ] as const,
-          ),
+          accounts.map((account) => [
+            account.ship,
+            {
+              ship: `~${account.ship}`,
+              url: account.shipUrl,
+              code: account.code,
+              mediaMaxMb: 1,
+            },
+          ]),
         ),
       },
     },
@@ -90,13 +86,11 @@ function createFixture(
     "fetch",
     vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       const url = new URL(input instanceof Request ? input.url : String(input));
+      const scryPhase = scryPhases.get(url.pathname);
       const account = accounts.find(
         (candidate) =>
-          url.href === candidate.sourceUrl ||
-          url.origin === candidate.shipUrl ||
-          url.href === candidate.allocationUrl ||
-          url.href === candidate.uploadUrl ||
-          url.origin === candidate.s3Endpoint,
+          [candidate.sourceUrl, candidate.allocationUrl, candidate.uploadUrl].includes(url.href) ||
+          [candidate.shipUrl, candidate.s3Endpoint].includes(url.origin),
       );
       if (!account) {
         throw new Error(`Unexpected Tlon fixture request: ${url.origin}${url.pathname}`);
@@ -109,14 +103,8 @@ function createFixture(
         phase = "allocation";
       } else if (url.href === account.uploadUrl || url.origin === account.s3Endpoint) {
         phase = "upload";
-      } else if (url.pathname === "/~/login") {
-        phase = "login";
-      } else if (url.pathname === "/~/scry/storage/configuration.json") {
-        phase = "storage";
-      } else if (url.pathname === "/~/scry/storage/credentials.json") {
-        phase = "credentials";
-      } else if (url.pathname === "/~/scry/genuine/secret.json") {
-        phase = "secret";
+      } else if (scryPhase) {
+        phase = scryPhase;
       } else if (url.pathname.startsWith("/~/channel/")) {
         phase = "poke";
       } else {
@@ -131,7 +119,7 @@ function createFixture(
       expect(method).toBe(
         phase === "login"
           ? "POST"
-          : phase === "allocation" || phase === "upload" || phase === "poke"
+          : ["allocation", "upload", "poke"].includes(phase)
             ? "PUT"
             : "GET",
       );
@@ -204,9 +192,7 @@ function createFixture(
           expect(Buffer.from(await new Response(init.body).arrayBuffer())).toEqual(IMAGE);
           response = new Response(
             new ReadableStream<Uint8Array>({ cancel: account.uploadCanceled }),
-            {
-              status: failUpload ? 503 : 200,
-            },
+            { status: failUpload ? 503 : 200 },
           );
           break;
         case "poke": {
@@ -276,6 +262,10 @@ function expectDelivered(account: Account, result: ChannelMessageSendResult, med
     receipt: { parts: [{ kind: "media" }] },
   });
   expect(account.pokes).toHaveLength(1);
+  const memo = {
+    author: `~${account.ship}`,
+    content: [{ inline: [`Photo from ${account.ship}`] }, { block: { image: { src: mediaUrl } } }],
+  };
   expect(account.pokes[0]).toMatchObject([
     {
       action: "poke",
@@ -284,19 +274,7 @@ function expectDelivered(account: Account, result: ChannelMessageSendResult, med
       mark: "chat-dm-action",
       json: {
         ship: RECIPIENT,
-        diff: {
-          delta: {
-            add: {
-              memo: {
-                author: `~${account.ship}`,
-                content: [
-                  { inline: [`Photo from ${account.ship}`] },
-                  { block: { image: { src: mediaUrl } } },
-                ],
-              },
-            },
-          },
-        },
+        diff: { delta: { add: { memo } } },
       },
     },
   ]);
