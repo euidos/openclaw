@@ -33,6 +33,7 @@ import {
   recordCompositionEnd,
 } from "../../../lib/ime.ts";
 import type { PresentationValue } from "../../../lib/presentation.ts";
+import { elementRef } from "../../../lib/reactive/element-ref.ts";
 import { t } from "../../../lib/reactive/i18n.ts";
 import { isSessionTitlePending, resolveSessionDisplayName } from "../../../lib/session-display.ts";
 import {
@@ -69,6 +70,7 @@ type ChatPaneParentSession = {
 };
 
 export type ChatPaneHeaderProps = ChatPaneLayoutMenuProps & {
+  onHeaderRef?: (element: HTMLElement) => void | (() => void);
   presented: PresentationValue;
   mergedChrome: boolean;
   navDrawerOpen?: boolean;
@@ -317,7 +319,9 @@ function SessionCrumb(props: ChatPaneHeaderProps) {
           }
           if (event.key === "Enter") {
             event.preventDefault();
-            props.onCommitRename();
+            if (!props.actionsDisabled) {
+              props.onCommitRename();
+            }
           } else if (event.key === "Escape") {
             event.preventDefault();
             props.onCancelRename();
@@ -325,7 +329,9 @@ function SessionCrumb(props: ChatPaneHeaderProps) {
         }}
         onBlur={(event) => {
           clearCompositionEnd(event);
-          props.onCommitRename();
+          if (!props.actionsDisabled) {
+            props.onCommitRename();
+          }
         }}
       />
     </Show>
@@ -431,6 +437,7 @@ export function ChatPaneHeader(props: ChatPaneHeaderProps) {
   return (
     <>
       <div
+        ref={[elementRef(props.onHeaderRef)]}
         class={[
           "chat-pane__header",
           {
