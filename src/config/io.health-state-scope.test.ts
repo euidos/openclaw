@@ -45,7 +45,25 @@ function fixture() {
   patchConfigHealthEntryToStore(deps, configPath, {
     lastObservedSuspiciousSignature: "before",
   });
-  return { deps, configPath };
+  return {
+    deps,
+    configPath,
+    entry: () => readConfigHealthStateFromStore(deps).entries?.[configPath],
+  };
+}
+
+async function snapshotFixture() {
+  const fixtureState = fixture();
+  const { deps, configPath } = fixtureState;
+  const raw = JSON.stringify({ gateway: { mode: "local" } });
+  fs.writeFileSync(configPath, raw);
+  const snapshot = await createConfigIO({
+    ...deps,
+    configPath,
+    observe: false,
+  }).readConfigFileSnapshot();
+  expect(snapshot.valid).toBe(true);
+  return { ...fixtureState, raw, snapshot };
 }
 
 it("shares boot health observations until a committed owner write changes them", async () => {
@@ -117,7 +135,7 @@ it("publishes imported health rows to an already-read owner", async () => {
 });
 
 it("reads recovery health from the admitted snapshot without overwriting a foreign commit", async () => {
-  const { deps, configPath } = fixture();
+  const { deps, configPath, entry } = fixture();
   await closeOpenClawStateDatabaseAsync();
   using writer = new DatabaseSync(resolveOpenClawStateSqlitePath(deps.env));
   const observation = captureConfigHealthStateStore(deps, configPath);
@@ -134,9 +152,7 @@ it("reads recovery health from the admitted snapshot without overwriting a forei
   );
   expect(before?.state.entries?.[configPath]?.lastObservedSuspiciousSignature).toBe("before");
   await observation.update({ lastObservedSuspiciousSignature: "stale recovery" }, before);
-  expect(
-    readConfigHealthStateFromStore(deps).entries?.[configPath]?.lastObservedSuspiciousSignature,
-  ).toBe("foreign commit");
+  expect(entry()?.lastObservedSuspiciousSignature).toBe("foreign commit");
 });
 
 it("reads committed worker health writes and rejects a stale patch basis", async () => {
@@ -196,7 +212,7 @@ it("compares every raw health field and absence before applying an observed patc
 it.each([false, true])(
   "preserves nested health facts and original-row comparison across outer rollback: %s",
   async (rollback) => {
-    const { deps, configPath } = fixture();
+    const { deps, configPath, entry } = fixture();
     const observation = captureConfigHealthStateStore(deps, configPath);
     const before = await observation.read();
     expect(before.state.entries?.[configPath]?.lastObservedSuspiciousSignature).toBe("before");
@@ -219,16 +235,12 @@ it.each([false, true])(
     } else {
       mutate();
     }
-    expect(
-      readConfigHealthStateFromStore(deps).entries?.[configPath]?.lastObservedSuspiciousSignature,
-    ).toBe(rollback ? "before" : "after");
+    expect(entry()?.lastObservedSuspiciousSignature).toBe(rollback ? "before" : "after");
     if (rollback) {
       expect(await observation.read()).toEqual(before);
     } else {
       await observation.update({ lastObservedSuspiciousSignature: "stale" }, before);
-      expect(
-        readConfigHealthStateFromStore(deps).entries?.[configPath]?.lastObservedSuspiciousSignature,
-      ).toBe("after");
+      expect(entry()?.lastObservedSuspiciousSignature).toBe("after");
     }
   },
 );
@@ -247,14 +259,7 @@ it("retains its captured database when the environment changes after planning", 
 });
 
 it("keeps sibling health rows and pending async observations independent of a sync observation", async () => {
-  const { deps, configPath } = fixture();
-  fs.writeFileSync(configPath, JSON.stringify({ gateway: { mode: "local" } }));
-  const snapshot = await createConfigIO({
-    ...deps,
-    configPath,
-    observe: false,
-  }).readConfigFileSnapshot();
-  expect(snapshot.valid).toBe(true);
+  const { deps, snapshot } = await snapshotFixture();
   const siblingPath = path.join(deps.env.HOME, "sibling.json");
   const now = vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
   patchConfigHealthEntryToStore(deps, siblingPath, {
@@ -276,15 +281,7 @@ it("keeps sibling health rows and pending async observations independent of a sy
 });
 
 it("preserves worker-updated fields omitted by an already-read synchronous observation", async () => {
-  const { deps, configPath } = fixture();
-  const raw = JSON.stringify({ gateway: { mode: "local" } });
-  fs.writeFileSync(configPath, raw);
-  const snapshot = await createConfigIO({
-    ...deps,
-    configPath,
-    observe: false,
-  }).readConfigFileSnapshot();
-  expect(snapshot.valid).toBe(true);
+  const { deps, configPath, raw, snapshot, entry } = await snapshotFixture();
   const priorState = readConfigHealthStateFromStore(deps);
   const promoted = createConfigHealthFingerprint({
     raw,
@@ -294,7 +291,7 @@ it("preserves worker-updated fields omitted by an already-read synchronous obser
   const workerObservation = captureConfigHealthStateStore(deps, configPath);
   const basis = await workerObservation.read();
   await workerObservation.update({ lastPromotedGood: promoted }, basis);
-  const committed = readConfigHealthStateFromStore(deps).entries?.[configPath]?.lastPromotedGood;
+  const committed = entry()?.lastPromotedGood;
   expect(committed).toEqual(promoted);
 
   const read = vi
@@ -303,7 +300,7 @@ it("preserves worker-updated fields omitted by an already-read synchronous obser
   observeConfigSnapshotSync(normalizeConfigIoDeps(deps), snapshot);
   read.mockRestore();
   await closeOpenClawStateDatabaseAsync();
-  const after = readConfigHealthStateFromStore(deps).entries?.[configPath];
+  const after = entry();
   expect(after?.lastKnownGood?.hash).toBe(promoted.hash);
   expect(after?.lastPromotedGood).toEqual(committed);
 });
@@ -311,7 +308,7 @@ it("preserves worker-updated fields omitted by an already-read synchronous obser
 it.each(["read", "update"] as const)(
   "rejects retired database admission during health %s",
   async (operation) => {
-    const { deps, configPath } = fixture();
+    const { deps, configPath, entry } = fixture();
     const observation = captureConfigHealthStateStore(deps, configPath);
     const before = await observation.read();
     await closeOpenClawStateDatabaseAsync();
@@ -321,14 +318,12 @@ it.each(["read", "update"] as const)(
         : observation.update({ lastObservedSuspiciousSignature: "stale" }, before),
     ).rejects.toThrow("read admission");
     expect(deps.logger.warn).not.toHaveBeenCalled();
-    expect(
-      readConfigHealthStateFromStore(deps).entries?.[configPath]?.lastObservedSuspiciousSignature,
-    ).toBe("before");
+    expect(entry()?.lastObservedSuspiciousSignature).toBe("before");
   },
 );
 
 it("keeps a confirmed health write successful when its database is then closed", async () => {
-  const { deps, configPath } = fixture();
+  const { deps, configPath, entry } = fixture();
   const observation = captureConfigHealthStateStore(deps, configPath);
   const before = await observation.read();
   if (!before) {
@@ -353,7 +348,5 @@ it("keeps a confirmed health write successful when its database is then closed",
   }
   expect(applied).toBe(true);
   expect(deps.logger.warn).not.toHaveBeenCalled();
-  expect(
-    readConfigHealthStateFromStore(deps).entries?.[configPath]?.lastObservedSuspiciousSignature,
-  ).toBe("committed");
+  expect(entry()?.lastObservedSuspiciousSignature).toBe("committed");
 });

@@ -29,7 +29,11 @@ afterEach(() => {
   closeOpenClawStateDatabaseForTest();
 });
 
-function createContext(root: string, configPath = path.join(root, "openclaw.json")) {
+function createContext(
+  root: string,
+  configPath = path.join(root, "openclaw.json"),
+  config?: unknown,
+) {
   const env: NodeJS.ProcessEnv = {
     HOME: root,
     USERPROFILE: root,
@@ -38,12 +42,21 @@ function createContext(root: string, configPath = path.join(root, "openclaw.json
     OPENCLAW_STATE_DIR: path.join(root, "state"),
     VITEST: "true",
   };
+  if (config !== undefined) {
+    fs.writeFileSync(configPath, JSON.stringify(config));
+  }
   return createConfigIoContext({
     configPath,
     env,
     homedir: () => root,
     observe: false,
   });
+}
+
+function fixture(config?: unknown, pluginValidation?: "core-only" | "full") {
+  const context = createContext(tempDirs.make("openclaw-config-snapshot-"), undefined, config);
+  context.options.pluginValidation = pluginValidation;
+  return context;
 }
 
 describe("config snapshot plugin metadata", () => {
@@ -70,8 +83,7 @@ describe("config snapshot plugin metadata", () => {
   it.each(["file", "includes", "validate"])(
     "preserves the original %s read failure without serializing its cause",
     async (phase) => {
-      const root = tempDirs.make("openclaw-config-read-cause-");
-      const context = createContext(root);
+      const context = fixture();
       const raw = '{"gateway":{"mode":"local"}}';
       fs.writeFileSync(context.configPath, raw);
       const cause = Object.assign(new Error("config read fixture failed"), {
@@ -129,8 +141,7 @@ describe("config snapshot plugin metadata", () => {
   );
 
   it("preserves source paths across core-only and prepared plugin reads with a Windows home", async () => {
-    const root = tempDirs.make("openclaw-config-windows-paths-");
-    const context = createContext(root);
+    const context = fixture();
     const windowsHome = "C:\\Users\\fixture";
     const resolve = path.resolve;
     const resolveWindows = path.win32.resolve;
@@ -152,10 +163,9 @@ describe("config snapshot plugin metadata", () => {
       prepareValidation: "runtime",
     });
 
-    expect(core.valid).toBe(true);
-    expect(full.valid).toBe(true);
     expect(core.sourceConfig).toEqual(full.sourceConfig);
     for (const snapshot of [core, full]) {
+      expect(snapshot.valid).toBe(true);
       expect(snapshot.authoredConfig?.plugins).toEqual(plugins);
       expect(snapshot.sourceConfig.plugins).toEqual(plugins);
       expect(snapshot.sourceConfigBeforeMigrations?.plugins).toEqual(plugins);
@@ -166,17 +176,8 @@ describe("config snapshot plugin metadata", () => {
   });
 
   it("leaves legacy roster repair to Doctor during full validation", async () => {
-    const root = tempDirs.make("openclaw-config-roster-metadata-");
-    const context = createContext(root);
-    context.options.pluginValidation = "full";
     const agents = { list: [{ id: "primary", default: true }, { id: "secondary" }] };
-    fs.writeFileSync(
-      context.configPath,
-      JSON.stringify({
-        agents,
-        channels: { discord: { enabled: false } },
-      }),
-    );
+    const context = fixture({ agents, channels: { discord: { enabled: false } } }, "full");
     const discovery = vi.spyOn(channelPresence, "listChannelIdsForOwnershipMigration");
     const snapshot = await readConfigFileSnapshotFromContext(context);
     expect(snapshot.valid).toBe(false);
@@ -191,36 +192,29 @@ describe("config snapshot plugin metadata", () => {
   });
 
   it("keeps invalid snapshot Doctor contracts owned by core-only validation", async () => {
-    const root = tempDirs.make("openclaw-config-invalid-metadata-");
-    const context = createContext(root);
-    context.options.pluginValidation = "core-only";
-    fs.writeFileSync(
-      context.configPath,
-      JSON.stringify({
+    const context = fixture(
+      {
         nodeHost: { browserProxy: { enabled: "invalid" } },
         channels: { discord: {} },
         session: { typingMode: "thinking" },
-      }),
+      },
+      "core-only",
     );
     const doctor = vi.spyOn(doctorLegacy, "findDoctorLegacyConfigIssues");
     const snapshot = await readConfigFileSnapshotFromContext(context);
     expect(snapshot.valid).toBe(false);
-    expect(snapshot.issues).toEqual(
-      expect.arrayContaining([expect.objectContaining({ path: "nodeHost.browserProxy.enabled" })]),
+    expect(snapshot.issues).toContainEqual(
+      expect.objectContaining({ path: "nodeHost.browserProxy.enabled" }),
     );
-    expect(snapshot.legacyIssues).toEqual(
-      expect.arrayContaining([expect.objectContaining({ path: "session.typingMode" })]),
+    expect(snapshot.legacyIssues).toContainEqual(
+      expect.objectContaining({ path: "session.typingMode" }),
     );
     expect(doctor).not.toHaveBeenCalled();
   });
 
   it("keeps best-effort core-only materialization independent of plugin metadata", async () => {
-    const root = tempDirs.make("openclaw-config-best-effort-metadata-");
-    const context = createContext(root);
-    context.options.pluginValidation = "core-only";
-    fs.writeFileSync(
-      context.configPath,
-      JSON.stringify({
+    const context = fixture(
+      {
         models: {
           providers: {
             "fixture-external": {
@@ -230,7 +224,8 @@ describe("config snapshot plugin metadata", () => {
             },
           },
         },
-      }),
+      },
+      "core-only",
     );
     const discovery = vi.spyOn(manifestRegistry, "loadPluginManifestRegistryCore");
     const result = await readBestEffortConfigSnapshotFromContext(context);
@@ -242,33 +237,28 @@ describe("config snapshot plugin metadata", () => {
     expect(discovery).not.toHaveBeenCalled();
   });
   it("records only genuinely missing substitutions as private facts", async () => {
-    const root = tempDirs.make("openclaw-config-snapshot-env-facts-");
-    const context = createContext(root);
-    context.deps.env.GATEWAY_TOKEN = "${ENV_LITERAL_GATEWAY_TOKEN}";
-    fs.writeFileSync(
-      context.configPath,
-      JSON.stringify({
-        gateway: {
-          auth: {
-            mode: "password",
-            password: "${MISSING_GATEWAY_PASSWORD}",
-            token: "$${ESCAPED_GATEWAY_TOKEN}",
-          },
-          remote: { token: "${GATEWAY_TOKEN}", password: "literal-${" },
+    const context = fixture({
+      gateway: {
+        auth: {
+          mode: "password",
+          password: "${MISSING_GATEWAY_PASSWORD}",
+          token: "$${ESCAPED_GATEWAY_TOKEN}",
         },
-        hooks: { token: "$MISSING_HOOK_TOKEN" },
-      }),
-      "utf8",
-    );
+        remote: { token: "${GATEWAY_TOKEN}", password: "literal-${" },
+      },
+      hooks: { token: "$MISSING_HOOK_TOKEN" },
+    });
+    context.deps.env.GATEWAY_TOKEN = "${ENV_LITERAL_GATEWAY_TOKEN}";
 
     const snapshot = await readConfigFileSnapshotFromContext(context);
 
     expect([...(getConfigResolutionFacts(snapshot.sourceConfigBeforeMigrations) ?? [])]).toEqual([
       "gateway.auth.password",
     ]);
-    expect(snapshot.config.gateway?.auth?.token).toBe("${ESCAPED_GATEWAY_TOKEN}");
-    expect(snapshot.config.gateway?.remote?.token).toBe("${ENV_LITERAL_GATEWAY_TOKEN}");
-    expect(snapshot.config.gateway?.remote?.password).toBe("literal-${");
+    expect(snapshot.config.gateway).toMatchObject({
+      auth: { token: "${ESCAPED_GATEWAY_TOKEN}" },
+      remote: { token: "${ENV_LITERAL_GATEWAY_TOKEN}", password: "literal-${" },
+    });
     expect(getAuthoredConfigSecretRef(snapshot.config, "hooks.token")).toEqual({
       source: "env",
       provider: "default",
@@ -287,8 +277,7 @@ describe("config snapshot plugin metadata", () => {
   });
 
   it("loads metadata for an explicit valid missing-config read without changing plain reads", async () => {
-    const root = tempDirs.make("openclaw-config-snapshot-metadata-");
-    const context = createContext(root);
+    const context = fixture();
     const loader = vi.spyOn(context, "createValidationPluginMetadataSnapshotLoader");
 
     const plainSnapshot = await readConfigFileSnapshotFromContext(context);
@@ -311,8 +300,7 @@ describe("config snapshot plugin metadata", () => {
   });
 
   it("does not invent plugin metadata for invalid snapshots", async () => {
-    const root = tempDirs.make("openclaw-config-snapshot-invalid-");
-    const context = createContext(root);
+    const context = fixture();
     fs.writeFileSync(context.configPath, "{ invalid", "utf8");
     const loader = vi.spyOn(context, "createValidationPluginMetadataSnapshotLoader");
 

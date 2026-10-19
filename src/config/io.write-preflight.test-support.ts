@@ -19,117 +19,85 @@ export function registerConfigWritePreflightTests({
   createConfigIO: typeof CreateConfigIO;
   silentLogger: { warn: () => void; error: () => void };
 }) {
-  itWithHome("blocks runtime preflight failures before committing root writes", async (home) => {
-    const configPath = configPathForHome(home);
-    const initialRaw = formatConfig({ gateway: { mode: "local" } });
-    let observedSource: OpenClawConfig | undefined;
+  function preflightTest(
+    name: string,
+    run: (fixture: { configPath: string; initialRaw: string }) => Promise<void>,
+    ambient = true,
+  ) {
+    itWithHome(name, async (home) => {
+      const configPath = configPathForHome(home);
+      const initialRaw = formatConfig({ gateway: { mode: "local" } });
+      await fs.mkdir(path.dirname(configPath), { recursive: true });
+      await fs.writeFile(configPath, initialRaw, "utf-8");
+      try {
+        await withEnvAsync(ambient ? { OPENCLAW_CONFIG_PATH: configPath } : {}, () =>
+          run({ configPath, initialRaw }),
+        );
+      } finally {
+        setRuntimeConfigSnapshotRefreshHandler(null);
+      }
+    });
+  }
 
-    await fs.mkdir(path.dirname(configPath), { recursive: true });
-    await fs.writeFile(configPath, initialRaw, "utf-8");
-
-    try {
-      await withEnvAsync({ OPENCLAW_CONFIG_PATH: configPath }, async () => {
+  for (const direct of [false, true]) {
+    preflightTest(
+      `blocks runtime preflight failures before ${direct ? "direct config IO" : "runtime"} commits root writes`,
+      async ({ configPath, initialRaw }) => {
+        let observedSource: OpenClawConfig | undefined;
+        const beforeCommit = vi.fn();
+        const message = direct ? "missing direct IO secret" : "missing included secret";
         setRuntimeConfigSnapshotRefreshHandler({
           preflight: async ({ sourceConfig }) => {
             observedSource = sourceConfig;
-            throw new Error("missing included secret");
+            throw new Error(message);
           },
           refresh: () => true,
         });
-
+        const config: OpenClawConfig = { gateway: { mode: "local", port: 19001 } };
         await expect(
-          writeConfigFile({
-            gateway: { mode: "local", port: 19001 },
-            logging: { level: "debug" },
-          }),
-        ).rejects.toThrow(/active SecretRef resolution failed: missing included secret/);
-
+          direct
+            ? createConfigIO({
+                env: { ...process.env, OPENCLAW_CONFIG_PATH: configPath },
+                logger: silentLogger,
+              }).writeConfigFile(config, { beforeCommit })
+            : writeConfigFile({ ...config, logging: { level: "debug" } }),
+        ).rejects.toThrow(`active SecretRef resolution failed: ${message}`);
         expect(observedSource?.gateway?.port).toBe(19001);
+        if (direct) {
+          expect(beforeCommit).not.toHaveBeenCalled();
+        }
         await expect(fs.readFile(configPath, "utf-8")).resolves.toBe(initialRaw);
-      });
-    } finally {
-      setRuntimeConfigSnapshotRefreshHandler(null);
-    }
-  });
+      },
+      !direct,
+    );
+  }
 
-  itWithHome(
+  preflightTest(
     "runs a caller commit guard after runtime preflight and before the root write",
-    async (home) => {
-      const configPath = configPathForHome(home);
-      const initialRaw = formatConfig({ gateway: { mode: "local" } });
+    async ({ configPath, initialRaw }) => {
       const events: string[] = [];
+      setRuntimeConfigSnapshotRefreshHandler({
+        preflight: () => {
+          events.push("runtime");
+        },
+        refresh: () => true,
+      });
 
-      await fs.mkdir(path.dirname(configPath), { recursive: true });
-      await fs.writeFile(configPath, initialRaw, "utf-8");
-
-      try {
-        await withEnvAsync({ OPENCLAW_CONFIG_PATH: configPath }, async () => {
-          setRuntimeConfigSnapshotRefreshHandler({
-            preflight: () => {
-              events.push("runtime");
+      await expect(
+        writeConfigFile(
+          { gateway: { mode: "local", port: 19001 } },
+          {
+            preCommitRuntimePreflight: async (sourceConfig) => {
+              events.push(`caller:${String(sourceConfig.gateway?.port)}`);
+              await expect(fs.readFile(configPath, "utf-8")).resolves.toBe(initialRaw);
+              throw new Error("authority changed");
             },
-            refresh: () => true,
-          });
-
-          await expect(
-            writeConfigFile(
-              { gateway: { mode: "local", port: 19001 } },
-              {
-                preCommitRuntimePreflight: async (sourceConfig) => {
-                  events.push(`caller:${String(sourceConfig.gateway?.port)}`);
-                  await expect(fs.readFile(configPath, "utf-8")).resolves.toBe(initialRaw);
-                  throw new Error("authority changed");
-                },
-              },
-            ),
-          ).rejects.toThrow("authority changed");
-
-          expect(events).toEqual(["runtime", "caller:19001"]);
-          await expect(fs.readFile(configPath, "utf-8")).resolves.toBe(initialRaw);
-        });
-      } finally {
-        setRuntimeConfigSnapshotRefreshHandler(null);
-      }
-    },
-  );
-
-  itWithHome(
-    "blocks runtime preflight failures before direct config IO commits root writes",
-    async (home) => {
-      const configPath = configPathForHome(home);
-      const initialRaw = formatConfig({ gateway: { mode: "local" } });
-      const env = {
-        ...process.env,
-        OPENCLAW_CONFIG_PATH: configPath,
-      } as NodeJS.ProcessEnv;
-      let observedSource: OpenClawConfig | undefined;
-      const beforeCommit = vi.fn();
-
-      await fs.mkdir(path.dirname(configPath), { recursive: true });
-      await fs.writeFile(configPath, initialRaw, "utf-8");
-
-      try {
-        setRuntimeConfigSnapshotRefreshHandler({
-          preflight: async ({ sourceConfig }) => {
-            observedSource = sourceConfig;
-            throw new Error("missing direct IO secret");
           },
-          refresh: () => true,
-        });
+        ),
+      ).rejects.toThrow("authority changed");
 
-        await expect(
-          createConfigIO({ env, logger: silentLogger }).writeConfigFile(
-            { gateway: { mode: "local", port: 19001 } },
-            { beforeCommit },
-          ),
-        ).rejects.toThrow(/active SecretRef resolution failed: missing direct IO secret/);
-
-        expect(observedSource?.gateway?.port).toBe(19001);
-        expect(beforeCommit).not.toHaveBeenCalled();
-        await expect(fs.readFile(configPath, "utf-8")).resolves.toBe(initialRaw);
-      } finally {
-        setRuntimeConfigSnapshotRefreshHandler(null);
-      }
+      expect(events).toEqual(["runtime", "caller:19001"]);
+      await expect(fs.readFile(configPath, "utf-8")).resolves.toBe(initialRaw);
     },
   );
 

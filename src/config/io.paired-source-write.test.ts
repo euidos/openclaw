@@ -4,13 +4,27 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import * as tmpDirOwner from "../infra/tmp-openclaw-dir.js";
 import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
 import { createSuiteTempRootTracker } from "../test-helpers/temp-dir.js";
-import { getConfigValueAtPath, setConfigValueAtPath } from "./config-paths.js";
+import { setConfigValueAtPath } from "./config-paths.js";
 import { createConfigIO } from "./io.js";
 import { replaceConfigFile } from "./mutate.js";
 import { withTempHome, writeOpenClawConfig } from "./test-helpers.js";
 import type { OpenClawConfig } from "./types.openclaw.js";
 
 afterEach(() => closeOpenClawStateDatabaseForTest());
+
+function createIO(home: string, configPath: string, vars: NodeJS.ProcessEnv, skipPlugins = false) {
+  return createConfigIO({
+    configPath,
+    homedir: () => home,
+    ...(skipPlugins ? { pluginValidation: "skip" as const } : {}),
+    env: {
+      ...process.env,
+      OPENCLAW_CONFIG_PATH: configPath,
+      OPENCLAW_STATE_DIR: path.dirname(configPath),
+      ...vars,
+    },
+  });
+}
 
 describe("paired source through the public config writer", () => {
   const roots = createSuiteTempRootTracker({ prefix: "config-paired-coordinator-" });
@@ -51,17 +65,7 @@ describe("paired source through the public config writer", () => {
         await fs.writeFile(slackPath, slackRaw);
         await fs.writeFile(emptyAccountPath, "{}\n");
         const rootBefore = await fs.readFile(configPath, "utf8");
-        const io = createConfigIO({
-          configPath,
-          homedir: () => home,
-          pluginValidation: "skip",
-          env: {
-            ...process.env,
-            OPENCLAW_CONFIG_PATH: configPath,
-            OPENCLAW_STATE_DIR: path.dirname(configPath),
-            CONFIG_PAIRED_WEBHOOK_APP: "test-app",
-          },
-        });
+        const io = createIO(home, configPath, { CONFIG_PAIRED_WEBHOOK_APP: "test-app" }, true);
         const { snapshot, writeOptions } = await io.readConfigFileSnapshotForWrite({
           observe: false,
         });
@@ -100,21 +104,12 @@ describe("paired source through the public config writer", () => {
 
         await write(next);
         const saved: OpenClawConfig = JSON.parse(await fs.readFile(configPath, "utf8"));
-        expect(getConfigValueAtPath(saved, pinPath)).toEqual(endpoint);
-        expect(getConfigValueAtPath(saved, ["channels", "feishu", "accounts", "work"])).toEqual({
-          $include: "./account.json",
-          legacyWebhook: endpoint,
+        expect(saved.channels?.feishu?.accounts).toEqual({
+          work: { $include: "./account.json", legacyWebhook: endpoint },
+          personal: { $include: "./account.json" },
+          empty: { $include: "./empty-account.json", legacyWebhook: endpoint },
         });
-        expect(getConfigValueAtPath(saved, ["channels", "feishu", "accounts", "personal"])).toEqual(
-          {
-            $include: "./account.json",
-          },
-        );
         expect(saved.channels?.slack).toEqual({ $include: "./slack.json" });
-        expect(getConfigValueAtPath(saved, ["channels", "feishu", "accounts", "empty"])).toEqual({
-          $include: "./empty-account.json",
-          legacyWebhook: endpoint,
-        });
         expect(saved.meta?.migrations?.webhookListeners).toEqual({
           feishu: [pinPath, emptyPinPath],
         });
@@ -144,13 +139,7 @@ describe("paired source through the public config writer", () => {
         const rootBefore = await fs.readFile(configPath, "utf8");
         const ownedPath = include ? includePath : configPath;
         const ownedBefore = await fs.readFile(ownedPath, "utf8");
-        const env = {
-          ...process.env,
-          OPENCLAW_CONFIG_PATH: configPath,
-          OPENCLAW_STATE_DIR: path.dirname(configPath),
-          CONFIG_PAIRED_BROWSER: "/opt/browser-before",
-        };
-        const io = createConfigIO({ env, configPath, homedir: () => home });
+        const io = createIO(home, configPath, { CONFIG_PAIRED_BROWSER: "/opt/browser-before" });
         const { snapshot, writeOptions } = await io.readConfigFileSnapshotForWrite({
           observe: false,
         });
@@ -200,16 +189,9 @@ describe("paired source through the public config writer", () => {
           },
           browser: { enabled: true, executablePath: "${CONFIG_PAIRED_BROWSER}" },
         });
-        const io = createConfigIO({
-          configPath,
-          homedir: () => home,
-          env: {
-            ...process.env,
-            OPENCLAW_CONFIG_PATH: configPath,
-            OPENCLAW_STATE_DIR: path.dirname(configPath),
-            CONFIG_PAIRED_BROWSER: "/opt/browser-before",
-            CONFIG_PAIRED_WORKSPACE: "/opt/workspace-before",
-          },
+        const io = createIO(home, configPath, {
+          CONFIG_PAIRED_BROWSER: "/opt/browser-before",
+          CONFIG_PAIRED_WORKSPACE: "/opt/workspace-before",
         });
         const { snapshot, writeOptions } = await io.readConfigFileSnapshotForWrite({
           observe: false,

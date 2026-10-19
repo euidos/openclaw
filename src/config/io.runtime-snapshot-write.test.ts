@@ -1,4 +1,3 @@
-// Covers runtime snapshot writes produced by config IO.
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -26,14 +25,26 @@ function resetRuntimeConfigState(): void {
   resetConfigRuntimeState();
 }
 
-describe("runtime config snapshot writes", () => {
-  beforeEach(() => {
-    resetRuntimeConfigState();
-  });
+function overlayFixture(runtimeConfig: OpenClawConfig, compareConfig = runtimeConfig) {
+  const calls: Array<[string, RuntimeConfigWritePreparedCandidate, OpenClawConfig]> = [];
+  const prepared = {
+    runtimeConfig,
+    compareConfig,
+    reapplyRuntimeOverlays(config: OpenClawConfig): OpenClawConfig {
+      calls.push(["runtime", this, config]);
+      return { ...config, logging: { level: "warn" } };
+    },
+    reapplyCompareOverlays(config: OpenClawConfig): OpenClawConfig {
+      calls.push(["compare", this, config]);
+      return { ...config, logging: { level: "error" } };
+    },
+  };
+  return { calls, prepared };
+}
 
-  afterEach(() => {
-    resetRuntimeConfigState();
-  });
+describe("runtime config snapshot writes", () => {
+  beforeEach(resetRuntimeConfigState);
+  afterEach(resetRuntimeConfigState);
 
   it("publishes canonical include snapshots with managed auth-store refresh scope", async () => {
     const initialConfig = {
@@ -47,30 +58,14 @@ describe("runtime config snapshot writes", () => {
       const toolsPath = path.join(path.dirname(configPath), "tools.json5");
       const authoredTools = { exec: { safeBins: ["${CONFIG_PUBLICATION_BIN}"] } };
       await fs.writeFile(toolsPath, JSON.stringify(authoredTools), "utf-8");
-      const overlayCalls: Array<{
-        kind: string;
-        receiver: RuntimeConfigWritePreparedCandidate;
-        config: OpenClawConfig;
-      }> = [];
-      let prepared: RuntimeConfigWritePreparedCandidate | undefined;
+      let overlays: ReturnType<typeof overlayFixture> | undefined;
       const preflight = vi.fn(
         async (
           sourceConfig: OpenClawConfig,
           refreshOptions?: { includeAuthStoreRefs?: boolean },
         ) => {
-          prepared = {
-            runtimeConfig: sourceConfig,
-            compareConfig: sourceConfig,
-            reapplyRuntimeOverlays(config) {
-              overlayCalls.push({ kind: "runtime", receiver: this, config });
-              return { ...config, logging: { level: "warn" } };
-            },
-            reapplyCompareOverlays(config) {
-              overlayCalls.push({ kind: "compare", receiver: this, config });
-              return { ...config, logging: { level: "error" } };
-            },
-          };
-          return Object.assign(prepared, { refreshOptions });
+          overlays = overlayFixture(sourceConfig);
+          return Object.assign(overlays.prepared, { refreshOptions });
         },
       );
       const notifications: Array<
@@ -121,12 +116,12 @@ describe("runtime config snapshot writes", () => {
           ],
         ],
       });
-      expect(overlayCalls.map(({ kind }) => kind)).toEqual(["runtime", "compare"]);
-      expect(overlayCalls.map(({ config }) => config)).toEqual([
-        notification?.runtimeConfig,
-        notification?.sourceConfig,
+      const prepared = overlays?.prepared;
+      expect(overlays?.calls).toEqual([
+        ["runtime", prepared, notification?.runtimeConfig],
+        ["compare", prepared, notification?.sourceConfig],
       ]);
-      for (const { receiver } of overlayCalls) {
+      for (const [, receiver] of overlays?.calls ?? []) {
         expect(receiver).toBe(prepared);
       }
       expect(notification?.preparedCandidate).not.toBe(prepared);
@@ -177,20 +172,11 @@ describe("runtime config snapshot writes", () => {
         })),
         writeConfigFile: vi.fn<ConfigMutationIO["writeConfigFile"]>(),
       } satisfies ConfigMutationIO;
-      const overlayCalls: Array<[string, RuntimeConfigWritePreparedCandidate, OpenClawConfig]> = [];
       const metadata = Symbol("prepared metadata");
+      const overlays = overlayFixture(snapshot.runtimeConfig, snapshot.sourceConfig);
       const prepared = {
-        runtimeConfig: snapshot.runtimeConfig,
-        compareConfig: snapshot.sourceConfig,
+        ...overlays.prepared,
         [metadata]: "preserved",
-        reapplyRuntimeOverlays(config: OpenClawConfig): OpenClawConfig {
-          overlayCalls.push(["runtime", this, config]);
-          return { ...config, logging: { level: "warn" } };
-        },
-        reapplyCompareOverlays(config: OpenClawConfig): OpenClawConfig {
-          overlayCalls.push(["compare", this, config]);
-          return { ...config, logging: { level: "error" } };
-        },
       };
       const fallback = {
         runtimeConfig: snapshot.runtimeConfig,
@@ -253,11 +239,11 @@ describe("runtime config snapshot writes", () => {
         releaseOwner.ownerId,
         releaseFallback.ownerId,
       ]);
-      expect(overlayCalls).toEqual([
+      expect(overlays.calls).toEqual([
         ["runtime", prepared, nextRuntimeConfig],
         ["compare", prepared, nextConfig],
       ]);
-      for (const [, receiver] of overlayCalls) {
+      for (const [, receiver] of overlays.calls) {
         expect(receiver).toBe(prepared);
       }
       const projected = candidates?.get(releaseOwner.ownerId);

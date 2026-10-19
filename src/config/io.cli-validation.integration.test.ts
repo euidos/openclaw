@@ -16,33 +16,51 @@ import type { OpenClawConfig } from "./types.js";
 
 afterEach(() => vi.restoreAllMocks());
 
+function captureOutput() {
+  const output: unknown[] = [];
+  vi.spyOn(defaultRuntime, "writeJson").mockImplementation((value) => {
+    output.push(value);
+  });
+  return () => output.at(-1);
+}
+
+async function runConfigCommand(args: string[]) {
+  const program = new Command();
+  program.exitOverride();
+  registerConfigCli(program);
+  await program.parseAsync(["config", ...args], { from: "user" });
+}
+
+async function validateWithoutWriting(
+  configPath: string,
+  before = fs.readFileSync(configPath, "utf8"),
+) {
+  try {
+    await runConfigCommand(["validate", "--json"]);
+  } catch (error) {
+    expect(error).toMatchObject({ name: "ExitError", code: 1 });
+  }
+  expect(fs.readFileSync(configPath, "utf8")).toBe(before);
+}
+
 it.each(["get", "validate"] as const)(
   "keeps core config %s independent of plugin metadata while preserving secret redaction",
   async (command) => {
     vi.spyOn(metadata, "resolveConfigWidePluginMetadataSnapshotAsync").mockRejectedValue(
       new Error("Plugin metadata is unavailable"),
     );
-    const output: unknown[] = [];
-    vi.spyOn(defaultRuntime, "writeJson").mockImplementation((value) => {
-      output.push(value);
-    });
+    const output = captureOutput();
     await withOpenClawTestState({ prefix: "config-cli-core-only-" }, async (state) => {
       await state.writeConfig({
         gateway: { mode: "local", auth: { mode: "token", token: "synthetic-core-token" } },
       });
-      const program = new Command();
-      program.exitOverride();
-      registerConfigCli(program);
-      await program.parseAsync(
-        command === "get"
-          ? ["config", "get", "gateway.auth.token", "--json"]
-          : ["config", "validate", "--json"],
-        { from: "user" },
+      await runConfigCommand(
+        command === "get" ? ["get", "gateway.auth.token", "--json"] : ["validate", "--json"],
       );
       if (command === "get") {
-        expect(output.at(-1)).toBe(REDACTED_SENTINEL);
+        expect(output()).toBe(REDACTED_SENTINEL);
       } else {
-        expect(output.at(-1)).toMatchObject({ valid: true, warnings: [] });
+        expect(output()).toMatchObject({ valid: true, warnings: [] });
       }
     });
   },
@@ -71,48 +89,25 @@ async function validateThroughCli(
   vi.spyOn(metadata, "resolveConfigWidePluginMetadataSnapshot").mockReturnValue(snapshot);
   vi.spyOn(metadata, "resolveConfigWidePluginMetadataSnapshotAsync").mockResolvedValue(snapshot);
   const schemaValidation = vi.spyOn(schemas, "validatePluginSchemaValue");
-  const output: unknown[] = [];
-  vi.spyOn(defaultRuntime, "writeJson").mockImplementation((value) => {
-    output.push(value);
-  });
+  const output = captureOutput();
   vi.spyOn(defaultRuntime, "error").mockImplementation(() => {});
   await withOpenClawTestState({ prefix: "config-validation-work-" }, async (state) => {
     await state.writeConfig(config);
-    const before = fs.readFileSync(state.configPath, "utf8");
-    const program = new Command();
-    program.exitOverride();
-    registerConfigCli(program);
-    try {
-      await program.parseAsync(["config", "validate", "--json"], { from: "user" });
-    } catch (error) {
-      expect(error).toMatchObject({ name: "ExitError", code: 1 });
-    }
-    expect(fs.readFileSync(state.configPath, "utf8")).toBe(before);
+    await validateWithoutWriting(state.configPath);
   });
-  return { output: output.at(-1), schemaValidation };
+  return { output: output(), schemaValidation };
 }
 
 it("validates existing state through a private read-only snapshot", async () => {
-  const output: unknown[] = [];
-  vi.spyOn(defaultRuntime, "writeJson").mockImplementation((value) => {
-    output.push(value);
-  });
+  const output = captureOutput();
   vi.spyOn(defaultRuntime, "error").mockImplementation(() => {});
   await withOpenClawTestState({ prefix: "config-validation-existing-state-" }, async (state) => {
     await state.writeConfig({ gateway: { mode: "local" }, plugins: { enabled: false } });
     const before = fs.readFileSync(state.configPath, "utf8");
     openOpenClawStateDatabase({ env: state.env });
     await closeOpenClawStateDatabaseAsync();
-    const program = new Command();
-    program.exitOverride();
-    registerConfigCli(program);
-    try {
-      await program.parseAsync(["config", "validate", "--json"], { from: "user" });
-    } catch (error) {
-      expect(error).toMatchObject({ name: "ExitError", code: 1 });
-    }
-    expect(output.at(-1)).toMatchObject({ valid: true });
-    expect(fs.readFileSync(state.configPath, "utf8")).toBe(before);
+    await validateWithoutWriting(state.configPath, before);
+    expect(output()).toMatchObject({ valid: true });
   });
 });
 
