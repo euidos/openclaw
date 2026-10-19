@@ -29,14 +29,8 @@ export function expectWire(
   request: ReturnType<typeof createClient>["request"],
   method: "subscribe" | "unsubscribe",
   params: Record<string, unknown> = {},
-  nth?: number,
 ) {
-  const args = wireCall(method, params);
-  if (nth === undefined) {
-    expect(request).toHaveBeenLastCalledWith(...args);
-  } else {
-    expect(request).toHaveBeenNthCalledWith(nth, ...args);
-  }
+  expect(request).toHaveBeenLastCalledWith(...wireCall(method, params));
 }
 
 function wireCall(method: "subscribe" | "unsubscribe", params: Record<string, unknown>) {
@@ -54,18 +48,6 @@ export function expectWireCalls(
   expect(request.mock.calls.filter(([name]) => name === `sessions.messages.${method}`)).toEqual(
     params.map((fields) => wireCall(method, fields)),
   );
-}
-
-export function createApprovalClient(approval: Promise<unknown>) {
-  return createClient(async (method, params) => {
-    if (method === "sessions.messages.unsubscribe") {
-      return {};
-    }
-    if (params.includeApprovals) {
-      return await approval;
-    }
-    return { key: params.key };
-  });
 }
 
 export function createStalledRequestClient(stalledMethod: string, stalledKey: string) {

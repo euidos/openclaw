@@ -82,7 +82,7 @@ async function before(
   broker: OnePasswordBroker,
   toolCallId: string,
   params: Record<string, unknown>,
-  context: PluginHookToolContext = invocation,
+  context: Omit<PluginHookToolContext, "toolName" | "toolCallId"> = invocation,
 ): Promise<PluginHookBeforeToolCallResult | void> {
   return broker.beforeToolCall(
     { toolName: "onepassword", params, toolCallId },
@@ -100,7 +100,7 @@ async function prepareGet(
   toolCallId: string,
   slug: string,
   reason = "test",
-  context: PluginHookToolContext = invocation,
+  context: Omit<PluginHookToolContext, "toolName" | "toolCallId"> = invocation,
 ) {
   const input = request(slug, reason);
   const hook = await before(broker, toolCallId, input, context);

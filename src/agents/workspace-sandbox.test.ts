@@ -94,7 +94,10 @@ it.each(["realpath", "mkdir"] as const)(
           return state.workspaceDir;
         });
       } else {
-        mkdir.mockImplementationOnce(async () => scope.close());
+        mkdir.mockImplementationOnce(async () => {
+          scope.close();
+          return undefined;
+        });
       }
       await expect(
         resolveAttemptWorkspaceSandbox({

@@ -11,6 +11,10 @@ import * as reads from "./server-methods/sessions-read-cache.test-support.js";
 import { registerSessionAutomationSource } from "./session-automation-index.js";
 import * as membership from "./session-membership-projection.js";
 import { bindSessionRowProjection } from "./session-row-projection-access.js";
+import {
+  canRetainSessionRowRuntimeOwnership,
+  isPreparedSessionRowDatabaseFacts,
+} from "./session-row-projection-record.js";
 import * as rowFixture from "./session-row-projection.read-fixture.test-support.js";
 import { listProjectedSessions } from "./session-utils-list.js";
 
@@ -188,6 +192,17 @@ it.each(["parent model change", "late cron registration"])(
         expect(row.materialized).toBeDefined();
         expect(row.pendingDatabaseFacts).toBeUndefined();
         expect(row.retainedDatabaseFacts).toBe(retained[index]);
+        const facts = row.retainedDatabaseFacts;
+        expect(isPreparedSessionRowDatabaseFacts(facts)).toBe(true);
+        if (!isPreparedSessionRowDatabaseFacts(facts)) {
+          throw new Error("Expected prepared retained database facts");
+        }
+        expect(facts.entry).toMatchObject({
+          agentHarnessId: "row-opaque",
+          modelSelectionLocked: true,
+        });
+        expect(facts.runtimeOwnershipDependencies).toEqual([]);
+        expect(canRetainSessionRowRuntimeOwnership(facts)).toBe(false);
       }
       expect(projection.needsSelectionPreparation()).toBe(true);
 

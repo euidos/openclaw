@@ -31,6 +31,7 @@ function createCatalogEntry(params: {
   pluginId: string;
   origin: MockCatalogOrigin;
   label: string;
+  blurb?: string;
   localPath: string;
 }) {
   return {
@@ -38,7 +39,8 @@ function createCatalogEntry(params: {
     pluginId: params.pluginId,
     origin: params.origin,
     meta: makeMeta(params.id, params.label, {
-      blurb: params.origin === "bundled" ? "bundled entry" : `${params.origin} shadow`,
+      blurb:
+        params.blurb ?? (params.origin === "bundled" ? "bundled entry" : `${params.origin} shadow`),
     }),
     install: { localPath: params.localPath, defaultChoice: "local" },
   };

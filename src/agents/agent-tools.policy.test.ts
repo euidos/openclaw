@@ -72,16 +72,18 @@ function expectAllowed(
 }
 
 describe("resolveGroupToolPolicy group context validation", () => {
-  const main = "agent:main:main";
-  const groupKey = (id: string) => `agent:main:whatsapp:group:${id}`;
   const whatsapp = (groups: WhatsAppConfig["groups"], accounts?: WhatsAppConfig["accounts"]) => ({
     channels: { whatsapp: { groups, accounts } },
   });
-  const config = whatsapp({
-    "trusted-group": { tools: { allow: ["exec", "read", "write", "edit"] } },
-    room: { tools: { allow: ["exec", "read"] } },
-    "room:sender:alice": { tools: { allow: ["read"] } },
-  });
+  const config = {
+    ...whatsapp({
+      "safe-room": { tools: { allow: ["read"] } },
+      "trusted-group": { tools: { allow: ["exec", "read", "write", "edit"] } },
+      room: { tools: { allow: ["exec", "read"] } },
+      "room:sender:alice": { tools: { allow: ["read"] } },
+    }),
+    tools: { allow: ["read"] },
+  };
   function groupPolicy(params: Omit<Parameters<typeof resolveGroupToolPolicy>[0], "config">) {
     return resolveGroupToolPolicy({ config, messageProvider: "whatsapp", ...params });
   }

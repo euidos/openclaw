@@ -279,9 +279,9 @@ describe("status-all format", () => {
         },
         decorateOk: (value) => `ok(${value})`,
         decorateWarn: (value) => `warn(${value})`,
-      }).filter((row) =>
+      }).filter((entry) =>
         ["Dashboard", "Gateway", "Gateway self", "Gateway service", "Node service"].includes(
-          row.Item,
+          entry.Item,
         ),
       ),
     ).toEqual([
