@@ -3,10 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { Command } from "commander";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/plugin-entry";
-import {
-  tryReadSecretFileSync,
-  type SecretFileReadOptions,
-} from "openclaw/plugin-sdk/secret-file-runtime";
+import { tryReadSecretFileSync } from "openclaw/plugin-sdk/secret-file-runtime";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { resolveTrustedOnePasswordCli } from "../onepassword-op-path.js";
 import { registerOnePasswordSecretRefCommands } from "./secret-ref-cli.js";
@@ -16,7 +13,7 @@ const readTokenFileMock = vi.hoisted(() =>
     (
       filePath: string | undefined,
       label: string,
-      options?: SecretFileReadOptions,
+      options?: Parameters<typeof tryReadSecretFileSync>[2],
     ) => string | undefined
   >(),
 );
