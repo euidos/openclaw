@@ -233,7 +233,7 @@ export function createApplicationUpdateOverlays(
     publish();
   };
 
-  const applyRun = (run: UpdateRunRecord) => {
+  const applyRun = (run: UpdateRunRecord, failure: UpdateFailureTriage | null) => {
     const current = snapshot.updateRun;
     if (current?.runId === run.runId && current.updatedAtMs > run.updatedAtMs) {
       // A status read can still carry independently newer schedule fields.
@@ -247,7 +247,6 @@ export function createApplicationUpdateOverlays(
     }
     runId = run.runId;
     updateAttempt = null;
-    const failure = projectUpdateRunFailure(run);
     setCurrentFailure(failure);
     snapshot = {
       ...snapshot,
@@ -277,7 +276,11 @@ export function createApplicationUpdateOverlays(
         return;
       }
       if (response.run) {
-        applyRun(response.run);
+        const failure = await projectUpdateRunFailure(response.run);
+        if (!isCurrent()) {
+          return;
+        }
+        applyRun(response.run, failure);
         if (response.run.status !== "running") {
           // Refresh the install owner's availability after completion so closing
           // the report cannot re-offer the just-installed target.
@@ -301,10 +304,18 @@ export function createApplicationUpdateOverlays(
     }
   };
 
-  const applyUpdateStatusResponse = (response: UpdateRestartStatusResponse) => {
+  const applyUpdateStatusResponse = async (
+    response: UpdateRestartStatusResponse,
+    isCurrent: () => boolean,
+  ) => {
+    const run = response.activeRun ?? response.lastRun;
+    const runFailure = run ? await projectUpdateRunFailure(run) : null;
+    // Failure formatting is cold code; a reconnect or revoked grant can win its load.
+    if (!isCurrent()) {
+      return;
+    }
     const { failure, updateStatusBanner, recordedUpdateAttempt, ...status } =
       projectUpdateStatusResponse(response, snapshot);
-    const run = response.activeRun ?? response.lastRun;
     const history = updateAttempt?.history;
     // A failed history read is not an empty baseline. Until a current identity
     // is observed, a status check cannot certify terminal history as this attempt.
@@ -328,7 +339,7 @@ export function createApplicationUpdateOverlays(
         run.runId === snapshot.updateRun.runId ||
         run.createdAtMs >= snapshot.updateRun.createdAtMs)
     ) {
-      applyRun(run);
+      applyRun(run, runFailure);
     } else {
       if (!snapshot.updateRun && !previousOutcome) {
         setCurrentFailure(failure);
