@@ -41,7 +41,13 @@ function createMemberHarness(overrides?: MemberOverrides) {
   if (!handler) {
     throw new Error("expected Slack member joined handler");
   }
-  return { ...harness, handler, trackEvent };
+  return {
+    ...harness,
+    handler,
+    trackEvent,
+    emit: (event: Record<string, unknown>, eventId = "Ev-member-default") =>
+      handler({ event, body: { event_id: eventId } }),
+  };
 }
 
 type JoinRequest = Parameters<
@@ -56,16 +62,13 @@ describe("registerSlackMemberEvents", () => {
   });
 
   it("blocks channel member events for users outside channel users allowlist", async () => {
-    const { handler } = createMemberHarness({ channelType: "channel", channelUsers: ["U_OWNER"] });
-    await handler({
-      event: makeMemberEvent({ channel: "C1", user: "U_ATTACKER" }),
-      body: { event_id: "Ev-member-default" },
-    });
+    const { emit } = createMemberHarness({ channelType: "channel", channelUsers: ["U_OWNER"] });
+    await emit(makeMemberEvent({ channel: "C1", user: "U_ATTACKER" }));
     expect(memberMocks.enqueue).not.toHaveBeenCalled();
   });
 
   it("introduces the joined bot in an allowed room despite sender and mention requirements", async () => {
-    const { ctx, handler } = createMemberHarness({
+    const { ctx, emit } = createMemberHarness({
       channelType: "channel",
       channelUsers: ["U_OWNER"],
     });
@@ -86,10 +89,10 @@ describe("registerSlackMemberEvents", () => {
       ],
     });
 
-    await handler({
-      event: { ...makeMemberEvent({ channel: "C1", user: "U_BOT" }), inviter: "U_OWNER" },
-      body: { event_id: "Ev-self-join" },
-    });
+    await emit(
+      { ...makeMemberEvent({ channel: "C1", user: "U_BOT" }), inviter: "U_OWNER" },
+      "Ev-self-join",
+    );
 
     expect(memberMocks.reportJoin).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({
@@ -120,17 +123,14 @@ describe("registerSlackMemberEvents", () => {
   });
 
   it("reports a denied bot self-join using conversation policy without applying sender policy", async () => {
-    const { ctx, handler } = createMemberHarness({
+    const { ctx, emit } = createMemberHarness({
       channelType: "channel",
       channelUsers: ["U_OWNER"],
     });
     ctx.cfg = { channels: { slack: { groupPolicy: "allowlist" } } };
     ctx.isChannelAllowed = vi.fn(() => false);
 
-    await handler({
-      event: makeMemberEvent({ channel: "C1", user: "U_BOT" }),
-      body: { event_id: "Ev-self-denied" },
-    });
+    await emit(makeMemberEvent({ channel: "C1", user: "U_BOT" }), "Ev-self-denied");
 
     expect(ctx.isChannelAllowed).toHaveBeenCalledWith({
       teamId: "T_TEST",
@@ -145,15 +145,12 @@ describe("registerSlackMemberEvents", () => {
   });
 
   it("keeps room metadata when Slack denies the joined room's message history", async () => {
-    const { ctx, handler } = createMemberHarness({ channelType: "group" });
+    const { ctx, emit } = createMemberHarness({ channelType: "group" });
     ctx.cfg = { channels: { slack: { groupPolicy: "open" } } };
     ctx.app.client = new WebClient("xoxb-test");
     vi.spyOn(ctx.app.client.conversations, "history").mockRejectedValue(new Error("missing_scope"));
 
-    await handler({
-      event: makeMemberEvent({ channel: "G1", user: "U_BOT" }),
-      body: { event_id: "Ev-self-private" },
-    });
+    await emit(makeMemberEvent({ channel: "G1", user: "U_BOT" }), "Ev-self-private");
 
     await expect(joinRequest().resolveRoomContext({ messageLimit: 30 })).resolves.toEqual({
       title: "#general",
@@ -162,10 +159,7 @@ describe("registerSlackMemberEvents", () => {
   });
 
   it("never introduces the bot into a direct-message conversation", async () => {
-    await createMemberHarness().handler({
-      event: makeMemberEvent({ channel: "D1", user: "U_BOT" }),
-      body: { event_id: "Ev-member-default" },
-    });
+    await createMemberHarness().emit(makeMemberEvent({ channel: "D1", user: "U_BOT" }));
 
     expect(memberMocks.reportJoin).not.toHaveBeenCalled();
   });
@@ -182,17 +176,14 @@ describe("registerSlackMemberEvents", () => {
   });
 
   it("uses the stable user ID when the post-auth name lookup fails", async () => {
-    const { ctx, handler } = createMemberHarness({
+    const { ctx, emit } = createMemberHarness({
       channelType: "channel",
       channelUsers: ["U1"],
     });
     const resolveUserName = vi.fn(async () => ({ error: new Error("users.info failed") }));
     ctx.resolveUserName = resolveUserName;
 
-    await handler({
-      event: makeMemberEvent({ channel: "C1", user: "U1" }),
-      body: { event_id: "Ev-member-id-fallback" },
-    });
+    await emit(makeMemberEvent({ channel: "C1", user: "U1" }), "Ev-member-id-fallback");
 
     expect(resolveUserName).toHaveBeenCalledOnce();
     expect(memberMocks.enqueue).toHaveBeenCalledWith(
@@ -217,7 +208,7 @@ describe("registerSlackMemberEvents", () => {
       sessionKey: `session:${input.eventScope?.teamId ?? "workspace"}`,
     }));
 
-    for (const teamId of ["T111", "T222"]) {
+    for (const [index, teamId] of ["T111", "T222"].entries()) {
       await handler({
         event: makeMemberEvent(),
         body: { api_app_id: "A_GRID", event_id: `Ev-member-${teamId}` },
@@ -228,17 +219,12 @@ describe("registerSlackMemberEvents", () => {
         } as AllMiddlewareArgs["context"],
         client: { token: `listener-${teamId}` } as AllMiddlewareArgs["client"],
       });
+      expect(memberMocks.enqueue).toHaveBeenNthCalledWith(index + 1, expect.any(String), {
+        sessionKey: `session:${teamId}`,
+        contextKey: `slack:member:${teamId}:joined:D1:U1:Ev-member-${teamId}`,
+      });
     }
-
-    expect(memberMocks.enqueue).toHaveBeenNthCalledWith(1, expect.any(String), {
-      sessionKey: "session:T111",
-      contextKey: "slack:member:T111:joined:D1:U1:Ev-member-T111",
-    });
     expect(trackEvent).toHaveBeenCalledTimes(2);
-    expect(memberMocks.enqueue).toHaveBeenNthCalledWith(2, expect.any(String), {
-      sessionKey: "session:T222",
-      contextKey: "slack:member:T222:joined:D1:U1:Ev-member-T222",
-    });
     expect(resolveChannelName).toHaveBeenCalledWith(
       "D1",
       expect.objectContaining({ teamId: "T111" }),

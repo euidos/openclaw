@@ -96,23 +96,18 @@ describe("Slack pins events", () => {
       sessionKey: `session:${input.eventScope?.teamId ?? "workspace"}`,
     }));
 
-    for (const teamId of ["T111", "T222"]) {
+    for (const [index, teamId] of ["T111", "T222"].entries()) {
       await handler({
         event: makePinEvent(),
         ...buildEnterpriseListenerArgs(teamId),
         body: { api_app_id: "A_GRID", event_id: `Ev-pin-${teamId}` },
       });
+      expect(pinEnqueueMock).toHaveBeenNthCalledWith(index + 1, expect.any(String), {
+        sessionKey: `session:${teamId}`,
+        contextKey: `slack:pin:${teamId}:added:D1:123.456:Ev-pin-${teamId}`,
+      });
     }
-
-    expect(pinEnqueueMock).toHaveBeenNthCalledWith(1, expect.any(String), {
-      sessionKey: "session:T111",
-      contextKey: "slack:pin:T111:added:D1:123.456:Ev-pin-T111",
-    });
     expect(trackEvent).toHaveBeenCalledTimes(2);
-    expect(pinEnqueueMock).toHaveBeenNthCalledWith(2, expect.any(String), {
-      sessionKey: "session:T222",
-      contextKey: "slack:pin:T222:added:D1:123.456:Ev-pin-T222",
-    });
     expect(resolveChannelName).toHaveBeenCalledWith(
       "D1",
       expect.objectContaining({ teamId: "T111" }),

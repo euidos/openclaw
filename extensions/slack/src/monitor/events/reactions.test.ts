@@ -143,30 +143,18 @@ describe("Slack reactions events", () => {
       sessionKey: `session:${input.eventScope?.teamId ?? "workspace"}`,
     }));
 
-    for (const teamId of ["T111", "T222"]) {
+    for (const [index, teamId] of ["T111", "T222"].entries()) {
       await handler({
         event: buildReactionEvent(),
         ...buildEnterpriseListenerArgs(teamId),
       });
+      expect(reactionQueueMock).toHaveBeenNthCalledWith(index + 1, expect.any(String), {
+        sessionKey: `session:${teamId}`,
+        contextKey: `slack:reaction:${teamId}:added:D1:123.456:U1:thumbsup:Ev-reaction-${teamId}`,
+      });
+      expect(resolveChannelName).toHaveBeenCalledWith("D1", expect.objectContaining({ teamId }));
     }
-
-    expect(reactionQueueMock).toHaveBeenNthCalledWith(1, expect.any(String), {
-      sessionKey: "session:T111",
-      contextKey: "slack:reaction:T111:added:D1:123.456:U1:thumbsup:Ev-reaction-T111",
-    });
     expect(trackEvent).toHaveBeenCalledTimes(2);
-    expect(reactionQueueMock).toHaveBeenNthCalledWith(2, expect.any(String), {
-      sessionKey: "session:T222",
-      contextKey: "slack:reaction:T222:added:D1:123.456:U1:thumbsup:Ev-reaction-T222",
-    });
-    expect(resolveChannelName).toHaveBeenCalledWith(
-      "D1",
-      expect.objectContaining({ teamId: "T111" }),
-    );
-    expect(resolveChannelName).toHaveBeenCalledWith(
-      "D1",
-      expect.objectContaining({ teamId: "T222" }),
-    );
     expect(resolveUserName).toHaveBeenCalledWith("U1", expect.objectContaining({ teamId: "T111" }));
   });
 
