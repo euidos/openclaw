@@ -1,3 +1,4 @@
+import { expectDefined } from "@openclaw/normalization-core/expect";
 import { afterEach, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import {
@@ -17,6 +18,7 @@ import { resetGatewayWorkAdmission } from "../../process/gateway-work-admission.
 import { testing } from "../../sessions/session-controller.test-support.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { cleanupSessionStateForTest } from "../../test-utils/session-state-cleanup.js";
+import { acceptCompactionSuccessor } from "../embedded-agent-runner/compaction-successor.js";
 import { markStartupOrphanedMainSessionsForRecovery } from "./main-session-restart-recovery-marking.js";
 import { seedConsumedPeerRestartInput } from "./main-session-restart-recovery-peer-source.test-support.js";
 import { recoverStore } from "./main-session-restart-recovery-store.js";
@@ -27,6 +29,72 @@ afterEach(() => {
   clearRuntimeConfigSnapshot();
   vi.restoreAllMocks();
 });
+
+it.each(["permission", "replacement"] as const)(
+  "keeps consumed peer authority through committed compaction without bypassing %s revocation",
+  async (revocation) => {
+    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+      const storePath = state.statePath("agents", "main", "sessions", "sessions.json");
+      const source = {
+        agentId: "main",
+        sessionKey: "agent:main:compaction-source",
+        sessionId: "compaction-source-session",
+        lifecycleRevision: "compaction-source-generation",
+        storePath,
+      };
+      const target = {
+        ...source,
+        sessionKey: "agent:main:compaction-target",
+        sessionId: "compaction-target-session",
+        lifecycleRevision: "compaction-target-generation",
+      };
+      const cfg: OpenClawConfig = {
+        agents: { defaults: { workspace: state.workspaceDir }, entries: { main: {} } },
+        session: { store: storePath, communication: { send: "always", receive: "always" } },
+        tools: { sessions: { visibility: "all" } },
+      };
+      setRuntimeConfigSnapshot(cfg);
+      await seedConsumedPeerRestartInput({ cfg, source, target, runId: "compacting-peer-input" });
+      const recovered = expectDefined(
+        await prepareConsumedSessionSendSource({
+          config: cfg,
+          target,
+          sourceRunId: "compacting-peer-input",
+          assertCurrent() {},
+        }),
+        "consumed peer source",
+      );
+      try {
+        const entry = expectDefined(loadSessionEntry(target), "compaction target");
+        const compacted = await acceptCompactionSuccessor({
+          currentTarget: target,
+          expectedEntry: {
+            sessionId: entry.sessionId,
+            lifecycleRevision: entry.lifecycleRevision,
+            activeWriterRunId: entry.activeWriterRunId,
+          },
+          assertActive: recovered.source,
+          config: cfg,
+          result: {
+            ok: true,
+            compacted: true,
+            result: { tokensBefore: 100, tokensAfter: 50, sessionId: "compacted-peer-session" },
+          },
+        });
+        expect(compacted.sessionId).toBe("compacted-peer-session");
+        expect(() => recovered.source()).not.toThrow();
+        if (revocation === "permission") {
+          await updateSessionEntry(source, () => ({ communication: { send: "never" } }));
+        } else {
+          await updateSessionEntry(target, () => ({ sessionId: "replacement-peer-session" }));
+        }
+        expect(() => recovered.source()).toThrow();
+      } finally {
+        recovered.release();
+      }
+    });
+  },
+);
 
 it.each(["reset", "archive", "deny"] as const)(
   "settles a consumed peer input once when its sender changes before recovery: %s",

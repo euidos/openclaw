@@ -8,7 +8,10 @@ import {
 import { readRuntimeConfig } from "../config/runtime-snapshot.js";
 import { readPendingInputSource } from "../config/sessions/session-pending-input-source.js";
 import { parseSessionPendingInputMessage } from "../config/sessions/session-pending-input-value.js";
-import type { SessionSourceAssertion } from "../config/sessions/session-source-authority.js";
+import {
+  composeSessionSourceAssertion,
+  type SessionSourceAssertion,
+} from "../config/sessions/session-source-authority.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { CommunicationEndpoint } from "../sessions/communication-admission.js";
 import { buildRunUserTurnIdempotencyKey } from "../sessions/user-turn-transcript.metadata.js";
@@ -187,10 +190,7 @@ export async function prepareConsumedSessionSendSource(params: {
       return undefined;
     }
     return {
-      source: () => {
-        assertCurrent();
-        communication.assertCurrent();
-      },
+      source: composeSessionSourceAssertion([assertCurrent, communication.assertCurrent]),
       release: communication.close,
     };
   }
