@@ -143,17 +143,8 @@ function driver<T>(send: T) {
 }
 
 function observe() {
-  let onUpdate: ((update: unknown) => Promise<void>) | undefined;
-  mocks.userbotStart.mockImplementation(async (params) => {
-    onUpdate = params.onUpdate;
-    return driver(mocks.userbotSend);
-  });
-  return async (update: unknown) => {
-    if (!onUpdate) {
-      throw new Error("Telegram observer was not started");
-    }
-    await onUpdate(update);
-  };
+  const updates = observeParticipants([mocks.userbotSend]);
+  return (update: unknown) => updates[0]!(update);
 }
 
 function sutConfig(adapter: Awaited<ReturnType<typeof createAdapter>>) {
@@ -232,9 +223,7 @@ beforeEach(() => {
     startApiProxy: mocks.startApiProxy,
   });
   mocks.restoreCredential.mockReturnValue({
-    ...credential,
-    stateRoot,
-    userDriverDir: path.join(stateRoot, "user-driver"),
+    groupId: credential.groupId,
     driverEnv: { TELEGRAM_USER_DRIVER_STATE_DIR: path.join(stateRoot, "user-driver") },
   });
   mocks.startApiProxy.mockResolvedValue({

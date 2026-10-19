@@ -22,6 +22,8 @@ vi.mock("openclaw/plugin-sdk/ssrf-runtime", () => ({
 }));
 
 const roots: string[] = [];
+const requestName = `${requestToken}.request.json`;
+const sendSignal = `TELEGRAM_PRIVATE_APP_SEND_REQUIRED ${requestToken}\n`;
 const writeJson = (file: string, value: unknown) =>
   fs.writeFileSync(file, JSON.stringify(value), { mode: 0o600 });
 
@@ -41,7 +43,6 @@ function fixture() {
   });
   const descriptor = readTelegramPrivateProductionDescriptor(file)!;
   const proofRoot = `${file}.app-proof`;
-  const requestName = `${requestToken}.request.json`;
   const send = (destination: "bot-dm" | "forum-topic", text: string) =>
     requestTelegramPrivateAppTurn({
       descriptor,
@@ -49,7 +50,7 @@ function fixture() {
       text,
       participant: descriptor.participants[destination === "bot-dm" ? 0 : 1]!,
     });
-  return { proofRoot, requestName, requestPath: path.join(proofRoot, requestName), send };
+  return { proofRoot, requestPath: path.join(proofRoot, requestName), send };
 }
 
 afterEach(() => {
@@ -132,17 +133,13 @@ it("publishes complete private handoffs before accepting native UI acknowledgeme
     }
     const settings = typeof options === "object" && options !== null ? options : undefined;
     const handle = await fsp.open(file, settings?.flag ?? "w", settings?.mode);
-    try {
-      await handle.writeFile(data, options);
-    } finally {
-      await handle.close();
-    }
+    await handle.writeFile(data, options).finally(() => handle.close());
   });
 
   const realStdoutWrite = process.stdout.write.bind(process.stdout);
   vi.spyOn(process.stdout, "write").mockImplementation((...args) => {
     const [chunk] = args;
-    if (chunk !== `TELEGRAM_PRIVATE_APP_SEND_REQUIRED ${requestToken}\n`) {
+    if (chunk !== sendSignal) {
       return realStdoutWrite(...args);
     }
     signals += 1;
@@ -188,7 +185,7 @@ it("publishes complete private handoffs before accepting native UI acknowledgeme
 });
 
 it("preserves an existing handoff and does not announce a failed publication", async () => {
-  const { proofRoot, requestName, requestPath, send } = fixture();
+  const { proofRoot, requestPath, send } = fixture();
   fs.mkdirSync(proofRoot, { mode: 0o700 });
   const existing = "existing request bytes\n";
   fs.writeFileSync(requestPath, existing, { mode: 0o600 });
@@ -198,5 +195,5 @@ it("preserves an existing handoff and does not announce a failed publication", a
 
   expect(fs.readFileSync(requestPath, "utf8")).toBe(existing);
   expect(fs.readdirSync(proofRoot)).toEqual([requestName]);
-  expect(stdout).not.toHaveBeenCalledWith(`TELEGRAM_PRIVATE_APP_SEND_REQUIRED ${requestToken}\n`);
+  expect(stdout).not.toHaveBeenCalledWith(sendSignal);
 });

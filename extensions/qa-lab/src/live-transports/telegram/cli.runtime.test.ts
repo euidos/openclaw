@@ -46,7 +46,7 @@ let summaryPath: string;
 function writeSummary(status: string) {
   const skipped = status === "skip" || status === "skipped";
   const empty = status === "zero-work";
-  writeSummaryData({
+  const summary = {
     run: { status: "completed" },
     counts: {
       total: empty ? 0 : 1,
@@ -55,10 +55,7 @@ function writeSummary(status: string) {
       skipped: Number(skipped),
     },
     scenarios: empty ? [] : [{ name: "channel-canary", status }],
-  });
-}
-
-function writeSummaryData(summary: unknown) {
+  };
   writeFileSync(summaryPath, JSON.stringify(summary), "utf8");
 }
 
@@ -124,13 +121,7 @@ it.each([
 it("lists only scenarios accepted by its flow runner", async () => {
   const write = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
   mocks.listTelegramQaScenarios.mockReturnValue([
-    {
-      id: "channel-message-flows",
-      defaultEnabled: true,
-      title: "Message flows",
-      rationale: "Exercise Telegram message flows",
-      regressionRefs: [],
-    },
+    { id: "flow", defaultEnabled: true, title: "Flow", rationale: "QA", regressionRefs: [] },
   ]);
   const options = {
     listScenarios: true,
@@ -141,7 +132,7 @@ it("lists only scenarios accepted by its flow runner", async () => {
   await runQaTelegramSuite(options);
 
   const output = write.mock.calls.map(([chunk]) => String(chunk)).join("");
-  expect(output).toContain("channel-message-flows\tdefault\t");
+  expect(output).toContain("flow\tdefault\t");
   expect(output).not.toContain("telegram-startup-getme-live");
   expect(mocks.runQaFlowSuiteFromRuntime).not.toHaveBeenCalled();
 });

@@ -4,6 +4,7 @@ import { createQaBusState } from "../../bus-state.js";
 import { readQaScenarioById } from "../../scenario-catalog.js";
 import { runLoadedScenarioFlow } from "../../scenario-flow-runner.test-support.js";
 import { selectQaFlowSuiteScenarios } from "../../suite-planning.js";
+import type { TelegramUserbotUpdate } from "./userbot-driver.runtime.js";
 
 const scenarioId = "telegram-participant-identity-inspection";
 const primaryUserId = "710000001";
@@ -24,19 +25,19 @@ const faults = [
   ["restart-leak", "changed or exposed private references after restart"],
 ] as const;
 type Fault = (typeof faults)[number][0];
+type Selector = { runId?: string; executionId?: string };
+type Inbound = Parameters<ReturnType<typeof createQaBusState>["addInboundMessage"]>[0];
 
 function runIdentityFlow(fault?: Fault) {
   const state = createQaBusState();
   const admittedRuns = ["previous-run"];
   const turns: Array<ReturnType<typeof state.addInboundMessage>> = [];
-  const nativeReplies: Array<{
-    text: string;
-    chatId: number;
-    senderId: number;
-    forumTopicId?: number;
-  }> = [];
+  const nativeReplies: Pick<
+    TelegramUserbotUpdate,
+    "text" | "chatId" | "senderId" | "forumTopicId"
+  >[] = [];
   let restarted = false;
-  const inspect = (selector: { runId?: string; executionId?: string }) => {
+  const inspect = (selector: Selector) => {
     const runId = selector.runId ?? selector.executionId?.replace("execution-", "");
     const index = admittedRuns.indexOf(runId ?? "") - 1;
     const turn = turns[index];
@@ -45,14 +46,12 @@ function runIdentityFlow(fault?: Fault) {
     const person = fault === "changed-primary" && index === 1 ? "e" : additional ? "c" : "b";
     const principalRef =
       fault === "raw-principal" ? turn.senderId : hmac(fault === "same-person" ? "b" : person);
-    const executionId = `execution-${runId}`;
+    const run = { runId, executionId: `execution-${runId}` };
     const principal = { kind: "person", principalRef, domainRef: hmac("a") };
     const context = {
       contextId: fault === "reused-context" ? "context-first" : `context-${runId}`,
-      executionId,
-      runId,
+      ...run,
       invoker: { state: "present", principal },
-      // Channel admission has no rawSourceRef.
       ingress: { kind: "channel", state: "present" },
       runtimeInstance: { runtimeRef: hmac("e") },
       assurance: [
@@ -61,11 +60,11 @@ function runIdentityFlow(fault?: Fault) {
       applicableGrants: [],
     };
     return {
-      run: { runId, executionId },
+      run,
       identity: { state: "present", context },
       decisionDisplays: [
         {
-          action: { family: "decision", operation: "record" },
+          action: { family: "decision" },
           provenance: { state: fault === "verified-generic" ? "verified" : "unverified" },
         },
       ],
@@ -75,21 +74,15 @@ function runIdentityFlow(fault?: Fault) {
       ...(fault === "prompt-leak" ? { leakedText: turn.text } : {}),
     };
   };
-  const call = vi.fn(
-    async (
-      method: string,
-      selector: { runId?: string; executionId?: string; decisionLimit: number },
-    ) => {
-      expect(method).toBe("audit.run.inspect");
-      // audit.run.inspect has a closed request schema, distinct from audit CLI --limit.
-      expect(Object.keys(selector).toSorted()).toEqual([
-        "decisionLimit",
-        selector.runId === undefined ? "executionId" : "runId",
-      ]);
-      expect(selector.decisionLimit).toBe(100);
-      return inspect(selector);
-    },
-  );
+  const call = vi.fn(async (method: string, selector: Selector & { decisionLimit: number }) => {
+    expect(method).toBe("audit.run.inspect");
+    expect(selector).toStrictEqual({
+      [selector.runId === undefined ? "executionId" : "runId"]:
+        selector.runId ?? selector.executionId,
+      decisionLimit: 100,
+    });
+    return inspect(selector);
+  });
   const restart = vi.fn(async (mutate: () => Promise<void>) => {
     await mutate();
     restarted = true;
@@ -103,72 +96,63 @@ function runIdentityFlow(fault?: Fault) {
     const executionId = args[2];
     assert(executionId, "identity CLI proof requires an exact execution selector");
     const inspection = inspect({ executionId });
-    if (!options?.json) {
-      return `Invoker [present] ${inspection.identity.context.invoker.principal.principalRef}\nDecisions`;
-    }
-    return inspection;
+    const principal = inspection.identity.context.invoker.principal.principalRef;
+    return options?.json ? inspection : `Invoker [present] ${principal}\nDecisions`;
   });
-  return {
-    call,
-    restart,
-    runQaCli,
-    turns,
-    result: runLoadedScenarioFlow(scenarioId, {
-      state,
-      api: {
-        env: {
-          providerMode: "mock-openai",
-          gateway: { call, restartAfterStateMutation: restart },
-        },
-        // Only the adapter's prepared, noncredential surface is supplied here.
-        telegramIdentityFixture: { participantAliases: ["primary", "guest"], forumTopicId },
-        readTelegramMessages: () => nativeReplies,
-        transport: {
-          id: "telegram",
-          reset: async () => state.reset(),
-          sendInbound: async (input: Parameters<typeof state.addInboundMessage>[0]) => {
-            expect(["primary", "guest"]).toContain(input.senderId);
-            const inbound = state.addInboundMessage({
-              ...input,
-              senderId: input.senderId === "primary" ? primaryUserId : additionalUserId,
-            });
-            turns.push(inbound);
-            return inbound;
-          },
-          waitForOutbound: async (input: {
-            conversation: { id: string; kind: string };
-            threadId?: string;
-            textIncludes: string;
-          }) => {
-            const inbound = turns.at(-1);
-            assert(inbound, "identity proof must send a transport turn before inspecting it");
-            expect([input.conversation, input.threadId]).toEqual([
-              inbound.conversation,
-              inbound.threadId,
-            ]);
-            const forum = inbound.conversation.kind === "group";
-            expect(inbound.threadId).toBe(forum ? String(forumTopicId) : undefined);
-            expect(inbound.text.startsWith("@openclaw ")).toBe(forum);
-            expect(inbound.text).toContain(`Reply exactly: ${input.textIncludes}`);
-            admittedRuns.push(`run-${turns.length}`);
-            nativeReplies.push({
-              text: input.textIncludes,
-              chatId: forum ? forumGroupId : botId,
-              senderId: botId,
-              ...(forum ? { forumTopicId } : {}),
-            });
-            return state.addOutboundMessage({
-              accountId: "sut",
-              to: `${forum ? "group" : "dm"}:${inbound.conversation.id}`,
-              threadId: inbound.threadId,
-              text: input.textIncludes,
-            });
-          },
-        },
-        runQaCli,
-      },
-    }),
+  const transport = {
+    id: "telegram",
+    reset: async () => state.reset(),
+    sendInbound: async (input: Inbound) => {
+      expect(["primary", "guest"]).toContain(input.senderId);
+      const inbound = state.addInboundMessage({
+        ...input,
+        senderId: input.senderId === "primary" ? primaryUserId : additionalUserId,
+      });
+      turns.push(inbound);
+      return inbound;
+    },
+    waitForOutbound: async (
+      input: Pick<Inbound, "conversation" | "threadId"> & { textIncludes: string },
+    ) => {
+      const inbound = turns.at(-1);
+      assert(inbound, "identity proof must send a transport turn before inspecting it");
+      expect([input.conversation, input.threadId]).toEqual([
+        inbound.conversation,
+        inbound.threadId,
+      ]);
+      const forum = inbound.conversation.kind === "group";
+      expect(inbound.threadId).toBe(forum ? String(forumTopicId) : undefined);
+      expect(inbound.text.startsWith("@openclaw ")).toBe(forum);
+      expect(inbound.text).toContain(`Reply exactly: ${input.textIncludes}`);
+      admittedRuns.push(`run-${turns.length}`);
+      nativeReplies.push({
+        text: input.textIncludes,
+        chatId: forum ? forumGroupId : botId,
+        senderId: botId,
+        ...(forum ? { forumTopicId } : {}),
+      });
+      return state.addOutboundMessage({
+        accountId: "sut",
+        to: `${forum ? "group" : "dm"}:${inbound.conversation.id}`,
+        threadId: inbound.threadId,
+        text: input.textIncludes,
+      });
+    },
   };
+  const result = runLoadedScenarioFlow(scenarioId, {
+    state,
+    api: {
+      env: {
+        providerMode: "mock-openai",
+        gateway: { call, restartAfterStateMutation: restart },
+      },
+      telegramIdentityFixture: { participantAliases: ["primary", "guest"], forumTopicId },
+      readTelegramMessages: () => nativeReplies,
+      transport,
+      runQaCli,
+    },
+  });
+  return { call, restart, runQaCli, turns, result };
 }
 
 it("excludes live identity proof from crabline", () => {
