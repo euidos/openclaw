@@ -187,6 +187,7 @@ type FirstAgentCommandOptions = {
     seed?: number;
     stop?: string[];
     temperature?: number;
+    toolChoice?: Record<string, unknown>;
     topP?: number;
   };
 };
@@ -994,6 +995,10 @@ describe("OpenAI-compatible HTTP API (e2e)", () => {
         expect(clientTools).toHaveLength(1);
         expect(clientTools[0]?.function?.name).toBe("get_weather");
         expect(firstCall?.extraSystemPrompt ?? "").toContain("You must call the get_weather tool");
+        expect(firstCall?.streamParams?.toolChoice).toEqual({
+          type: "function",
+          name: "get_weather",
+        });
         const json = (await res.json()) as { choices?: Array<{ finish_reason?: string | null }> };
         expect(json.choices?.[0]?.finish_reason).toBe("tool_calls");
       }
@@ -1033,6 +1038,7 @@ describe("OpenAI-compatible HTTP API (e2e)", () => {
         expect(firstCall?.extraSystemPrompt ?? "").toContain(
           "You must call one of the available tools",
         );
+        expect(firstCall?.streamParams?.toolChoice).toEqual({ type: "required" });
         const json = (await res.json()) as { choices?: Array<{ finish_reason?: string | null }> };
         expect(json.choices?.[0]?.finish_reason).toBe("tool_calls");
       }
